@@ -1,0 +1,24 @@
+# Build artifacts
+/build/
+/build-*/
+CMakeCache.txt
+CMakeFiles/
+*.cmake
+*.sln
+*.vcxproj*
+*.xcodeproj/
+.DS_Store
+*.user
+*.opendb
+*.obj
+*.pdb
+*.idb
+*.ilk
+*.exe
+*.dll
+*.lib
+*.a
+*.so
+*.dylib
+*.vst3
+*.component
