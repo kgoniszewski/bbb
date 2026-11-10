@@ -1,10 +1,13 @@
-// Engine benchmark (M3): % of one core at 48 kHz in 64-frame buffers.
+// Engine benchmark (M4): % of one core at 48 kHz in 64-frame buffers, with
+// the soundboard coupling loop (the "board off" lines are the A/B mode).
 //
 //   worst:    all 88 keys struck (1 ms apart) and held, sustain pedal down
 //   no-cull:  the same with culling disabled (every mode of every key)
 //   typical:  a four-note chord re-struck every 0.5 s and released, pedal up
 //   cluster:  a 12-note cluster (C3..B3 plus C5..B5 alternating) struck ff
 //             every 100 ms: 12 hammers in contact at once, repeatedly
+//   bloom:    sustain pedal down, a staccato four-note chord every 0.5 s: every
+//             string free to resonate through the bridge (sympathetic case)
 //   hammer:   cost of one active hammer per 64-frame buffer, per key, while
 //             in contact and averaged over its life (contact plus release
 //             wait), measured on the solver alone
@@ -132,6 +135,19 @@ int main(int argc, char** argv) {
         return out;
     };
 
+    auto bloom = [period](std::uint64_t t0, std::uint64_t t1) {
+        std::vector<pm::Event> out;
+        if (t0 == 0) out.push_back(ev(0, pm::EventType::Sustain, 0, 127));
+        const int notes[4] = {48, 60, 64, 67};
+        for (std::uint64_t base = (t0 / period) * period; base < t1; base += period)
+            for (int n : notes) {
+                if (base >= t0) out.push_back(ev(base, pm::EventType::NoteOn, n, 90));
+                const std::uint64_t off = base + period / 5;
+                if (off >= t0 && off < t1) out.push_back(ev(off, pm::EventType::NoteOff, n, 64));
+            }
+        return out;
+    };
+
     pm::Engine eng;
     if (!eng.prepare(fs, block)) return 1;
     std::printf("engine benchmark: fs %.0f Hz, block %d, kernel %s, %.1f s measured; %d normal modes "
@@ -141,19 +157,27 @@ int main(int argc, char** argv) {
     struct Case {
         const char* name;
         bool cull;
-        int scene;  // 0 worst, 1 typical, 2 cluster
+        int scene;  // 0 worst, 1 typical, 2 cluster, 3 bloom
+        bool board;
     };
-    for (const Case& c : {Case{"worst (88 keys held, pedal)", true, 0},
-                          Case{"worst, culling off", false, 0},
-                          Case{"typical (4-note chord, pedal up)", true, 1},
-                          Case{"cluster (12 notes ff every 100 ms)", true, 2}}) {
+    for (const Case& c : {Case{"worst (88 keys held, pedal)", true, 0, true},
+                          Case{"worst, culling off", false, 0, true},
+                          Case{"typical (4-note chord, pedal up)", true, 1, true},
+                          Case{"cluster (12 notes ff every 100 ms)", true, 2, true},
+                          Case{"bloom (pedal down, staccato chords)", true, 3, true},
+                          Case{"worst, board off (A/B)", true, 0, false},
+                          Case{"cluster, board off (A/B)", true, 2, false}}) {
         eng.setCulling(c.cull, -100.0f);
+        pm::SoundboardConfig bc;
+        bc.enabled = c.board;
+        eng.setSoundboardConfig(bc);
         if (!eng.prepare(fs, block)) return 1;
         // The worst cases are measured from the first strike, so the max
         // includes the burst of 88 hammers (1 ms apart, pool of 32).
         const Result r = c.scene == 0   ? run(eng, fs, block, 0.0, seconds, allKeys)
                          : c.scene == 1 ? run(eng, fs, block, 0.5, seconds, chord)
-                                        : run(eng, fs, block, 0.5, seconds, cluster);
+                         : c.scene == 2 ? run(eng, fs, block, 0.5, seconds, cluster)
+                                        : run(eng, fs, block, 0.5, seconds, bloom);
         std::printf("  %-35s %6.2f %% of one core; first 100 ms %6.2f %%; buffers p99 %6.2f %%, "
                     "max %6.2f %%; awake modes mean %5.0f, at end %5d\n",
                     c.name, r.avgPercent, r.first100msPercent, r.p99Percent, r.maxPercent,
@@ -172,7 +196,7 @@ int main(int argc, char** argv) {
         const pm::KeyModeSet ms = pm::computeKeyModes(kp, fs);
         pm::ModeBank bank;
         pm::ContactTables contact;
-        const int n = ms.count;
+        const int n = pm::keyBankModes(ms);
         if (!bank.allocateSegments(&n, 1) || !contact.allocate(bank.capacity(), 1)) return 1;
         pm::loadKeyModes(bank, contact, 0, kp, ms, fs);
         bank.setSegmentDamper(0, 0.0f);

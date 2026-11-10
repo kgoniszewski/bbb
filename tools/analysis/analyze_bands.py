@@ -69,8 +69,8 @@ def main():
     ap.add_argument("--labels", default="", help="names of the segments (comma separated)")
     args = ap.parse_args()
 
-    fs, chans = read_wav_channels(args.wav)
-    x = np.sum(chans, axis=0)
+    chans, fs = read_wav_channels(args.wav)
+    x = chans.sum(axis=1) if chans.ndim == 2 else chans
     times = [float(t) for t in args.at.split(",")]
     labels = args.labels.split(",") if args.labels else ["t=%.2f s" % t for t in times]
     if len(labels) != len(times):

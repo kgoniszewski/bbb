@@ -173,8 +173,12 @@ void ModeBank::setCulling(bool enabled, float thresholdDb) noexcept {
 }
 
 void ModeBank::setSegmentCullOffset(int s, float stateDb, float inputDb) noexcept {
-    segCullScale_[s] = std::pow(10.0f, std::max(stateDb, 0.0f) / 20.0f);
-    segInputScale_[s] = std::pow(10.0f, std::max(inputDb, 0.0f) / 20.0f);
+    const float c = std::pow(10.0f, std::max(stateDb, 0.0f) / 20.0f);
+    const float i = std::pow(10.0f, std::max(inputDb, 0.0f) / 20.0f);
+    if (c == segCullScale_[s] && i == segInputScale_[s]) return;
+    segCullScale_[s] = c;
+    segInputScale_[s] = i;
+    runsDirty_ = true;  // the wake list depends on the input threshold
 }
 
 int ModeBank::activeGroups() const noexcept {
@@ -399,12 +403,23 @@ int ModeBank::wakeableSegments(const int*& list) noexcept {
     return nWake_;
 }
 
-void ModeBank::wakeCoupled(int s) noexcept {
+// A woken group starts from its quasi-static deflection under the current
+// input u, z = wIn u / (1 - c), not from rest: its static correction (which
+// joins at the same time) then cancels exactly, and no force step reaches
+// the board.
+void ModeBank::wakeCoupled(int s, float u) noexcept {
     const float input = segInput_[s];
     bool sleeping = false;
     for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) {
         if (active_[g]) continue;
         if (input * groupInOut_[g] > cullThreshold_ * segInputScale_[s]) {
+            for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i) {
+                const std::complex<double> w(wIn_[i], wInIm_[i]);
+                const std::complex<double> c(1.0 + double(dr_[i]), double(ci_[i]));
+                const std::complex<double> z = w == 0.0 ? 0.0 : w * double(u) / (1.0 - c);
+                zr_[i] = static_cast<float>(z.real());
+                zi_[i] = static_cast<float>(z.imag());
+            }
             active_[g] = 1;
             runsDirty_ = true;
         } else {
@@ -442,7 +457,7 @@ void ModeBank::stepCoupled(const float* in, float* out, Kernel kernel) noexcept 
     if (woke)
         for (int i = 0; i < nWake_; ++i) {
             const int s = wakeList_[i];
-            if (segInput_[s] * segWakeGain_[s] > cullThreshold_ * segInputScale_[s]) wakeCoupled(s);
+            if (segInput_[s] * segWakeGain_[s] > cullThreshold_ * segInputScale_[s]) wakeCoupled(s, in[s]);
         }
 }
 

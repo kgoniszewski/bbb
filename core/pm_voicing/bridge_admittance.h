@@ -7,8 +7,9 @@
 // semi-definite real part (a passive termination); the unison solver relies
 // on both.
 //
-// M4 replaces the placeholder below with the driving-point admittance of
-// the soundboard model at each key's bridge point; nothing else changes.
+// Since M4 the engine uses the soundboard's admittance (SoundboardBridge,
+// soundboard_model.h); the smooth placeholder below remains for unit tests
+// of the unison solver and the hammer.
 #pragma once
 
 #include <complex>
@@ -55,7 +56,7 @@ public:
     Admittance2 at(int, double) const noexcept override { return {}; }
 };
 
-// PLACEHOLDER (until the M4 soundboard): a smooth parametric admittance.
+// Smooth parametric admittance (the M3 placeholder, used by unit tests).
 //
 //   Re Yvv(key, f) = G(key) * (f / fET(key))^slope
 //   Yvv            = Re Yvv * (1 + j chi(f))

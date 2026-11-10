@@ -328,6 +328,7 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
         case static_cast<std::uint8_t>(EventType::KeyDownSilent):
             if (!validKey) break;
             keyDown_[k] = true;
+            joinLoop(k);
             if (now >= panicUntil_) retargetDamper(k, now, static_cast<float>(kDefaultReleaseVelocity));
             break;
         case static_cast<std::uint8_t>(EventType::NoteOff):
@@ -336,13 +337,17 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
             retargetDamper(k, now,
                            e.value ? e.value / 65535.0f : static_cast<float>(kDefaultReleaseVelocity));
             break;
-        case static_cast<std::uint8_t>(EventType::Sustain):
+        case static_cast<std::uint8_t>(EventType::Sustain): {
             // Continuous: the smoothed position restarts from its value at the
             // event's exact time (sampled on the control grid by controlTick).
             pedalFrom_ = pedalAt(now);
             pedalStart_ = now;
-            sustain_ = e.value / 65535.0f;
+            const float next = e.value / 65535.0f;
+            if (next > sustain_)
+                for (int i = 0; i < kNumKeys; ++i) joinLoop(i);
+            sustain_ = next;
             break;
+        }
         case static_cast<std::uint8_t>(EventType::Sostenuto): {
             const bool down = e.value >= 32768;
             if (down && !sostenuto_) {
@@ -405,8 +410,7 @@ void Engine::noteOn(int k, std::uint16_t vel, std::int64_t now) noexcept {
         damp_[k] = Damper{0.0f, 0.0f, 0.0f, now, 0, false, false};
         applied_[k] = 0.0f;
         bank_.setSegmentDamper(k, 0.0f);
-        cullOffsetApplied_[k] = 0.0f;
-        bank_.setSegmentCullOffset(k, 0.0f, 0.0f);
+        joinLoop(k);
     }
     const double v = hammerVelocityFor(vel / 65535.0);
     if (!strike(k, v, now)) {
@@ -554,6 +558,14 @@ float Engine::pedalFactor(int k) noexcept {
     return kLightContact * (2.0f / static_cast<float>(kPi)) * std::acos(e / a);
 }
 
+// A key whose damper starts to lift takes bridge input from this sample on.
+void Engine::joinLoop(int k) noexcept {
+    if (cullOffsetApplied_[k] != 0.0f) {
+        cullOffsetApplied_[k] = 0.0f;
+        bank_.setSegmentCullOffset(k, 0.0f, 0.0f);
+    }
+}
+
 float Engine::pedalAt(std::int64_t t) const noexcept {
     const double x = double(t - pedalStart_) / pedalTau_;
     if (x > 40.0) return sustain_;
@@ -598,7 +610,10 @@ void Engine::controlTick(std::int64_t now) noexcept {
             applied_[k] = a;
             bank_.setSegmentDamper(k, a);
         }
-        const float off = boardOn_ && a >= 0.5f ? dampedCull : 0.0f;
+        // Out of the loop only once the damper is fully seated and still (a
+        // string just being damped keeps listening while it rings down);
+        // back in at the exact time of the event that lifts it.
+        const float off = boardOn_ && a >= 1.0f && !d.ramping ? dampedCull : 0.0f;
         if (off != cullOffsetApplied_[k]) {
             cullOffsetApplied_[k] = off;
             bank_.setSegmentCullOffset(k, 0.0f, off);
@@ -666,6 +681,7 @@ void Engine::processBoard(int n) noexcept {
         } else if (keyActive_[k]) {
             keyActive_[k] = false;
             u_[k] = uPrev_[k] = fKey_[k] = 0.0f;
+            bank_.setCoupledInputHistory(k, 0.0f);  // its static correction restarts from rest
         }
     }
     nOutZones_ = 0;

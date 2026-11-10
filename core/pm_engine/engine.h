@@ -307,6 +307,7 @@ private:
     bool prepareImpl(double sampleRate, int maxFrames, const PianoTable& table, const BridgeAdmittance& bridge,
                      bool board) noexcept;
     float pedalFactor(int k) noexcept;
+    void joinLoop(int k) noexcept;
     float keyAmplitude(int k) const noexcept;
 
     bool prepared_ = false;
@@ -370,7 +371,6 @@ private:
     std::int64_t pedalStart_ = 0;
     double pedalTau_ = 480.0;  // samples
     float pedalAt(std::int64_t t) const noexcept;
-    float p0Key_[kNumKeys]{};
     float applied_[kNumKeys]{};
 
     // Keys, dampers, pedal.

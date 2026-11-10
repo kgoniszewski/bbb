@@ -223,7 +223,7 @@ private:
     void cullPass(const SegmentIO* io) noexcept;
     void run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) noexcept;
     void rebuildRuns() noexcept;
-    void wakeCoupled(int s) noexcept;
+    void wakeCoupled(int s, float u) noexcept;
 
     AlignedArray<float> zr_, zi_, dr_, ci_, wIn_, wInIm_, wOut_;  // dr = Re(c) - 1
     AlignedArray<float> dr0_, ci0_;   // free-string coefficient
