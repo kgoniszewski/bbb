@@ -1,0 +1,119 @@
+// Scalar reference kernel versus SIMD kernel (plan §4.2, §5.4).
+#include <cmath>
+#include <cstdio>
+#include <random>
+#include <vector>
+
+#include "signal_utils.h"
+#include "test_harness.h"
+
+using namespace pm;
+using pm_test::render;
+
+namespace {
+
+constexpr double kFs = 48000.0;
+
+// A bank with 'modes' random modes and random weights, plus a pluck-like
+// initial state, so every lane differs.
+void fillRandom(ModeBank& bank, int modes, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> uf(30.0, 20000.0), us(0.5, 40.0), uw(-1.0, 1.0);
+    bank.allocate(modes);
+    bank.resize(modes);
+    for (int i = 0; i < modes; ++i) {
+        const double f = uf(rng), sigma = us(rng);
+        const double wIn = 0.01 * uw(rng), wOut = uw(rng) / modes;
+        const double re = uw(rng), im = uw(rng);
+        bank.setMode(i, f, sigma, kFs);
+        bank.setWeights(i, static_cast<float>(wIn), static_cast<float>(wOut));
+        bank.setState(i, static_cast<float>(re), static_cast<float>(im));
+    }
+}
+
+std::vector<float> noise(int n, unsigned seed, float amp) {
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<float> u(-amp, amp);
+    std::vector<float> v(static_cast<std::size_t>(n));
+    for (auto& x : v) x = u(rng);
+    return v;
+}
+
+double maxAbs(const std::vector<float>& v) {
+    double m = 0.0;
+    for (float x : v) m = std::max(m, static_cast<double>(std::fabs(x)));
+    return m;
+}
+
+double maxDiff(const std::vector<float>& a, const std::vector<float>& b) {
+    double m = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        m = std::max(m, static_cast<double>(std::fabs(a[i] - b[i])));
+    return m;
+}
+
+void compareKernels(int modes) {
+    const int n = static_cast<int>(kFs);  // 1 s
+    const auto u = noise(n, 7, 1.0f);
+    ModeBank a, b;
+    fillRandom(a, modes, 42);
+    fillRandom(b, modes, 42);
+    const auto ya = render(a, n, Kernel::Scalar, &u);
+    const auto yb = render(b, n, Kernel::Simd, &u);
+    const double peak = maxAbs(ya);
+    // First block: only a few roundings apart.
+    double firstBlock = 0.0;
+    for (int k = 0; k < 64; ++k) firstBlock = std::max(firstBlock, double(std::fabs(ya[k] - yb[k])));
+    const double whole = maxDiff(ya, yb);
+    double stateDiff = 0.0;
+    for (int i = 0; i < modes; ++i)
+        stateDiff = std::max({stateDiff, double(std::fabs(a.stateRe(i) - b.stateRe(i))),
+                              double(std::fabs(a.stateIm(i) - b.stateIm(i)))});
+    std::printf("  %d modes (%s): peak %.3f, first block diff %.2e, 1 s diff %.2e (rel %.2e), "
+                "state diff %.2e\n",
+                modes, simdKernelName(), peak, firstBlock, whole, whole / peak, stateDiff);
+    CHECK(peak > 0.01);
+    CHECK_LE(firstBlock / peak, 1e-6);
+    CHECK_LE(whole / peak, 2e-5);
+    CHECK_LE(stateDiff, 1e-4);
+}
+
+}  // namespace
+
+TEST(scalar_and_simd_agree_even_group_count) { compareKernels(128); }
+// Odd group count exercises the single-group remainder path.
+TEST(scalar_and_simd_agree_odd_group_count) { compareKernels(80); }
+// Partial last group (padding lanes must stay silent).
+TEST(scalar_and_simd_agree_partial_group) { compareKernels(37); }
+
+TEST(string_pluck_kernels_agree) {
+    StringParams p;
+    ModeBank a, b;
+    a.allocate(256);
+    b.allocate(256);
+    loadString(a, p, kFs);
+    loadString(b, p, kFs);
+    pluck(a, 0.12, 1e-3);
+    pluck(b, 0.12, 1e-3);
+    const int n = static_cast<int>(2 * kFs);
+    const auto ya = render(a, n, Kernel::Scalar);
+    const auto yb = render(b, n, Kernel::Simd);
+    const double rel = maxDiff(ya, yb) / maxAbs(ya);
+    std::printf("  C4 pluck, 2 s: relative max diff %.2e\n", rel);
+    CHECK_LE(rel, 2e-5);
+}
+
+// Splitting the same signal into different block sizes must not change the
+// result at all: sub-block boundaries do not alter any arithmetic.
+TEST(block_size_does_not_change_output) {
+    const int n = 10000;
+    const auto u = noise(n, 3, 0.5f);
+    for (Kernel k : {Kernel::Scalar, Kernel::Simd}) {
+        ModeBank a, b;
+        fillRandom(a, 100, 5);
+        fillRandom(b, 100, 5);
+        const auto ya = render(a, n, k, &u, 64);
+        const auto yb = render(b, n, k, &u, 37);
+        CHECK(maxDiff(ya, yb) == 0.0);
+    }
+}

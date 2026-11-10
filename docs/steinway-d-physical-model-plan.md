@@ -114,7 +114,7 @@ flowchart LR
 Transverse displacement y(x,t) of a stiff, lossy string (Chaigne–Askenfelt / Bensa form):
 
 ```
-μ ∂²y/∂t² = T ∂²y/∂x² − E·S·κ² ∂⁴y/∂x⁴ − 2·b1·μ ∂y/∂t + 2·b3·μ ∂³y/∂t∂x² + f_hammer(x,t)
+μ ∂²y/∂t² = T ∂²y/∂x² − E·S·κ² ∂⁴y/∂x⁴ − 2·b1·μ ∂y/∂t + 2·b3·μ ∂³y/∂t³ + f_hammer(x,t)
 ```
 
 with μ linear density, T tension, E Young's modulus, S core cross-section, κ = d/4 radius of gyration.
@@ -126,6 +126,8 @@ f_n = n·f0·sqrt(1 + B·n²)            B = π³·E·d⁴ / (64·T·L²)
 σ_n = b1 + b3·(2π f_n)²              T60_n = 6.91 / σ_n
 φ_n(x) = sin(nπx/L)                  modal mass m_n = μL/2
 ```
+
+The loss term is the Chaigne–Askenfelt third-time-derivative form, which gives the σ_n above with b3 in seconds. (Bensa's mixed-derivative form ∂³y/∂t∂x² is better posed for finite-difference schemes but gives σ = b1 + b3·k² with b3 in m²/s; the offline reference must pick one and convert.) Note that f0 here is the flexible-string fundamental: the first partial sounds at f0·sqrt(1 + B), so tuning targets must be applied to the sounding partial.
 
 The two-parameter loss law is only a first fit. The real decay of a partial is dominated by the bridge admittance at that frequency, which the coupled model supplies separately (§1.4), so b1 and b3 represent internal and air losses only.
 

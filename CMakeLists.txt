@@ -1,0 +1,41 @@
+cmake_minimum_required(VERSION 3.20)
+project(piano_physical_model LANGUAGES CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
+option(PM_BUILD_TESTS "Build unit tests" ON)
+option(PM_BUILD_TOOLS "Build render_cli" ON)
+option(PM_BUILD_BENCH "Build kernel benchmark" ON)
+option(PM_NATIVE_ARCH "Compile for the host CPU (-march=native; enables AVX2 on x86)" OFF)
+
+# Warnings and optimisation shared by every target.
+add_library(pm_options INTERFACE)
+if(MSVC)
+  target_compile_options(pm_options INTERFACE /W4 $<$<CONFIG:Release>:/O2>)
+else()
+  target_compile_options(pm_options INTERFACE -Wall -Wextra -Wpedantic
+                         $<$<CONFIG:Release>:-O3>)
+  if(PM_NATIVE_ARCH)
+    target_compile_options(pm_options INTERFACE -march=native)
+  endif()
+endif()
+
+add_subdirectory(core/pm_base)
+add_subdirectory(core/pm_string)
+
+if(PM_BUILD_TOOLS)
+  add_subdirectory(tools/render_cli)
+endif()
+if(PM_BUILD_BENCH)
+  add_subdirectory(tools/bench)
+endif()
+if(PM_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()
