@@ -1,0 +1,7 @@
+# One long mf C4, held for 25 s: the fundamental and low partials show the
+# prompt sound (in-phase vertical motion of the three strings, strongly
+# coupled to the bridge) and the much slower aftersound (antisymmetric and
+# horizontal motion), with slow beating between the detuned strings.
+#   analyze_decay.py double_decay.wav --note 60 --at 0 --seconds 25
+0.0   note_on C4 80
+25.0  note_off C4

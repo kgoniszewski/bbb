@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(piano_physical_model LANGUAGES CXX)
+project(piano_physical_model LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -11,7 +11,7 @@ endif()
 
 option(PM_BUILD_TESTS "Build unit tests" ON)
 option(PM_BUILD_TOOLS "Build render_cli" ON)
-option(PM_BUILD_BENCH "Build kernel benchmark" ON)
+option(PM_BUILD_BENCH "Build kernel and engine benchmarks" ON)
 option(PM_NATIVE_ARCH "Compile for the host CPU (-march=native; enables AVX2 on x86)" OFF)
 
 # Warnings and optimisation shared by every target.
@@ -28,9 +28,16 @@ endif()
 
 add_subdirectory(core/pm_base)
 add_subdirectory(core/pm_string)
+add_subdirectory(core/pm_hammer)
+add_subdirectory(core/pm_voicing)
+add_subdirectory(core/pm_engine)
+add_subdirectory(core/pm_api)
 
 if(PM_BUILD_TOOLS)
   add_subdirectory(tools/render_cli)
+endif()
+if(PM_BUILD_TOOLS OR PM_BUILD_TESTS)
+  add_subdirectory(tools/reference_fdtd)
 endif()
 if(PM_BUILD_BENCH)
   add_subdirectory(tools/bench)

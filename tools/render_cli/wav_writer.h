@@ -1,4 +1,5 @@
-// Minimal mono WAV writer: 32-bit IEEE float or 24-bit PCM, little-endian.
+// Minimal WAV writer: 32-bit IEEE float or 24-bit PCM, little-endian, any
+// channel count (samples interleaved).
 #pragma once
 
 #include <algorithm>
@@ -25,9 +26,9 @@ inline void putTag(std::vector<std::uint8_t>& b, const char* t) { b.insert(b.end
 }  // namespace detail
 
 // Returns false on I/O error. Pcm24 clips to [-1, 1); returns the number of
-// clipped samples through 'clipped' if given.
+// clipped samples through 'clipped' if given. x holds interleaved frames.
 inline bool writeWav(const char* path, const std::vector<float>& x, int sampleRate,
-                     WavFormat fmt, std::size_t* clipped = nullptr) {
+                     WavFormat fmt, std::size_t* clipped = nullptr, int channels = 1) {
     using namespace detail;
     const bool isFloat = fmt == WavFormat::Float32;
     const std::uint32_t bytesPerSample = isFloat ? 4 : 3;
@@ -44,16 +45,17 @@ inline bool writeWav(const char* path, const std::vector<float>& x, int sampleRa
     putTag(b, "fmt ");
     put32(b, fmtBytes);
     put16(b, isFloat ? 3 : 1);  // WAVE_FORMAT_IEEE_FLOAT / WAVE_FORMAT_PCM
-    put16(b, 1);                // mono
+    const std::uint32_t ch = static_cast<std::uint32_t>(channels);
+    put16(b, ch);
     put32(b, static_cast<std::uint32_t>(sampleRate));
-    put32(b, static_cast<std::uint32_t>(sampleRate) * bytesPerSample);
-    put16(b, bytesPerSample);
+    put32(b, static_cast<std::uint32_t>(sampleRate) * bytesPerSample * ch);
+    put16(b, bytesPerSample * ch);
     put16(b, bytesPerSample * 8);
     if (isFloat) {
         put16(b, 0);
         putTag(b, "fact");
         put32(b, 4);
-        put32(b, static_cast<std::uint32_t>(x.size()));
+        put32(b, static_cast<std::uint32_t>(x.size() / ch));
     }
     putTag(b, "data");
     put32(b, dataBytes);

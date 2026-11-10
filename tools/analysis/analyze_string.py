@@ -22,10 +22,10 @@ import numpy as np
 LN1000 = np.log(1000.0)
 
 
-def read_wav(path):
-    """Returns (samples as float64 mono array, sample rate). Supports PCM
-    16/24/32-bit and IEEE float 32/64-bit, including WAVE_FORMAT_EXTENSIBLE.
-    Multi-channel files are reduced to their first channel."""
+def read_wav_channels(path):
+    """Returns (samples as a float64 array of shape (frames, channels), sample
+    rate). Supports PCM 16/24/32-bit and IEEE float 32/64-bit, including
+    WAVE_FORMAT_EXTENSIBLE."""
     with open(path, "rb") as f:
         data = f.read()
     if data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
@@ -61,7 +61,13 @@ def read_wav(path):
         x = v / 8388608.0
     else:
         raise ValueError(f"{path}: unsupported format tag {tag}, {bits} bits")
-    return x.reshape(-1, channels)[:, 0], rate
+    return x.reshape(-1, channels), rate
+
+
+def read_wav(path):
+    """Returns (first channel as a float64 array, sample rate)."""
+    x, rate = read_wav_channels(path)
+    return x[:, 0], rate
 
 
 def blackman_harris(n):

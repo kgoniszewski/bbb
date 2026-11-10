@@ -1,0 +1,6 @@
+add_library(pm_api STATIC pm_api.cpp)
+target_include_directories(pm_api PUBLIC ${PROJECT_SOURCE_DIR}/core)
+target_link_libraries(pm_api PUBLIC pm_engine)
+if(NOT MSVC)
+  target_compile_options(pm_api PRIVATE -fno-exceptions -fno-rtti)
+endif()

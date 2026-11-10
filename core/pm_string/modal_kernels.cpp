@@ -10,12 +10,14 @@ void runModesScalar(const BankView& b, const int* groups, int nGroups, const flo
     for (int gi = 0; gi < nGroups; ++gi) {
         const int m0 = groups[gi] * ModeBank::kGroupSize;
         for (int m = m0; m < m0 + ModeBank::kGroupSize; ++m) {
-            const float dr = b.dr[m], ci = b.ci[m], wi = b.wIn[m], wo = b.wOut[m];
+            const float dr = b.dr[m], ci = b.ci[m], wr = b.wInRe[m], wi = b.wInIm[m], wo = b.wOut[m];
             float zr = b.zr[m], zi = b.zi[m];
             for (int k = 0; k < n; ++k) {
                 // Same evaluation order as the SIMD kernel.
-                const float nr = ((zr + wi * in[k]) + dr * zr) - ci * zi;
-                const float ni = (zi + dr * zi) + ci * zr;
+                const float ar = in ? zr + wr * in[k] : zr;
+                const float ai = in ? zi + wi * in[k] : zi;
+                const float nr = (ar + dr * zr) - ci * zi;
+                const float ni = (ai + dr * zi) + ci * zr;
                 zr = nr;
                 zi = ni;
                 out[k] += wo * zi;
@@ -37,8 +39,8 @@ static_assert(ModeBank::kGroupSize % kWidth == 0, "group must be a whole number 
 // serial chain (z[n+1] needs z[n]: three dependent FMA latencies per
 // sample), so enough independent vectors must be in flight to hide that
 // latency; past that point extra vectors only add register spills (each
-// vector needs zr, zi, dr, ci, wIn, wOut).
-//   NEON: 2 groups = 8 vectors (8 x 6 fills 32 registers less a few). NOT yet
+// vector needs zr, zi, dr, ci, wOut, plus wInRe, wInIm with an input).
+//   NEON: 2 groups = 8 vectors (8 x 5 fills 32 registers less a few). NOT yet
 //         measured on Apple silicon; tune with -DPM_GROUPS_PER_STEP=N on device.
 //   AVX2: 4 groups = 8 vectors of 8 (measured best on x86: 1/2/4 groups gave
 //         0.27/0.13/0.115 ns per mode-sample).
@@ -51,11 +53,16 @@ constexpr int kGroupsPerStep = 4;
 constexpr int kGroupsPerStep = 2;
 #endif
 
-template <int NG>
+// HasInput = false is the free-running case (every key in the engine: the
+// hammer solver drives its modes itself): four FMAs and one output FMA per
+// mode and sample. With an input the complex input weight adds two.
+template <int NG, bool HasInput>
 inline void step(const BankView& b, const int* groups, const float* in, float* scratch,
                  int n) noexcept {
     constexpr int NV = NG * kVecPerGroup;
-    vf zr[NV], zi[NV], dr[NV], ci[NV], wi[NV], wo[NV];
+    constexpr int NI = HasInput ? NV : 1;
+    vf zr[NV], zi[NV], dr[NV], ci[NV], wo[NV];
+    [[maybe_unused]] vf wr[NI], wi[NI];
     int base[NV];
     for (int v = 0; v < NV; ++v) {
         base[v] = groups[v / kVecPerGroup] * ModeBank::kGroupSize + (v % kVecPerGroup) * kWidth;
@@ -63,18 +70,26 @@ inline void step(const BankView& b, const int* groups, const float* in, float* s
         zi[v] = load(b.zi + base[v]);
         dr[v] = load(b.dr + base[v]);
         ci[v] = load(b.ci + base[v]);
-        wi[v] = load(b.wIn + base[v]);
         wo[v] = load(b.wOut + base[v]);
+        if constexpr (HasInput) {
+            wr[v] = load(b.wInRe + base[v]);
+            wi[v] = load(b.wInIm + base[v]);
+        }
     }
     for (int k = 0; k < n; ++k) {
-        const vf u = set1(in[k]);
+        [[maybe_unused]] const vf u = HasInput ? set1(in[k]) : zero();
         // Two accumulators so the output sum is a short tree, not a chain.
         vf acc0 = load(scratch + k * kWidth);
         vf acc1 = zero();
         for (int v = 0; v < NV; ++v) {
             // z + (c - 1) z: four FMAs per mode, like the plain c*z form.
-            const vf nr = fnmadd(ci[v], zi[v], fmadd(dr[v], zr[v], fmadd(wi[v], u, zr[v])));
-            const vf ni = fmadd(ci[v], zr[v], fmadd(dr[v], zi[v], zi[v]));
+            vf ar = zr[v], ai = zi[v];
+            if constexpr (HasInput) {
+                ar = fmadd(wr[v], u, ar);
+                ai = fmadd(wi[v], u, ai);
+            }
+            const vf nr = fnmadd(ci[v], zi[v], fmadd(dr[v], zr[v], ar));
+            const vf ni = fmadd(ci[v], zr[v], fmadd(dr[v], zi[v], ai));
             zr[v] = nr;
             zi[v] = ni;
             if (v & 1)
@@ -90,6 +105,15 @@ inline void step(const BankView& b, const int* groups, const float* in, float* s
     }
 }
 
+template <bool HasInput>
+void runAll(const BankView& b, const int* groups, int nGroups, const float* in, float* scratch,
+            int n) noexcept {
+    int gi = 0;
+    for (; gi + kGroupsPerStep <= nGroups; gi += kGroupsPerStep)
+        step<kGroupsPerStep, HasInput>(b, groups + gi, in, scratch, n);
+    for (; gi < nGroups; ++gi) step<1, HasInput>(b, groups + gi, in, scratch, n);
+}
+
 }  // namespace
 
 void runModesSimd(const BankView& b, const int* groups, int nGroups, const float* in,
@@ -97,12 +121,10 @@ void runModesSimd(const BankView& b, const int* groups, int nGroups, const float
     // Per-lane partial sums live in scratch; one horizontal sum per sample at
     // the end instead of one per group per sample.
     for (int k = 0; k < n; ++k) store(scratch + k * kWidth, zero());
-
-    int gi = 0;
-    for (; gi + kGroupsPerStep <= nGroups; gi += kGroupsPerStep)
-        step<kGroupsPerStep>(b, groups + gi, in, scratch, n);
-    for (; gi < nGroups; ++gi) step<1>(b, groups + gi, in, scratch, n);
-
+    if (in)
+        runAll<true>(b, groups, nGroups, in, scratch, n);
+    else
+        runAll<false>(b, groups, nGroups, in, scratch, n);
     for (int k = 0; k < n; ++k) out[k] += hsum(load(scratch + k * kWidth));
 }
 
