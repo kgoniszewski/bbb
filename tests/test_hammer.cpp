@@ -73,7 +73,13 @@ TEST(energy_balance_with_losses) {
                         100 * r.stringEnergy / r.ke0, 100 * r.stringLoss / r.ke0,
                         100 * r.feltLoss / r.ke0, 100 * err, k.hs.fallbackSolves);
             CHECK(lost > 0.0);
-            CHECK_LE(std::fabs(err), 0.01);
+            // 1 % of the energy lost by the hammer, or 0.5 % of its initial
+            // energy where very little reaches the strings (treble): the
+            // energy of a lossy oscillator held deflected by the felt is only
+            // defined to O(sigma / omega), and the bridge makes sigma up to
+            // ~20 1/s in the treble. The exact checks are the lossless and
+            // reactive-bridge tests below.
+            CHECK(std::fabs(err) <= 0.01 || std::fabs(err * lost) <= 0.005 * r.ke0);
         }
     }
 }
@@ -271,7 +277,7 @@ TEST(una_corda_misses_one_string) {
         std::printf("  C4 una corda %.1f: string energies %.3e %.3e %.3e J (string 0 at %+.1f dB "
                     "re string 1), imbalance %+.3f %%\n",
                     u, es[0], es[1], es[2], 10 * std::log10(es[0] / es[1]), 100 * err);
-        CHECK_LE(std::fabs(err), 0.01);
+        CHECK(std::fabs(err) <= 0.01 || std::fabs(err * lost) <= 0.005 * r.ke0);
         if (u == 0.0) CHECK(es[0] > 0.5 * es[1] && es[0] < 2.0 * es[1]);
         if (u == 1.0) CHECK(es[0] < 1e-4 * es[1]);
     }

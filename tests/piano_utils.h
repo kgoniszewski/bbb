@@ -73,27 +73,18 @@ struct SingleKey {
         return e;
     }
     double partialAmplitude(int p) { return std::sqrt(partialEnergy(p)); }
-    // Rate at which the free strings lose energy now (internal and bridge
-    // losses), W: -dE/dt for E = sum_k (m/2) omega_k^2 |z_k|^2, z = V w.
-    double lossRate() {
-        double total = 0.0;
-        for (const pm::KeyPartial& kp : modes.partials) {
-            const pm::UnisonPartial& u = kp.unison;
-            const int n = u.oscillators;
-            std::complex<double> z[pm::kMaxOscillators], dz[pm::kMaxOscillators];
-            for (int k = 0; k < n; ++k) {
-                z[k] = dz[k] = 0.0;
-                for (int r = 0; r < kp.kept; ++r) {
-                    const int i = kp.firstMode + r, j = kp.keptIndex[r];
-                    const std::complex<double> w(zr()[i], zi()[i]);
-                    z[k] += u.V[k * n + j] * w;
-                    dz[k] += u.V[k * n + j] * u.mode[j].lambda * w;
-                }
-                const double om = 2.0 * std::numbers::pi * u.oscFreqHz[k];
-                total -= modes.modalMass * om * om * std::real(std::conj(z[k]) * dz[k]);
-            }
+    // Energy the free strings lose over one sample from the current state
+    // (internal and bridge losses), measured with the same energy functional
+    // as stringEnergy(): one exact free step of the bank's coefficients.
+    double lossOverOneSample() {
+        std::vector<float> r(zr(), zr() + modes.count), i(zi(), zi() + modes.count);
+        const double e0 = pm::keyStringEnergy(modes, r.data(), i.data());
+        for (int m = 0; m < modes.count; ++m) {
+            const std::complex<double> z = bank.coefficient(m) * std::complex<double>(r[m], i[m]);
+            r[m] = static_cast<float>(z.real());
+            i[m] = static_cast<float>(z.imag());
         }
-        return total;
+        return e0 - pm::keyStringEnergy(modes, r.data(), i.data());
     }
     void strike(double v) { pm::launchHammer(hs, hp, view(), v); }
 };
@@ -118,18 +109,13 @@ inline StrikeResult runStrike(SingleKey& key, double velocity, int maxSamples = 
     const pm::HammerKeyModes m = key.view();
     bool wasIn = false;
     float y = 0.0f;
-    double lost = 0.0, rate0 = key.lossRate();
+    double lost = 0.0;
     for (int s = 0; s < maxSamples; ++s) {
+        const double before = key.hs.lastContact >= 0 || key.hs.inContact ? key.lossOverOneSample() : 0.0;
         pm::runHammer(key.hs, key.hp, m, &y, 1);
         r.out.push_back(y);
         const bool in = key.hs.inContact;
-        if (key.hs.lastContact >= 0 && (in || wasIn)) {
-            const double rate1 = key.lossRate();
-            lost += 0.5 * (rate0 + rate1) / key.fs;  // trapezoid
-            rate0 = rate1;
-        } else {
-            rate0 = key.lossRate();
-        }
+        if (in || wasIn) lost += 0.5 * (before + key.lossOverOneSample());
         if (wasIn && !in) {
             r.keEnd = 0.5 * key.hp.mass * key.hs.v * key.hs.v;
             r.stringEnergy = key.stringEnergy();

@@ -51,12 +51,16 @@ void usage() {
         "  --out FILE         output WAV (default out.wav)\n"
         "\n"
         "piano mode: render_cli --score FILE [options]\n"
-        "  --score FILE       text score (time note_on KEY VEL | note_off KEY | cc64 V | ...)\n"
+        "  --score FILE       text score (time note_on KEY VEL | note_off KEY | cc64/cc66/cc67 V | ...)\n"
         "  --tail S           seconds rendered after the last event (default 4)\n"
         "  --fs, --block, --format, --out, --cull-db, --no-cull as above\n"
         "  --gain-db DB       master gain (default 0)\n"
         "  --width W          stereo width 0..1 (default 0.35)\n"
-        "  --quiet            do not list the strikes\n",
+        "  --quiet            do not list the strikes\n"
+        "  --a4 HZ            reference pitch (default 440)\n"
+        "  --stretch X        stretch tuning amount 0..1.5 (default 1)\n"
+        "  --equal-temperament  plain 12-TET instead of stretch tuning\n"
+        "  --unison-width X   scales the unison detuning (default 1; 0 = strings in unison)\n",
         d.f0, d.B, d.b1, d.b3, d.length, d.linearDensity, d.outputPos, d.outputGain,
         d.maxPartials, d.maxFreqHz);
 }
@@ -72,11 +76,13 @@ int pianoMain(int argc, char** argv) {
     double fs = 48000.0, tail = 4.0, gainDb = 0.0, width = 0.35, cullDb = -100.0;
     int block = 64;
     bool cull = true, quiet = false;
+    pm::TableOptions voicing;
     pm_tools::WavFormat format = pm_tools::WavFormat::Float32;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--no-cull") { cull = false; continue; }
         if (a == "--quiet") { quiet = true; continue; }
+        if (a == "--equal-temperament") { voicing.equalTemperament = true; continue; }
         if (i + 1 >= argc) {
             std::fprintf(stderr, "missing value for %s\n", a.c_str());
             return 2;
@@ -93,6 +99,9 @@ int pianoMain(int argc, char** argv) {
         else if (a == "--gain-db") ok = num, gainDb = d;
         else if (a == "--width") ok = num, width = d;
         else if (a == "--cull-db") ok = num, cullDb = d;
+        else if (a == "--a4") ok = num && d > 0.0, voicing.a4Hz = d;
+        else if (a == "--stretch") ok = num && d >= 0.0 && d <= 1.5, voicing.stretch = d;
+        else if (a == "--unison-width") ok = num && d >= 0.0, voicing.unisonWidth = d;
         else if (a == "--format") {
             if (std::strcmp(v, "f32") == 0) format = pm_tools::WavFormat::Float32;
             else if (std::strcmp(v, "s24") == 0) format = pm_tools::WavFormat::Pcm24;
@@ -117,7 +126,9 @@ int pianoMain(int argc, char** argv) {
     engine.setMasterGainDb(static_cast<float>(gainDb));
     engine.setStereoWidth(static_cast<float>(width));
     engine.setCulling(cull, static_cast<float>(cullDb));
-    if (!engine.prepare(fs, block)) {
+    pm::PianoTable table;
+    pm::buildPianoTable(table, voicing);
+    if (!engine.prepare(fs, block, table)) {
         std::fprintf(stderr, "engine prepare failed\n");
         return 1;
     }
@@ -164,12 +175,12 @@ int pianoMain(int argc, char** argv) {
                 static_cast<unsigned long long>(st.deferredStrikes),
                 static_cast<unsigned long long>(st.droppedEvents));
     if (!quiet) {
-        std::printf("  %-8s %-5s %-9s %-10s %-9s %-8s %-9s\n", "time s", "note", "v m/s",
-                    "contact ms", "in cont.", "contacts", "felt loss");
+        std::printf("  %-8s %-5s %-9s %-10s %-9s %-8s %-9s %-9s\n", "time s", "note", "v m/s",
+                    "contact ms", "in cont.", "contacts", "felt loss", "una corda");
         for (const pm::StrikeInfo& s : strikes)
-            std::printf("  %-8.3f %-5d %-9.2f %-10.3f %-9.3f %-8d %.1f %%\n", s.sampleTime / fs, s.note,
+            std::printf("  %-8.3f %-5d %-9.2f %-10.3f %-9.3f %-8d %-9.1f %.2f\n", s.sampleTime / fs, s.note,
                         s.velocity, s.contactSpanMs, s.contactTimeMs, s.contacts,
-                        100.0 * s.feltLossFraction);
+                        100.0 * s.feltLossFraction, s.unaCorda);
     }
     if (clipped) std::printf("  warning: %zu samples clipped in 24-bit output\n", clipped);
     return 0;

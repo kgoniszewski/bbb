@@ -14,6 +14,12 @@ namespace {
 
 constexpr double kPi = std::numbers::pi;
 
+// Relative tolerance of the contact solves (on the compression). The energy
+// identity is off by about F times the residual per substep, i.e. by about
+// 1e-10 of the contact energy: far below what the tests resolve (1e-6),
+// while each extra Newton evaluation would cost S pow calls per substep.
+constexpr double kSolveTol = 1e-10;
+
 // One substep of free propagation of all modes, w <- C w, returning
 // y_s = sum Im(proj_s w) for every string and (if wantOut) sum wOut Im w
 // afterwards. Same dr form and operation order as the bank kernel.
@@ -147,7 +153,7 @@ inline Felt::Point solveContact(const Felt& felt, double dFree, const Felt::Poin
         return qHi;
     }
     double lo = std::min(dFree - A * Fhi, 0.0), hi = dFree;
-    const double tol = 1e-13 * std::max(std::fabs(dFree), std::fabs(q0.d));
+    const double tol = kSolveTol * std::max(std::fabs(dFree), std::fabs(q0.d));
     double e = std::clamp(guess, lo, hi);
     Felt::Point q = felt.at(e);
     for (int it = 0; it < 60; ++it) {
@@ -158,7 +164,7 @@ inline Felt::Point solveContact(const Felt& felt, double dFree, const Felt::Poin
         else lo = e;
         double next = e - r / (q.dD + A * dF);
         if (!(next >= lo && next <= hi)) next = 0.5 * (lo + hi);  // safeguard
-        const bool done = std::fabs(next - e) <= 1e-13 * std::fabs(e);
+        const bool done = std::fabs(next - e) <= 1e-3 * kSolveTol * std::fabs(e);
         e = next;
         q = felt.at(e);
         if (done) break;
@@ -201,7 +207,7 @@ inline void solveContacts(const Felt& felt, const double* dFree, const Felt::Poi
                           Felt::Point* q1, double* F, int& fallbacks) noexcept {
     double scale = 0.0;
     for (int s = 0; s < S; ++s) scale = std::max({scale, std::fabs(dFree[s]), std::fabs(q0[s].d)});
-    const double tol = 1e-13 * scale;
+    const double tol = kSolveTol * scale;
     double e[S], dF[S], r[S];
     for (int s = 0; s < S; ++s) e[s] = std::min(guess[s], dFree[s]);
     for (int it = 0; it < 12; ++it) {
@@ -284,8 +290,10 @@ void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, 
             Felt::Point q1[S];
             double P = 0.0;
             if (touching) {
+                // Quadratic extrapolation of the felt compression: with it one
+                // Newton step usually meets the tolerance.
                 double guess[S];
-                for (int s = 0; s < S; ++s) guess[s] = q0[s].e + h.dxiPrev[s];
+                for (int s = 0; s < S; ++s) guess[s] = q0[s].e + 2.0 * h.dxiPrev[s] - h.dxiPrev2[s];
                 if constexpr (S == 1) {
                     q1[0] = solveContact(felt, dFree[0], q0[0], Ah + m.G[0][0], guess[0], F[0]);
                 } else {
@@ -309,6 +317,7 @@ void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, 
                     h.feltLoss += F[s] * (q1[s].d - q0[s].d) - (q1[s].W - q0[s].W);
                 }
                 h.yPrev[s] = y;
+                h.dxiPrev2[s] = h.dxiPrev[s];
                 h.dxiPrev[s] = q1[s].e - q0[s].e;
                 q0[s] = q1[s];
             }
@@ -471,6 +480,7 @@ void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m
         h.wPrev[s] = 0.0;
         h.fPrev[s] = 0.0;
         h.dxiPrev[s] = velocity * m.h;
+        h.dxiPrev2[s] = velocity * m.h;
         h.yPrev[s] = used ? y[s] : 0.0;
     }
     h.launchVelocity = velocity;

@@ -1,0 +1,14 @@
+# C4 at the same velocity with the una corda up, at half travel and fully
+# down (8 s each): the level falls, and the aftersound share rises because
+# the hammer strikes the trichord unevenly (one string grazed, then missed).
+# The pedal moves between notes; a sounding note is never affected.
+#   analyze_decay.py una_corda.wav --note 60 --at 0,8,16 --seconds 7.5
+0.0   note_on C4 80
+7.5   note_off C4
+7.9   cc67 64
+8.0   note_on C4 80
+15.5  note_off C4
+15.9  cc67 127
+16.0  note_on C4 80
+23.5  note_off C4
+24.0  cc67 0

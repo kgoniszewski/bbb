@@ -48,28 +48,40 @@ TEST(centroid_and_level_rise_with_velocity) {
     }
 }
 
-// The sounding first partial of every key is within 0.5 cent of equal
-// temperament (A4 = 440 Hz).
+// The sounding first partial of every key is at the tuner's target
+// (stretch tuning, A4 = 440 Hz) despite the bridge reactance, which the key
+// loader compensates: within 0.5 cent with unison width 0 (strings in
+// unison). With the default detuned unisons the partial is a beating
+// cluster of normal modes 0.05-1 Hz apart; the phase slope of the sum then
+// wanders by up to about 1.5 cent over the 1 s window, so 2 cents are allowed.
 TEST(every_key_in_tune) {
-    pm::Engine eng;
-    double worst = 0.0;
-    int worstKey = 0;
-    for (int key = 1; key <= 88; ++key) {
-        eng.prepare(kFs, 64);
-        const double f1 = 440.0 * std::pow(2.0, (key - 49) / 12.0);
-        const int n = static_cast<int>(kFs * (key < 30 ? 2.0 : 1.0));
-        const Stereo s = renderEngine(eng, {noteOn(0, key + 20, 110)}, n);
-        std::vector<float> tail(s.l.begin() + 2400, s.l.end());
-        const pm_test::PartialFit fit = pm_test::measurePartial(tail, kFs, f1, f1, 50.0);
-        const double c = fit.frames >= 3 ? pm_test::cents(fit.freqHz, f1) : 1e9;
-        if (std::fabs(c) > std::fabs(worst)) {
-            worst = c;
-            worstKey = key;
+    for (double width : {0.0, 1.0}) {
+        pm::TableOptions o;
+        o.unisonWidth = width;
+        pm::PianoTable table;
+        pm::buildPianoTable(table, o);
+        const double tol = width == 0.0 ? 0.5 : 2.0;
+        pm::Engine eng;
+        double worst = 0.0;
+        int worstKey = 0;
+        for (int key = 1; key <= 88; ++key) {
+            eng.prepare(kFs, 64, table);
+            const double f1 = table.keys[key - 1].f1;
+            const int n = static_cast<int>(kFs * (key < 30 ? 2.0 : 1.0));
+            const Stereo s = renderEngine(eng, {noteOn(0, key + 20, 110)}, n);
+            std::vector<float> tail(s.l.begin() + 2400, s.l.end());
+            const pm_test::PartialFit fit = pm_test::measurePartial(tail, kFs, f1, f1, 50.0);
+            const double c = fit.frames >= 3 ? pm_test::cents(fit.freqHz, f1) : 1e9;
+            if (std::fabs(c) > std::fabs(worst)) {
+                worst = c;
+                worstKey = key;
+            }
+            if (!(std::fabs(c) <= tol)) std::printf("  key %d: %.3f cents (%d frames)\n", key, c, fit.frames);
+            CHECK_LE(std::fabs(c), tol);
         }
-        if (!(std::fabs(c) <= 0.5)) std::printf("  key %d: %.3f cents (%d frames)\n", key, c, fit.frames);
-        CHECK_LE(std::fabs(c), 0.5);
+        std::printf("  unison width %.0f: worst first-partial error %.4f cents (key %d)\n", width, worst,
+                    worstKey);
     }
-    std::printf("  worst first-partial error %.4f cents (key %d)\n", worst, worstKey);
 }
 
 // Re-striking a sounding string: no step at the event beyond the signal's

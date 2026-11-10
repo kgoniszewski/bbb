@@ -80,6 +80,17 @@ TEST(render_does_not_allocate) {
     ev.push_back(sustain(3000, true));
     for (int n = 21; n <= 108; n += 3) ev.push_back(noteOff(5000 + n, n));
     ev.push_back(noteOn(6000, 60, 127));  // re-strike of a sounding string
+    pm::Event una = simple(6500, pm::EventType::UnaCorda);
+    una.value = 40000;
+    ev.push_back(una);
+    ev.push_back(noteOn(6600, 62, 100));  // struck with una corda
+    pm::Event sos = simple(7000, pm::EventType::Sostenuto);
+    sos.value = 65535;
+    ev.push_back(sos);
+    ev.push_back(noteOff(7500, 62));
+    sos.time = 8500;
+    sos.value = 0;
+    ev.push_back(sos);
     ev.push_back(sustain(9000, false));
     ev.push_back(simple(12000, pm::EventType::AllNotesOff));
     ev.push_back(noteOn(14000, 72, 90));

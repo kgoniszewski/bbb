@@ -2,7 +2,9 @@
 //
 //   <time s> note_on  <key> <velocity 1..127>
 //   <time s> note_off <key> [release velocity 1..127]
-//   <time s> cc64     <value 0..127>
+//   <time s> cc64     <value 0..127>      sustain
+//   <time s> cc66     <value 0..127>      sostenuto
+//   <time s> cc67     <value 0..127>      una corda (continuous)
 //   <time s> all_notes_off
 //   <time s> panic
 //
@@ -91,9 +93,11 @@ inline bool readScore(const char* path, double fs, std::vector<ScoreEvent>& out)
                 } else if (kind == "note_on") {
                     goto bad;
                 }
-            } else if (kind == "cc64") {
+            } else if (kind == "cc64" || kind == "cc66" || kind == "cc67") {
                 if (!(ls >> b) || b < 0 || b > 127) goto bad;
-                e.type = pm::EventType::Sustain;
+                e.type = kind == "cc64" ? pm::EventType::Sustain
+                         : kind == "cc66" ? pm::EventType::Sostenuto
+                                          : pm::EventType::UnaCorda;
                 e.value = pm::value16FromMidi7(b);
             } else if (kind == "all_notes_off") {
                 e.type = pm::EventType::AllNotesOff;

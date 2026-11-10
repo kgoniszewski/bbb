@@ -128,11 +128,21 @@ void buildPianoTable(PianoTable& table, const TableOptions& opt) noexcept {
 
         k.strings = defaultStringCount(k.key);
         if (k.strings > 1) {
-            double u[kMaxStrings], mean = 0.0;
-            for (int s = 0; s < k.strings; ++s) mean += (u[s] = uniform(opt.seed, k.key, 1, s));
+            // A spread pattern (randomly permuted) with +-30 % jitter, zero
+            // mean: every unison is detuned by about the spread, none
+            // accidentally in perfect tune.
+            static const double kPattern2[2] = {-0.5, 0.5}, kPattern3[3] = {-0.6, 0.0, 0.6};
+            const double* pat = k.strings == 2 ? kPattern2 : kPattern3;
+            const int shift = static_cast<int>(std::floor((uniform(opt.seed, k.key, 3, 0) + 1.0) * 0.5 * k.strings)) % k.strings;
+            const bool flip = uniform(opt.seed, k.key, 3, 1) < 0.0;
+            double d[kMaxStrings], mean = 0.0;
+            for (int s = 0; s < k.strings; ++s) {
+                const double base = pat[(s + shift) % k.strings] * (flip ? -1.0 : 1.0);
+                mean += (d[s] = base + 0.3 * std::fabs(base + 0.5) * uniform(opt.seed, k.key, 1, s));
+            }
             mean /= k.strings;
             for (int s = 0; s < k.strings; ++s)
-                k.detuneCents[s] = opt.unisonWidth * opt.unisonSpreadCents * (u[s] - mean);
+                k.detuneCents[s] = opt.unisonWidth * opt.unisonSpreadCents * 2.0 * (d[s] - mean);
         }
         // Horizontal modes a little sharp (stiffer horizontal termination).
         k.polarizationSplitCents = 0.2;

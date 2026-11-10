@@ -77,7 +77,7 @@ struct TableOptions {
     double stretch = 1.0;             // 0 .. 1.5 of the computed stretch
     bool equalTemperament = false;    // plain 12-TET on the first partial
     double unisonWidth = 1.0;         // scales every string's detuning
-    double unisonSpreadCents = 0.6;   // at width 1
+    double unisonSpreadCents = 0.5;   // per-string offsets about +-this at width 1
     double matingSpreadM = 15e-6;     // hammer-string offsets, +- metres
     std::uint64_t seed = 1;           // detuning and mating offsets
 };

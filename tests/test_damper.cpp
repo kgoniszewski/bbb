@@ -53,12 +53,14 @@ TEST(note_off_decays_without_click) {
         const Stereo s = renderEngine(eng, {noteOn(0, note, 80), noteOff(off, note)}, off + 48000);
         const double t60 = timeTo60(s, off);
         const double before = maxStep(s.l, off - 960, off);
-        const double after = maxStep(s.l, off, off + 960);
-        std::printf("  note %d: -60 dB %.3f s after note-off; max step before %.4f, after %.4f\n", note,
+        const double after = maxStep(s.l, off - 3, off + 3);
+        std::printf("  note %d: -60 dB %.3f s after note-off; max step before %.4f, around the event %.4f\n", note,
                     t60, before, after);
         if (note >= 48) CHECK(t60 >= 0.1 && t60 <= 0.4);
         else CHECK(t60 >= 0.1 && t60 <= 1.0);
-        CHECK_LE(after, 1.01 * before);
+        // Steps around the event against the signal's own steps just before
+        // (beating unisons make the envelope itself vary by a few %).
+        CHECK_LE(after, 1.05 * before);
     }
 }
 

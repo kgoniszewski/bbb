@@ -23,10 +23,10 @@ void fillRandom(ModeBank& bank, int modes, unsigned seed) {
     bank.resize(modes);
     for (int i = 0; i < modes; ++i) {
         const double f = uf(rng), sigma = us(rng);
-        const double wIn = 0.01 * uw(rng), wOut = uw(rng) / modes;
+        const double wIn = 0.01 * uw(rng), wInIm = 0.01 * uw(rng), wOut = uw(rng) / modes;
         const double re = uw(rng), im = uw(rng);
         bank.setMode(i, f, sigma, kFs);
-        bank.setWeights(i, static_cast<float>(wIn), static_cast<float>(wOut));
+        bank.setWeights(i, static_cast<float>(wIn), static_cast<float>(wInIm), static_cast<float>(wOut));
         bank.setState(i, static_cast<float>(re), static_cast<float>(im));
     }
 }
@@ -52,14 +52,14 @@ double maxDiff(const std::vector<float>& a, const std::vector<float>& b) {
     return m;
 }
 
-void compareKernels(int modes) {
+void compareKernels(int modes, bool withInput = true) {
     const int n = static_cast<int>(kFs);  // 1 s
     const auto u = noise(n, 7, 1.0f);
     ModeBank a, b;
     fillRandom(a, modes, 42);
     fillRandom(b, modes, 42);
-    const auto ya = render(a, n, Kernel::Scalar, &u);
-    const auto yb = render(b, n, Kernel::Simd, &u);
+    const auto ya = render(a, n, Kernel::Scalar, withInput ? &u : nullptr);
+    const auto yb = render(b, n, Kernel::Simd, withInput ? &u : nullptr);
     const double peak = maxAbs(ya);
     // First block: only a few roundings apart.
     double firstBlock = 0.0;
@@ -69,9 +69,10 @@ void compareKernels(int modes) {
     for (int i = 0; i < modes; ++i)
         stateDiff = std::max({stateDiff, double(std::fabs(a.stateRe(i) - b.stateRe(i))),
                               double(std::fabs(a.stateIm(i) - b.stateIm(i)))});
-    std::printf("  %d modes (%s): peak %.3f, first block diff %.2e, 1 s diff %.2e (rel %.2e), "
+    std::printf("  %d modes (%s, %s): peak %.3f, first block diff %.2e, 1 s diff %.2e (rel %.2e), "
                 "state diff %.2e\n",
-                modes, simdKernelName(), peak, firstBlock, whole, whole / peak, stateDiff);
+                modes, simdKernelName(), withInput ? "complex input" : "free-running", peak, firstBlock,
+                whole, whole / peak, stateDiff);
     CHECK(peak > 0.01);
     CHECK_LE(firstBlock / peak, 1e-6);
     CHECK_LE(whole / peak, 2e-5);
@@ -85,6 +86,25 @@ TEST(scalar_and_simd_agree_even_group_count) { compareKernels(128); }
 TEST(scalar_and_simd_agree_odd_group_count) { compareKernels(80); }
 // Partial last group (padding lanes must stay silent).
 TEST(scalar_and_simd_agree_partial_group) { compareKernels(37); }
+// The free-running kernel (no input).
+TEST(scalar_and_simd_agree_free_running) {
+    compareKernels(128, false);
+    compareKernels(80, false);
+}
+
+// No input is bit-identical to a zero input.
+TEST(free_running_equals_zero_input) {
+    const int n = 4800;
+    const std::vector<float> zeros(static_cast<std::size_t>(n), 0.0f);
+    for (Kernel k : {Kernel::Scalar, Kernel::Simd}) {
+        ModeBank a, b;
+        fillRandom(a, 100, 9);
+        fillRandom(b, 100, 9);
+        const auto ya = render(a, n, k, &zeros);
+        const auto yb = render(b, n, k, nullptr);
+        CHECK(maxDiff(ya, yb) == 0.0);
+    }
+}
 
 TEST(string_pluck_kernels_agree) {
     StringParams p;

@@ -115,6 +115,7 @@ struct HammerState {
     double wPrev[kMaxStrings] = {};     // contact potential
     double fPrev[kMaxStrings] = {};     // elastic felt force
     double dxiPrev[kMaxStrings] = {};   // last change of the felt compression
+    double dxiPrev2[kMaxStrings] = {};  // the one before
     double yPrev[kMaxStrings] = {};     // y_s
 
     // Statistics, from the last launch.
