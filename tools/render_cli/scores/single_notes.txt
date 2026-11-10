@@ -1,0 +1,37 @@
+# Single notes at five velocities on C2, C4 and C7, 2.5 s apart, each
+# released after 2 s. Used for centroid-vs-velocity analysis:
+#   analyze_note.py notes.wav --note 36 --at 0,2.5,5,7.5,10
+#   analyze_note.py notes.wav --note 60 --at 12.5,15,17.5,20,22.5
+#   analyze_note.py notes.wav --note 96 --at 25,27.5,30,32.5,35
+0.0   note_on C2 20
+2.0   note_off C2
+2.5   note_on C2 50
+4.5   note_off C2
+5.0   note_on C2 80
+7.0   note_off C2
+7.5   note_on C2 105
+9.5   note_off C2
+10.0  note_on C2 127
+12.0  note_off C2
+
+12.5  note_on C4 20
+14.5  note_off C4
+15.0  note_on C4 50
+17.0  note_off C4
+17.5  note_on C4 80
+19.5  note_off C4
+20.0  note_on C4 105
+22.0  note_off C4
+22.5  note_on C4 127
+24.5  note_off C4
+
+25.0  note_on C7 20
+27.0  note_off C7
+27.5  note_on C7 50
+29.5  note_off C7
+30.0  note_on C7 80
+32.0  note_off C7
+32.5  note_on C7 105
+34.5  note_off C7
+35.0  note_on C7 127
+37.0  note_off C7

@@ -224,6 +224,8 @@ inline float hammerStep(Hammer& h, float yFree, float g, float dt) noexcept {
 }
 ```
 
+**Implementation note (M2).** The sketch below is superseded. With the impulse-invariant resonator of §1.5 the instantaneous gain g of the sketch is exactly zero, so the implemented scheme (`core/pm_hammer`) differs: while in contact the hammer owns its key's modes and advances them in substeps with the force held constant per substep (exact zero-order-hold integration, which gives g > 0), the felt force is a discrete gradient of the felt potential solved by a safeguarded Newton iteration, and the static compliance of the partials above the kept band is added in series with the felt. The scheme conserves energy exactly for lossless felt and string. Substep factor: 1 below key 40, 2 for keys 40–75, 4 above.
+
 A unit test checks energy balance (hammer kinetic energy lost = string energy gained + felt dissipation) to within 1 %.
 
 ### 1.5 The modal bank (strings)

@@ -1,0 +1,26 @@
+# A C major chord over a bass octave with the sustain pedal: pedal down
+# before the chord, keys released while the pedal holds the sound, pedal
+# up at 4 s, then the same chord without pedal for comparison.
+0.00  cc64 127
+0.10  note_on C2 70
+0.10  note_on C3 75
+0.12  note_on E4 80
+0.12  note_on G4 80
+0.13  note_on C5 85
+1.00  note_off C2
+1.00  note_off C3
+1.00  note_off E4
+1.00  note_off G4
+1.00  note_off C5
+4.00  cc64 0
+
+5.00  note_on C2 70
+5.00  note_on C3 75
+5.02  note_on E4 80
+5.02  note_on G4 80
+5.03  note_on C5 85
+6.00  note_off C2
+6.00  note_off C3
+6.00  note_off E4
+6.00  note_off G4
+6.00  note_off C5

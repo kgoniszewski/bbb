@@ -1,0 +1,35 @@
+# Fast repeated note: A4 struck 16 times at 12 strikes per second, crescendo
+# from velocity 30 to 120; each key release lands halfway to the next strike
+# (re-strikes of a still-sounding, partly damped string).
+0.0000 note_on A4 30
+0.0417 note_off A4
+0.0833 note_on A4 36
+0.1250 note_off A4
+0.1667 note_on A4 42
+0.2083 note_off A4
+0.2500 note_on A4 48
+0.2917 note_off A4
+0.3333 note_on A4 54
+0.3750 note_off A4
+0.4167 note_on A4 60
+0.4583 note_off A4
+0.5000 note_on A4 66
+0.5417 note_off A4
+0.5833 note_on A4 72
+0.6250 note_off A4
+0.6667 note_on A4 78
+0.7083 note_off A4
+0.7500 note_on A4 84
+0.7917 note_off A4
+0.8333 note_on A4 90
+0.8750 note_off A4
+0.9167 note_on A4 96
+0.9583 note_off A4
+1.0000 note_on A4 102
+1.0417 note_off A4
+1.0833 note_on A4 108
+1.1250 note_off A4
+1.1667 note_on A4 114
+1.2083 note_off A4
+1.2500 note_on A4 120
+1.2917 note_off A4

@@ -38,6 +38,31 @@ jobs:
           python -m pip install --quiet numpy
           ./build/tools/render_cli/render_cli --seconds 3 --out c4.wav
           python tools/analysis/analyze_string.py c4.wav --f0 261.63 --B 3.8e-4 --b1 0.5 --b3 6.25e-9 --partials 10
+          for s in tools/render_cli/scores/*.txt; do
+            ./build/tools/render_cli/render_cli --score "$s" --out "$(basename "$s" .txt).wav" --quiet
+          done
+          python tools/analysis/analyze_note.py single_notes.wav --note 60 --at 12.5,15,17.5,20,22.5
 
       - name: Benchmark (informational)
-        run: ./build/tools/bench/bench_modal --seconds 0.5 --reps 2
+        run: |
+          ./build/tools/bench/bench_modal --seconds 0.5 --reps 2
+          ./build/tools/bench/bench_engine --seconds 1
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (ASan + UBSan)
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc -DPM_BUILD_BENCH=OFF
+          "-DCMAKE_CXX_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer"
+          "-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all"
+          "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

@@ -18,9 +18,21 @@
 // and that received no input is zeroed and put to sleep; a sleeping group is
 // skipped entirely until input large enough to matter arrives.
 //
-// process() and all setters are real-time safe: no allocation, locks or I/O.
-// Call them from one thread. The caller is responsible for denormal flushing
-// (pm::ScopedFlushDenormals at the top of the render callback).
+// Segments. A bank may be laid out as several segments (one per piano key),
+// each starting on a group boundary, so that a group never mixes keys. A
+// segment has its own input and output buffer, can be skipped for a
+// sub-block (while a hammer solver owns its modes), and carries a damper
+// amount d that scales a per-mode extra decay rate:
+//   c_eff = c_free * exp(-d * sigmaDamp_n / fs)
+// The kernels only ever see c_eff; the free coefficient is kept separately so
+// d can change at any time without accumulating rounding error.
+//
+// The bank laid out by allocate() has a single segment covering all groups.
+//
+// process(), processSegments() and the setters marked RT are real-time
+// safe: no allocation, locks or I/O. Call them from one thread. The caller
+// is responsible for denormal flushing (pm::ScopedFlushDenormals at the top
+// of the render callback).
 #pragma once
 
 #include <complex>
@@ -35,6 +47,14 @@ enum class Kernel { Scalar, Simd };
 // Name of the instruction set the Simd kernel was compiled for.
 const char* simdKernelName() noexcept;
 
+// Per-segment I/O for ModeBank::processSegments().
+struct SegmentIO {
+    const float* in = nullptr;  // force input u[0..n), or null for none
+    float* out = nullptr;       // receives the segment output (see processSegments)
+    bool skip = false;          // leave this segment untouched for this call
+    bool wrote = false;         // set by the bank: out was written
+};
+
 class ModeBank {
 public:
     static constexpr int kGroupSize = 16;
@@ -44,24 +64,50 @@ public:
     ModeBank(ModeBank&&) noexcept = default;
     ModeBank& operator=(ModeBank&&) noexcept = default;
 
-    // Non-real-time. Reserves storage for up to maxModes modes and clears
-    // everything. Returns false on allocation failure.
+    // Non-real-time. Reserves storage for up to maxModes modes in a single
+    // segment and clears everything. Returns false on allocation failure.
     bool allocate(int maxModes) noexcept;
+
+    // Non-real-time. Lays out nSegments segments; segment s holds
+    // modesPerSegment[s] modes starting on a group boundary (the rest of its
+    // last group is silent padding). All modes are in use (size() is the
+    // padded total) and cleared. Returns false on allocation failure.
+    bool allocateSegments(const int* modesPerSegment, int nSegments) noexcept;
 
     int capacity() const noexcept { return capacity_; }
     int size() const noexcept { return size_; }
     int groupCount() const noexcept { return (size_ + kGroupSize - 1) / kGroupSize; }
 
+    int segmentCount() const noexcept { return nSeg_; }
+    int segmentFirstMode(int s) const noexcept { return segFirstGroup(s) * kGroupSize; }
+    // Padded: a whole number of groups.
+    int segmentModeCount(int s) const noexcept {
+        return (segFirstGroup(s + 1) - segFirstGroup(s)) * kGroupSize;
+    }
+
     // Sets the number of modes in use (<= capacity). Modes beyond the new size
-    // are cleared, so padding lanes in the last group stay silent.
+    // are cleared, so padding lanes in the last group stay silent. Only for
+    // the single-segment layout.
     void resize(int count) noexcept;
 
-    // c = exp((-sigma + j*2*pi*freqHz) / fs), computed in double.
+    // c = exp((-sigma + j*2*pi*freqHz) / fs), computed in double. Sets the
+    // free coefficient; the segment's current damper amount is applied on top.
     void setMode(int i, double freqHz, double sigma, double fs) noexcept;
     void setWeights(int i, float wIn, float wOut) noexcept;
+    // Extra decay rate (1/s) of mode i when its segment's damper amount is 1.
+    void setDamperRate(int i, double sigmaDamp, double fs) noexcept;
     // Writing a non-zero state wakes the mode's group.
     void setState(int i, float re, float im) noexcept;
     void clearState() noexcept;
+
+    // RT. Sets the damper amount (>= 0) of segment s and recomputes the
+    // coefficients of its modes. Cheap (a short polynomial per mode); call it
+    // at control rate, only when the amount changes.
+    void setSegmentDamper(int s, float amount) noexcept;
+    float segmentDamper(int s) const noexcept { return segDamp_[s]; }
+    // RT. Marks every group of segment s awake (after its state was written
+    // directly through the state pointers below).
+    void wakeSegment(int s) noexcept;
 
     // The coefficient exactly as the kernels apply it.
     std::complex<double> coefficient(int i) const noexcept {
@@ -72,14 +118,30 @@ public:
     float weightIn(int i) const noexcept { return wIn_[i]; }
     float weightOut(int i) const noexcept { return wOut_[i]; }
 
+    // Direct access for a solver that advances one segment's modes itself
+    // (the hammer contact solver). 64-byte aligned, padded with zeros.
+    float* stateReData() noexcept { return zr_.data(); }
+    float* stateImData() noexcept { return zi_.data(); }
+    const float* weightOutData() const noexcept { return wOut_.data(); }
+    // exp(-d * sigmaDamp_n / fs) - 1 for the current damper amount d.
+    const float* damperFactorMinusOneData() const noexcept { return dampAm1_.data(); }
+
     // thresholdDb is relative to an output amplitude of 1.0 (full scale).
     // Disabling culling wakes every group.
     void setCulling(bool enabled, float thresholdDb = -100.0f) noexcept;
     bool cullingEnabled() const noexcept { return cullEnabled_; }
 
     // Advances all awake modes by nFrames samples. 'in' is the force input
-    // u[n] (may be null for no input). The bank output is ADDED to out[0..n).
+    // u[n] (may be null for no input), shared by all segments. The bank output
+    // is ADDED to out[0..n).
     void process(const float* in, float* out, int nFrames, Kernel kernel = Kernel::Simd) noexcept;
+
+    // Advances every segment not marked skip by nFrames samples, each with
+    // its own input. When a segment has awake groups its output OVERWRITES
+    // io[s].out[0..nFrames) and io[s].wrote is set; otherwise io[s].out is
+    // untouched and wrote is false (the segment is silent). io has
+    // segmentCount() entries. Skipped segments are excluded from culling.
+    void processSegments(SegmentIO* io, int nFrames, Kernel kernel = Kernel::Simd) noexcept;
 
     int activeGroups() const noexcept;
     bool groupActive(int g) const noexcept { return active_[g] != 0; }
@@ -88,22 +150,35 @@ public:
     std::uint64_t groupBlocksProcessed() const noexcept { return groupBlocks_; }
 
 private:
+    int segFirstGroup(int s) const noexcept {
+        return singleSegment_ ? (s == 0 ? 0 : groupCount()) : segGroups_[s];
+    }
+    bool allocateArrays(int groups, int segments) noexcept;
     void updateGroupGain(int g) noexcept;
-    void cullPass() noexcept;
+    void applyDamper(int i) noexcept;
+    void cullPass(const SegmentIO* io) noexcept;
+    void run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) noexcept;
 
     AlignedArray<float> zr_, zi_, dr_, ci_, wIn_, wOut_;  // dr = Re(c) - 1
+    AlignedArray<float> dr0_, ci0_;   // free-string coefficient
+    AlignedArray<float> dampRate_;    // sigmaDamp / fs per mode
+    AlignedArray<float> dampAm1_;     // current damper factor - 1
     AlignedArray<float> groupInOut_;  // max |wIn * wOut| over the group
     AlignedArray<std::uint8_t> active_;
     AlignedArray<int> activeList_;
+    AlignedArray<int> segGroups_;     // first group of each segment, plus end
+    AlignedArray<float> segDamp_;     // damper amount per segment
+    AlignedArray<float> segInput_;    // sum |u| since the last cull pass, per segment
     AlignedArray<float> scratch_;     // kCullInterval * SIMD width
     AlignedArray<float> zeros_;       // kCullInterval zero samples
 
     int capacity_ = 0;
     int size_ = 0;
+    int nSeg_ = 0;
+    bool singleSegment_ = true;
     bool cullEnabled_ = false;
     float cullThreshold_ = 1e-5f;
     int sinceCull_ = 0;
-    float intervalInput_ = 0.0f;      // sum |u| since the last cull pass
     std::uint64_t groupBlocks_ = 0;
 };
 
