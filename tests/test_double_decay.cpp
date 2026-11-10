@@ -31,9 +31,19 @@ struct NoteDecay {
     double rmsDb = 0.0;    // broadband, first 0.3 s
 };
 
+// Tests of the unison model (double decay, beating, una corda), which does
+// not depend on the bridge model: they run with the smooth placeholder
+// admittance and the soundboard off. With the M4 board a fundamental's
+// two-stage decay depends on where it falls on the board's admittance (the
+// mass-like reactance near C4, for instance, pulls the in-phase mode 0.8 Hz
+// away from the others and its aftersound beats); that the run-time loop
+// reproduces the bake is test_soundboard_coupling's job, and the M4 decay
+// times are reported by tools/analysis (README).
+const pm::PlaceholderBridgeAdmittance kSmooth;
+
 NoteDecay analyse(const PianoTable& table, int note, int vel, double seconds, double unaCorda = 0.0) {
     pm::Engine eng;
-    eng.prepare(kFs, 64, table);
+    eng.prepare(kFs, 64, table, kSmooth);
     std::vector<pm::Event> ev;
     if (unaCorda > 0.0) {
         pm::Event u = simple(0, pm::EventType::UnaCorda);
@@ -99,7 +109,7 @@ TEST(beating_at_predicted_rate) {
         k.detuneCents[0] = -0.5 * cents;
         k.detuneCents[1] = 0.5 * cents;
         k.unaCordaString = -1;
-        const pm::KeyModeSet m = pm::computeKeyModes(k, kFs);
+        const pm::KeyModeSet m = pm::computeKeyModes(k, kFs, kSmooth);
         const pm::UnisonPartial& u = m.partials[0].unison;
         int a = 0, b = 1;
         for (int j = 0; j < u.oscillators; ++j) {
@@ -128,7 +138,7 @@ TEST(beating_at_predicted_rate) {
 // the default detuning, una corda raises the aftersound (next test).
 TEST(identical_strings_limits) {
     const PianoTable t0 = table(0.0, 0.0);
-    const pm::KeyModeSet m = pm::computeKeyModes(t0.keys[39], kFs);
+    const pm::KeyModeSet m = pm::computeKeyModes(t0.keys[39], kFs, kSmooth);
     double symRate = 0.0, best = -1.0;
     for (int j = 0; j < m.partials[0].unison.oscillators; ++j)
         if (m.partials[0].unison.mode[j].score > best) {

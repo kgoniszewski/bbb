@@ -1,0 +1,21 @@
+# Sustain-pedal bloom (plan §1.6): the same staccato C major chord (0.2 s)
+# with the pedal down and with it up. With the pedal down every damper is
+# lifted, the chord's partials ring the other strings through the bridge,
+# and a broadband bloom remains after the keys are released; with it up only
+# the undamped top section answers. No special code: the bloom comes out of
+# the soundboard coupling loop.
+0.00  cc64 127
+0.20  note_on C4 90
+0.20  note_on E4 90
+0.20  note_on G4 90
+0.40  note_off C4
+0.40  note_off E4
+0.40  note_off G4
+3.50  cc64 0
+
+5.00  note_on C4 90
+5.00  note_on E4 90
+5.00  note_on G4 90
+5.20  note_off C4
+5.20  note_off E4
+5.20  note_off G4

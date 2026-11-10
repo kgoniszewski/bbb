@@ -134,6 +134,26 @@ inline StrikeResult runStrike(SingleKey& key, double velocity, int maxSamples = 
 }
 
 // Engine helpers.
+
+// For tests of one key's own damper or pedal logic: the soundboard only
+// listens (no sympathetic feedback, so no other string starts to ring) and
+// the mechanical noises are off (their noise realisations are not
+// shift-invariant). Call before prepare().
+inline void dryBoard(pm::Engine& e) {
+    pm::SoundboardConfig c;
+    c.sympathetic = 0.0;
+    e.setSoundboardConfig(c);
+    e.setNoiseLevels(0.0f, 0.0f);
+}
+// Soundboard off (the A/B mode, M3 output): for tests of the damper logic on
+// the string sound alone (the board's own low modes ring on for seconds
+// after the strings are damped, as they physically do).
+inline void noBoard(pm::Engine& e) {
+    pm::SoundboardConfig c;
+    c.enabled = false;
+    e.setSoundboardConfig(c);
+    e.setNoiseLevels(0.0f, 0.0f);
+}
 inline pm::Event noteOn(std::uint64_t sample, int note, int vel7) {
     pm::Event e;
     e.time = sample;

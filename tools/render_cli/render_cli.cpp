@@ -60,7 +60,11 @@ void usage() {
         "  --a4 HZ            reference pitch (default 440)\n"
         "  --stretch X        stretch tuning amount 0..1.5 (default 1)\n"
         "  --equal-temperament  plain 12-TET instead of stretch tuning\n"
-        "  --unison-width X   scales the unison detuning (default 1; 0 = strings in unison)\n",
+        "  --unison-width X   scales the unison detuning (default 1; 0 = strings in unison)\n"
+        "  --no-board         soundboard off (A/B: M3 output, no sympathetic loop)\n"
+        "  --sympathetic G    sympathetic loop gain 0..1.5 (default 1)\n"
+        "  --knock N          hammer knock level, N per m/s (default 0.02; 0 = off)\n"
+        "  --damper-noise N   damper-lift noise level (default 0.004; 0 = off)\n",
         d.f0, d.B, d.b1, d.b3, d.length, d.linearDensity, d.outputPos, d.outputGain,
         d.maxPartials, d.maxFreqHz);
 }
@@ -77,12 +81,15 @@ int pianoMain(int argc, char** argv) {
     int block = 64;
     bool cull = true, quiet = false;
     pm::TableOptions voicing;
+    pm::SoundboardConfig board;
+    double knock = -1.0, damperNoise = -1.0;
     pm_tools::WavFormat format = pm_tools::WavFormat::Float32;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--no-cull") { cull = false; continue; }
         if (a == "--quiet") { quiet = true; continue; }
         if (a == "--equal-temperament") { voicing.equalTemperament = true; continue; }
+        if (a == "--no-board") { board.enabled = false; continue; }
         if (i + 1 >= argc) {
             std::fprintf(stderr, "missing value for %s\n", a.c_str());
             return 2;
@@ -102,6 +109,9 @@ int pianoMain(int argc, char** argv) {
         else if (a == "--a4") ok = num && d > 0.0, voicing.a4Hz = d;
         else if (a == "--stretch") ok = num && d >= 0.0 && d <= 1.5, voicing.stretch = d;
         else if (a == "--unison-width") ok = num && d >= 0.0, voicing.unisonWidth = d;
+        else if (a == "--sympathetic") ok = num && d >= 0.0 && d <= 1.5, board.sympathetic = d;
+        else if (a == "--knock") ok = num && d >= 0.0, knock = d;
+        else if (a == "--damper-noise") ok = num && d >= 0.0, damperNoise = d;
         else if (a == "--format") {
             if (std::strcmp(v, "f32") == 0) format = pm_tools::WavFormat::Float32;
             else if (std::strcmp(v, "s24") == 0) format = pm_tools::WavFormat::Pcm24;
@@ -126,6 +136,9 @@ int pianoMain(int argc, char** argv) {
     engine.setMasterGainDb(static_cast<float>(gainDb));
     engine.setStereoWidth(static_cast<float>(width));
     engine.setCulling(cull, static_cast<float>(cullDb));
+    engine.setSoundboardConfig(board);
+    engine.setNoiseLevels(knock >= 0.0 ? static_cast<float>(knock) : engine.knockLevel(),
+                          damperNoise >= 0.0 ? static_cast<float>(damperNoise) : engine.damperNoiseLevel());
     pm::PianoTable table;
     pm::buildPianoTable(table, voicing);
     if (!engine.prepare(fs, block, table)) {
@@ -168,8 +181,9 @@ int pianoMain(int argc, char** argv) {
     std::printf("%s: %zu events, %.2f s stereo at %.0f Hz, %d modes, peak %.4f (%.1f dBFS)\n",
                 out.c_str(), score.size(), n / fs, fs, st.totalModes, peak,
                 20.0 * std::log10(std::max(peak, 1e-30f)));
-    std::printf("  render time %.1f ms (%.1fx real time), block %d, kernel %s, culling %s\n",
-                elapsed * 1e3, (n / fs) / elapsed, block, pm::simdKernelName(), cull ? "on" : "off");
+    std::printf("  render time %.1f ms (%.1fx real time), block %d, kernel %s, culling %s, soundboard %s\n",
+                elapsed * 1e3, (n / fs) / elapsed, block, pm::simdKernelName(), cull ? "on" : "off",
+                board.enabled ? "on" : "off");
     std::printf("  peak before limiter %.3f, limited samples %llu, deferred strikes %llu, dropped %llu\n",
                 st.peakPreLimiter, static_cast<unsigned long long>(st.limitedSamples),
                 static_cast<unsigned long long>(st.deferredStrikes),

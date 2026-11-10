@@ -28,6 +28,25 @@ void runModesScalar(const BankView& b, const int* groups, int nGroups, const flo
     }
 }
 
+void stepRunsScalar(const BankView& b, const int* seg, const int* m0, const int* m1, int nRuns,
+                    const float* in, float* out) noexcept {
+    for (int r = 0; r < nRuns; ++r) {
+        const float u = in[seg[r]];
+        float acc = 0.0f;
+        for (int m = m0[r]; m < m1[r]; ++m) {
+            const float zr = b.zr[m], zi = b.zi[m];
+            const float ar = zr + b.wInRe[m] * u;
+            const float ai = zi + b.wInIm[m] * u;
+            const float nr = (ar + b.dr[m] * zr) - b.ci[m] * zi;
+            const float ni = (ai + b.dr[m] * zi) + b.ci[m] * zr;
+            b.zr[m] = nr;
+            b.zi[m] = ni;
+            acc += b.wOut[m] * ni;
+        }
+        out[seg[r]] += acc;
+    }
+}
+
 namespace {
 
 using namespace pm::simd;
@@ -115,6 +134,45 @@ void runAll(const BankView& b, const int* groups, int nGroups, const float* in, 
 }
 
 }  // namespace
+
+// Memory-bound (seven loads and two stores per vector for six FMAs), so the
+// loop is kept simple; two accumulators shorten the output chain.
+void stepRunsSimd(const BankView& b, const int* seg, const int* m0, const int* m1, int nRuns,
+                  const float* in, float* out) noexcept {
+    for (int r = 0; r < nRuns; ++r) {
+        const vf u = set1(in[seg[r]]);
+        vf acc0 = zero(), acc1 = zero();
+        int m = m0[r];
+        const int end = m1[r];
+        for (; m + 2 * kWidth <= end; m += 2 * kWidth) {
+            for (int h = 0; h < 2; ++h) {
+                const int i = m + h * kWidth;
+                const vf zr = load(b.zr + i), zi = load(b.zi + i);
+                const vf dr = load(b.dr + i), ci = load(b.ci + i);
+                const vf ar = fmadd(load(b.wInRe + i), u, zr);
+                const vf ai = fmadd(load(b.wInIm + i), u, zi);
+                const vf nr = fnmadd(ci, zi, fmadd(dr, zr, ar));
+                const vf ni = fmadd(ci, zr, fmadd(dr, zi, ai));
+                store(b.zr + i, nr);
+                store(b.zi + i, ni);
+                if (h == 0) acc0 = fmadd(load(b.wOut + i), ni, acc0);
+                else acc1 = fmadd(load(b.wOut + i), ni, acc1);
+            }
+        }
+        for (; m < end; m += kWidth) {
+            const vf zr = load(b.zr + m), zi = load(b.zi + m);
+            const vf dr = load(b.dr + m), ci = load(b.ci + m);
+            const vf ar = fmadd(load(b.wInRe + m), u, zr);
+            const vf ai = fmadd(load(b.wInIm + m), u, zi);
+            const vf nr = fnmadd(ci, zi, fmadd(dr, zr, ar));
+            const vf ni = fmadd(ci, zr, fmadd(dr, zi, ai));
+            store(b.zr + m, nr);
+            store(b.zi + m, ni);
+            acc0 = fmadd(load(b.wOut + m), ni, acc0);
+        }
+        out[seg[r]] += hsum(add(acc0, acc1));
+    }
+}
 
 void runModesSimd(const BankView& b, const int* groups, int nGroups, const float* in,
                   float* out, int n, float* scratch) noexcept {

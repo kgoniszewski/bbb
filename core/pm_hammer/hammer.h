@@ -38,6 +38,18 @@
 //    safeguarded Newton per string, ignoring the off-diagonal of G) is the
 //    fallback if Newton has not converged after 12 steps; it is counted.
 //
+// Fused passes. Each substep's force is not applied in a pass of its own:
+// it is kept pending and added to the state at the start of the next
+// substep's propagation (w <- C (w + b F)), which is the same arithmetic
+// with one pass over the modes per substep instead of two. stepHammer()
+// leaves the last force pending in the HammerState between calls (the
+// engine calls it once per sample); runHammer() and flushHammer() apply it.
+// Anything that reads the key's state directly must flush first.
+//
+// Sympathetic input (soundboard loop). With m.wInRe/wInIm set and an input
+// u[k] per base sample, the key's modes also receive wIn u[k] at the end of
+// the sample's last substep, as in the bank kernel (z <- c z + wIn u).
+//
 // Because both sides integrate exactly under the same constant forces, the
 // work sum_s F_s dxi_s equals the change of felt potential plus a
 // non-negative dissipation term, so the discrete hammer + string energy can
@@ -97,6 +109,8 @@ struct HammerKeyModes {
     const float* pIm[kMaxStrings] = {};
     const float* bRe[kMaxStrings] = {};  // ZOH force weights for string s, one substep
     const float* bIm[kMaxStrings] = {};
+    const float* wInRe = nullptr;   // bank input weights (sympathetic input), or null
+    const float* wInIm = nullptr;
     double G[kMaxStrings][kMaxStrings] = {};  // metres per newton, see above
     double gOut[kMaxStrings] = {};  // sum wOut Im(b_s): output units per newton
     double cRes = 0.0;              // residual compliance of omitted modes, m/N
@@ -117,6 +131,8 @@ struct HammerState {
     double dxiPrev[kMaxStrings] = {};   // last change of the felt compression
     double dxiPrev2[kMaxStrings] = {};  // the one before
     double yPrev[kMaxStrings] = {};     // y_s
+    double fPend[kMaxStrings] = {};     // force of the last substep, not yet applied
+    bool pending = false;
 
     // Statistics, from the last launch.
     double launchVelocity = 0.0;
@@ -173,7 +189,7 @@ private:
 // String s displacement at the strike point, sum_j Im(proj_sj w_j).
 double strikeDisplacement(const HammerKeyModes& m, int s = 0) noexcept;
 
-// Starts (or restarts) a strike: the hammer is placed half a substep of
+// Starts (or restarts) a strike (flushing a pending force first): the hammer is placed half a substep of
 // travel below the first string it will meet, moving up at 'velocity' m/s.
 // Strings already vibrating keep their state; the contact sees their true
 // motion. The offsets of 'p' are latched by the caller for the strike.
@@ -182,8 +198,15 @@ void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m
 
 // Advances hammer and the key's modes by n base samples, writing the key's
 // output (sum wOut Im w after each sample, like the bank) to out[0..n).
+// 'in' (may be null) is the sympathetic input per base sample. runHammer
+// leaves the state complete (flushed); stepHammer leaves the last force
+// pending.
 void runHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, float* out,
-               int n) noexcept;
+               int n, const float* in = nullptr) noexcept;
+void stepHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in,
+                float* out, int n) noexcept;
+// Applies a pending force to the key's modes.
+void flushHammer(HammerState& h, const HammerKeyModes& m) noexcept;
 
 // True once the hammer has been off the strings for longer than the key's
 // release time (or reached its lifetime limit): the bank may take the modes

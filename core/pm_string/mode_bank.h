@@ -132,12 +132,19 @@ public:
     float* stateReData() noexcept { return zr_.data(); }
     float* stateImData() noexcept { return zi_.data(); }
     const float* weightOutData() const noexcept { return wOut_.data(); }
+    const float* weightInReData() const noexcept { return wIn_.data(); }
+    const float* weightInImData() const noexcept { return wInIm_.data(); }
     // exp(-d * sigmaDamp_n / fs) - 1 for the current damper amount d.
     const float* damperFactorMinusOneData() const noexcept { return dampAm1_.data(); }
 
     // thresholdDb is relative to an output amplitude of 1.0 (full scale).
     // Disabling culling wakes every group.
     void setCulling(bool enabled, float thresholdDb = -100.0f) noexcept;
+    // RT. Raises segment s's culling thresholds (dB >= 0, default 0): its
+    // groups sleep when their output bound is below threshold * 10^(stateDb
+    // / 20), and input keeps them awake or wakes them only when its bound
+    // exceeds threshold * 10^(inputDb / 20).
+    void setSegmentCullOffset(int s, float stateDb, float inputDb) noexcept;
     bool cullingEnabled() const noexcept { return cullEnabled_; }
 
     // Advances all awake modes by nFrames samples. 'in' is the force input
@@ -151,6 +158,54 @@ public:
     // untouched and wrote is false (the segment is silent). io has
     // segmentCount() entries. Skipped segments are excluded from culling.
     void processSegments(SegmentIO* io, int nFrames, Kernel kernel = Kernel::Simd) noexcept;
+
+    // Coupled processing (soundboard loop, pm_board/soundboard.h). The first
+    // segmentCoupledGroups(s) groups of segment s are "coupled": they take
+    // a per-sample input from the loop and must be advanced one sample at a
+    // time with stepCoupled(); the remaining groups are advanced a sub-block
+    // at a time by processSegmentsUncoupled() (no input). Per sub-block of
+    // n samples (n <= kCullInterval, never crossing a multiple of
+    // kCullInterval in absolute time):
+    //   processSegmentsUncoupled(io, n); beginCoupled(io);
+    //   n x stepCoupled(in, out);        endCoupled(io, n);
+    // Segments marked io[s].skip are left alone by all of these. Culling:
+    // a sleeping coupled group wakes as soon as the input accumulated since
+    // the last cull pass could have moved its output above the threshold
+    // (the same bound as process()); the cull pass runs in endCoupled() on
+    // the absolute kCullInterval grid.
+    void setSegmentCoupledGroups(int s, int groups) noexcept;  // non-RT
+    // Static correction of the coupled input (pm_voicing/soundboard_model.h):
+    // stepCoupled() subtracts k0 u[n] + k1 u[n-1] per awake coupled group
+    // from its segment's output, so that sleeping groups (which do not
+    // respond) are not corrected. computeStaticCorrection() derives both
+    // taps from the current coefficients and input/output weights (damper
+    // amount 0): k0 + k1 = sum wOut Im(wIn / (1 - c)) (static gain),
+    // -k1 = sum wOut Im(-wIn c / (1 - c)^2) (its slope in j omega T).
+    void computeStaticCorrection(int s) noexcept;  // non-RT, after the modes and setSegmentCoupledGroups
+    // Sum over all coupled groups of segment s (awake or not).
+    float staticCorrection0(int s) const noexcept;
+    float staticCorrection1(int s) const noexcept;
+    // The previous input of segment s as stepCoupled() remembers it (state
+    // of the static correction; tests that set the whole state use these).
+    float coupledInputHistory(int s) const noexcept { return segInPrev_[s]; }
+    void setCoupledInputHistory(int s, float u) noexcept { segInPrev_[s] = u; }
+    int segmentCoupledGroups(int s) const noexcept { return segCoupled_[s]; }
+    // RT. Overwrites io[s].out[0..n) with the uncoupled groups' output where
+    // they are awake (io[s].wrote), like processSegments.
+    void processSegmentsUncoupled(SegmentIO* io, int nFrames, Kernel kernel = Kernel::Simd) noexcept;
+    void beginCoupled(const SegmentIO* io) noexcept;
+    // RT. One sample: in[s] is segment s's input, out[s] receives its coupled
+    // groups' output for every segment with awake coupled groups (the
+    // segments listed by coupledSegments()); other entries are untouched.
+    void stepCoupled(const float* in, float* out, Kernel kernel = Kernel::Simd) noexcept;
+    // RT, valid after beginCoupled() until the next change of the awake
+    // set: segments with awake coupled groups, and segments that are asleep
+    // (in part) but can still be woken by their input.
+    int coupledSegments(const int*& list) noexcept;
+    // Whether stepCoupled() writes out[s] (segment has awake coupled groups).
+    bool segmentHasAwakeCoupled(int s) const noexcept { return segHasRuns_[s] != 0; }
+    int wakeableSegments(const int*& list) noexcept;
+    void endCoupled(const SegmentIO* io, int nFrames) noexcept;
 
     int activeGroups() const noexcept;
     bool groupActive(int g) const noexcept { return active_[g] != 0; }
@@ -167,18 +222,30 @@ private:
     void applyDamper(int i) noexcept;
     void cullPass(const SegmentIO* io) noexcept;
     void run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) noexcept;
+    void rebuildRuns() noexcept;
+    void wakeCoupled(int s) noexcept;
 
     AlignedArray<float> zr_, zi_, dr_, ci_, wIn_, wInIm_, wOut_;  // dr = Re(c) - 1
     AlignedArray<float> dr0_, ci0_;   // free-string coefficient
     AlignedArray<float> dampRate_;    // sigmaDamp / fs per mode
     AlignedArray<float> dampAm1_;     // current damper factor - 1
-    AlignedArray<float> groupInOut_;  // max |wIn| |wOut| over the group
+    AlignedArray<float> groupInOut_;  // sum |wIn| |wOut| over the group
     AlignedArray<std::uint8_t> active_;
     AlignedArray<int> activeList_;
     AlignedArray<int> segGroups_;     // first group of each segment, plus end
     AlignedArray<float> segDamp_;     // damper amount per segment
     AlignedArray<float> segInput_;    // sum |u| since the last cull pass, per segment
     AlignedArray<float> scratch_;     // kCullInterval * SIMD width
+    // Coupled processing.
+    AlignedArray<int> segCoupled_;    // coupled groups per segment
+    AlignedArray<std::uint8_t> segSkip_, segSleeping_, segHasRuns_;
+    AlignedArray<float> segWakeGain_; // max groupInOut over the coupled groups
+    AlignedArray<int> runSeg_, runM0_, runM1_, runSegList_, wakeList_;
+    int nRunSegs_ = 0, nWake_ = 0;
+    AlignedArray<float> groupK0_, groupK1_, segK0_, segK1_, segInPrev_;
+    AlignedArray<float> segCullScale_, segInputScale_;  // per-segment threshold factors
+    int nRuns_ = 0;
+    bool runsDirty_ = true;
 
     int capacity_ = 0;
     int size_ = 0;

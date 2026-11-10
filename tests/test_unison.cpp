@@ -166,7 +166,8 @@ pm::UnisonPartialSpec c4Spec(double width, double strikeHorizontal = 0.0) {
     for (int i = 0; i < 3; ++i) s.detuneRatio[i] = std::pow(2.0, width * c[i] / 1200.0);
     s.sigma = 0.35;
     s.kappa = 1081.0;
-    s.Y = pm::defaultBridge().at(40, 261.6);
+    // The smooth placeholder admittance: these are tests of the solver.
+    s.Y = pm::PlaceholderBridgeAdmittance().at(40, 261.6);
     s.phi = 1.0;
     s.modalMass = 0.002;
     s.outV = 1.0;
@@ -185,12 +186,17 @@ TEST(identical_strings_limits) {
     const pm::UnisonPartial u = pm::solveUnisonPartial(s);
     const double prompt = s.sigma + 3.0 * s.kappa * s.Y.vv.real();
     int sym = 0, anti = 0;
+    // The antisymmetric modes are degenerate (horizontalRatio is 1 here), so
+    // the solver may return any basis of that space: compare against the
+    // largest input of any mode, not the mode's own.
+    double maxIn = 0.0;
+    for (int j = 0; j < u.oscillators; ++j) maxIn = std::max(maxIn, std::abs(u.mode[j].input[0]));
     for (int j = 0; j < u.oscillators; ++j) {
         const pm::UnisonMode& m = u.mode[j];
         const double sig = -m.lambda.real();
         const cd symExc = m.input[0] + m.input[1] + m.input[2];
         if (std::fabs(sig - prompt) < 0.02 * prompt) ++sym;
-        if (std::fabs(sig - s.sigma) < 1e-6 && m.wOut < 1e-9 && std::abs(symExc) < 1e-9 * std::abs(m.input[0])) ++anti;
+        if (std::fabs(sig - s.sigma) < 1e-6 && m.wOut < 1e-9 && std::abs(symExc) < 1e-9 * maxIn) ++anti;
     }
     std::printf("  identical strings: status %d, condition %.2f; modes at the prompt rate %d, "
                 "silent antisymmetric modes at the internal rate %d\n",

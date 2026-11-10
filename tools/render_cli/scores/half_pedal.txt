@@ -1,0 +1,47 @@
+# Half-pedal ramp (plan §1.9): C3 held 1 s and released over a sustain
+# pedal at fixed positions (MIDI 0, 48, 56, 60, 64, 68, 72, 80, 127) - the
+# release decays more slowly as the felt moves from pressed, through light,
+# amplitude-dependent contact, to clear - then one long note with the pedal
+# swept slowly up and down while the strings ring (no clicks, nothing reset).
+0.00  cc64 0
+0.10  note_on C3 85
+1.10  note_off C3
+3.00  cc64 48
+3.10  note_on C3 85
+4.10  note_off C3
+6.00  cc64 56
+6.10  note_on C3 85
+7.10  note_off C3
+9.00  cc64 60
+9.10  note_on C3 85
+10.10 note_off C3
+12.00 cc64 64
+12.10 note_on C3 85
+13.10 note_off C3
+15.00 cc64 68
+15.10 note_on C3 85
+16.10 note_off C3
+18.00 cc64 72
+18.10 note_on C3 85
+19.10 note_off C3
+21.00 cc64 80
+21.10 note_on C3 85
+22.10 note_off C3
+24.00 cc64 127
+24.10 note_on C3 85
+25.10 note_off C3
+28.00 cc64 0
+
+30.00 note_on C3 85
+30.10 note_off C3
+30.00 cc64 127
+31.00 cc64 100
+31.25 cc64 80
+31.50 cc64 70
+31.75 cc64 64
+32.00 cc64 60
+32.25 cc64 56
+32.50 cc64 64
+32.75 cc64 80
+33.00 cc64 127
+34.00 cc64 0
