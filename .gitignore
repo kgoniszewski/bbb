@@ -1,0 +1,12 @@
+# Build trees
+build/
+build-*/
+cmake-build-*/
+out/
+
+# Python
+__pycache__/
+*.pyc
+
+# Rendered audio
+*.wav
