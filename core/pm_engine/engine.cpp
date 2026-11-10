@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <vector>
 
 #include "pm_base/denormals.h"
 #include "pm_voicing/key_loader.h"
@@ -41,30 +42,52 @@ bool Engine::prepare(double sampleRate, int maxFrames) noexcept {
 }
 
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept {
+    return prepare(sampleRate, maxFrames, table, defaultBridge());
+}
+
+bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table,
+                     const BridgeAdmittance& bridge) noexcept {
     prepared_ = false;
     if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
     fs_ = sampleRate;
     maxFrames_ = maxFrames;
     table_ = table;
 
+    // Normal modes of every key (non-real-time; the per-partial eigen-solves
+    // take a few milliseconds in total).
+    static const RigidBridge rigid;
+    std::vector<KeyModeSet> sets(kNumKeys);
     totalModes_ = 0;
+    perturbedPartials_ = uncoupledPartials_ = 0;
     for (int k = 0; k < kNumKeys; ++k) {
-        keyModes_[k] = pm::keyModeCount(table_.keys[k], fs_);
+        const KeyParams& kp = table_.keys[k];
+        sets[k] = computeKeyModes(kp, fs_, kp.bridgeCoupling ? bridge : static_cast<const BridgeAdmittance&>(rigid));
+        keyModes_[k] = sets[k].count;
         totalModes_ += keyModes_[k];
-        hammerParams_[k] = hammerParams(table_.keys[k]);
-        hasDamper_[k] = table_.keys[k].hasDamper;
+        perturbedPartials_ += sets[k].perturbedPartials;
+        uncoupledPartials_ += sets[k].uncoupledPartials;
+        hammerParams_[k] = hammerParams(kp);
+        unaString_[k] = kp.unaCordaString;
+        unaMiss_[k] = kp.unaCordaMiss;
+        unaSoften_[k] = std::clamp(kp.unaCordaSoften, 0.0, 0.9);
+        hasDamper_[k] = kp.hasDamper;
         // Every partial's extra decay is at least damperSigma * damperFloor.
-        const double minSigma = table_.keys[k].damperSigma * table_.keys[k].damperFloor;
+        const double minSigma = kp.damperSigma * kp.damperFloor;
         panicAmount_[k] = static_cast<float>(minSigma > 0.0 ? std::max(1.0, kPanicSigma / minSigma) : 1.0);
     }
     if (!bank_.allocateSegments(keyModes_, kNumKeys)) return false;
     if (!contact_.allocate(bank_.capacity(), kNumKeys)) return false;
     if (!io_.allocate(kNumKeys) || !keyBuf_.allocate(std::size_t{kNumKeys} * kSubBlock) ||
-        !mixL_.allocate(kSubBlock) || !mixR_.allocate(kSubBlock))
+        !mixL_.allocate(kSubBlock) || !mixR_.allocate(kSubBlock) ||
+        !groupModes_.allocate(static_cast<std::size_t>(bank_.groupCount())))
         return false;
     for (int k = 0; k < kNumKeys; ++k) {
-        loadKey(bank_, contact_, k, table_.keys[k], fs_);
+        loadKeyModes(bank_, contact_, k, table_.keys[k], sets[k], fs_);
         io_[k].out = keyBuf_.data() + std::size_t(k) * kSubBlock;
+        const int g0 = bank_.segmentFirstMode(k) / ModeBank::kGroupSize;
+        for (int g = 0; g < bank_.segmentModeCount(k) / ModeBank::kGroupSize; ++g)
+            groupModes_[g0 + g] = static_cast<std::uint8_t>(
+                std::clamp(keyModes_[k] - g * ModeBank::kGroupSize, 0, ModeBank::kGroupSize));
     }
     appliedCullOn_ = cullOn_.load(std::memory_order_relaxed);
     appliedCullDb_ = cullDb_.load(std::memory_order_relaxed);
@@ -92,6 +115,9 @@ void Engine::resetState() noexcept {
         io_[k].skip = false;
     }
     sustain_ = 0.0f;
+    sostenuto_ = false;
+    for (int k = 0; k < kNumKeys; ++k) sostLatched_[k] = false;
+    unaCorda_ = 0.0f;
     panicUntil_ = -1;
     freeCount_ = kHammerPool;
     for (int i = 0; i < kHammerPool; ++i) freeList_[i] = kHammerPool - 1 - i;
@@ -134,6 +160,7 @@ EngineStats Engine::stats() const noexcept {
     s.totalModes = totalModes_;
     s.groups = bank_.groupCount();
     s.awakeGroups = pub_.awakeGroups.load(std::memory_order_relaxed);
+    s.awakeModes = pub_.awakeModes.load(std::memory_order_relaxed);
     s.activeHammers = pub_.activeHammers.load(std::memory_order_relaxed);
     s.peakActiveHammers = pub_.peakHammers.load(std::memory_order_relaxed);
     s.droppedEvents = dropped_.load(std::memory_order_relaxed);
@@ -214,6 +241,24 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
                     retargetDamper(i, now, static_cast<float>(kDefaultReleaseVelocity));
             break;
         }
+        case static_cast<std::uint8_t>(EventType::Sostenuto): {
+            const bool down = e.value >= 32768;
+            if (down && !sostenuto_) {
+                // Latch the dampers that the keys themselves hold up now.
+                for (int i = 0; i < kNumKeys; ++i) sostLatched_[i] = keyDown_[i] && hasDamper_[i];
+            } else if (!down && sostenuto_) {
+                for (int i = 0; i < kNumKeys; ++i) {
+                    const bool was = sostLatched_[i];
+                    sostLatched_[i] = false;
+                    if (was) retargetDamper(i, now, static_cast<float>(kDefaultReleaseVelocity));
+                }
+            }
+            sostenuto_ = down;
+            break;
+        }
+        case static_cast<std::uint8_t>(EventType::UnaCorda):
+            unaCorda_ = e.value / 65535.0f;
+            break;
         case static_cast<std::uint8_t>(EventType::AllNotesOff):
             for (int i = 0; i < kNumKeys; ++i) {
                 keyDown_[i] = false;
@@ -229,6 +274,9 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
                     pending_[j++] = pending_[i];
             pendingCount_ = j;
             sustain_ = 0.0f;
+            sostenuto_ = false;
+            for (int i = 0; i < kNumKeys; ++i) sostLatched_[i] = false;
+            unaCorda_ = 0.0f;
             panicUntil_ = now + static_cast<std::int64_t>(kPanicSeconds * fs_);
             for (int i = 0; i < kNumKeys; ++i) {
                 keyDown_[i] = false;
@@ -290,8 +338,16 @@ bool Engine::strike(int k, double velocity, std::int64_t now) noexcept {
     }
     Hammer& h = hammers_[slot];
     h.launchTime = static_cast<std::uint64_t>(now);
+    h.unaCorda = unaCorda_;
+    h.params = hammerParams_[k];
+    if (unaCorda_ > 0.0f) {
+        const double u = unaCorda_;
+        if (unaString_[k] >= 0 && unaString_[k] < h.params.strings)
+            h.params.offset[unaString_[k]] += u * u * unaMiss_[k];
+        h.params.K *= 1.0 - u * unaSoften_[k];
+    }
     const HammerKeyModes m = contact_.view(bank_, k);
-    launchHammer(h.state, hammerParams_[k], m, velocity);
+    launchHammer(h.state, h.params, m, velocity);
     bank_.wakeSegment(k);
     return true;
 }
@@ -311,6 +367,8 @@ void Engine::releaseHammer(int a, bool report) noexcept {
         info.contactTimeMs = static_cast<float>(1e3 * m.h * double(h.state.contactSubsteps));
         info.contacts = h.state.contacts;
         info.peakForce = static_cast<float>(h.state.peakForce);
+        info.unaCorda = h.unaCorda;
+        info.fallbackSolves = h.state.fallbackSolves;
         if (h.state.kineticEnergy0 > 0.0)
             info.feltLossFraction = static_cast<float>(h.state.feltLoss / h.state.kineticEnergy0);
         strikeLog_.push(info);
@@ -326,7 +384,7 @@ void Engine::releaseHammer(int a, bool report) noexcept {
 
 float Engine::damperTarget(int k, std::int64_t now) const noexcept {
     if (now < panicUntil_) return panicAmount_[k];
-    if (!hasDamper_[k] || keyDown_[k] || sustain_ >= 0.5f) return 0.0f;
+    if (!hasDamper_[k] || keyDown_[k] || sustain_ >= 0.5f || sostLatched_[k]) return 0.0f;
     return 1.0f;
 }
 
@@ -398,7 +456,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
     for (int a = 0; a < activeCount_; ++a) {
         Hammer& h = hammers_[active_[a]];
         const HammerKeyModes m = contact_.view(bank_, h.key);
-        runHammer(h.state, hammerParams_[h.key], m, io_[h.key].out, n);
+        runHammer(h.state, h.params, m, io_[h.key].out, n);
         io_[h.key].skip = true;
     }
     bank_.processSegments(io_.data(), n);
@@ -486,7 +544,14 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     }
     sampleTime_ += static_cast<std::uint64_t>(nFrames);
 
-    pub_.awakeGroups.store(bank_.activeGroups(), std::memory_order_relaxed);
+    int awakeGroups = 0, awakeModes = 0;
+    for (int g = 0; g < bank_.groupCount(); ++g)
+        if (bank_.groupActive(g)) {
+            ++awakeGroups;
+            awakeModes += groupModes_[g];
+        }
+    pub_.awakeGroups.store(awakeGroups, std::memory_order_relaxed);
+    pub_.awakeModes.store(awakeModes, std::memory_order_relaxed);
     pub_.activeHammers.store(activeCount_, std::memory_order_relaxed);
     pub_.peakHammers.store(peakHammers_, std::memory_order_relaxed);
     pub_.deferred.store(deferred_, std::memory_order_relaxed);

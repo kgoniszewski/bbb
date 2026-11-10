@@ -1,7 +1,7 @@
 /* Stable C interface to the piano engine (plan §5.2), for Swift and Python.
  *
- * Threads: create/destroy/prepare and the velocity-curve parameters
- * (PM_PARAM_VELOCITY_*) from a non-real-time thread; pm_engine_push_event
+ * Threads: create/destroy/prepare, the velocity-curve parameters
+ * (PM_PARAM_VELOCITY_*) and the tuning parameters from a non-real-time thread; pm_engine_push_event
  * from one producer thread; pm_engine_render from the audio thread (real-time
  * safe); other parameters from any thread. Every function is noexcept and
  * tolerates a null engine pointer. */
@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 2
+#define PM_API_VERSION_MINOR 3
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -25,7 +25,9 @@ enum pm_event_type {
     PM_EVENT_NOTE_OFF = 2,      /* note, value = 16-bit release velocity (0 = default) */
     PM_EVENT_SUSTAIN = 3,       /* value = 16-bit pedal position (CC64) */
     PM_EVENT_ALL_NOTES_OFF = 4,
-    PM_EVENT_PANIC = 5
+    PM_EVENT_PANIC = 5,
+    PM_EVENT_SOSTENUTO = 6,     /* value = 16-bit pedal position (CC66), on at half travel */
+    PM_EVENT_UNA_CORDA = 7      /* value = 16-bit pedal position (CC67), continuous */
 };
 
 enum pm_time_base {
@@ -57,12 +59,18 @@ enum pm_param {
     PM_PARAM_CULLING_ENABLED = 5,         /* 0 / 1, default 1 */
     PM_PARAM_VELOCITY_MIN = 6,            /* hammer m/s at velocity 0+, default 0.3 */
     PM_PARAM_VELOCITY_MAX = 7,            /* hammer m/s at velocity 127, default 5.5 */
-    PM_PARAM_VELOCITY_EXPONENT = 8        /* power curve exponent, default 1.5 */
+    PM_PARAM_VELOCITY_EXPONENT = 8,       /* power curve exponent, default 1.5 */
+    /* Tuning and voicing: take effect at the next pm_engine_prepare. */
+    PM_PARAM_A4_HZ = 9,                   /* default 440 */
+    PM_PARAM_TUNING_STRETCH = 10,         /* 0 .. 1.5 of the computed stretch, default 1 */
+    PM_PARAM_EQUAL_TEMPERAMENT = 11,      /* 0 / 1: plain 12-TET, default 0 */
+    PM_PARAM_UNISON_WIDTH = 12            /* scales the unison detuning, default 1 */
 };
 
 typedef struct pm_stats {
     int32_t total_modes;
     int32_t awake_groups;
+    int32_t awake_modes;
     int32_t active_hammers;
     int32_t peak_active_hammers;
     uint64_t dropped_events;

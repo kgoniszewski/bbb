@@ -1,6 +1,14 @@
-// Piano engine, M2 (plan §4.2): 88 keys of one modal string each, a hammer
-// pool, dampers and sustain pedal, sample-accurate event scheduling and a
+// Piano engine, M3 (plan §4.2): 88 keys of coupled unisons (1-3 strings in
+// two polarizations, as normal modes), a hammer pool, dampers, sustain,
+// sostenuto and una corda pedals, sample-accurate event scheduling and a
 // fixed stereo output stage (no soundboard yet).
+//
+// Pedals. Sustain (CC64) lifts every damper at half travel. Sostenuto (CC66,
+// plan §1.9): when it goes down (half travel), the keys whose dampers are
+// lifted by their own keys at that moment are latched and stay undamped
+// until it comes up. Una corda (CC67) is continuous; it is latched per
+// strike when the hammer is launched (offsets and felt of that strike), so
+// moving it never changes a sounding note or a contact in progress.
 //
 // Threads. prepare() and the velocity-curve setter are non-real-time.
 // pushEvent() may be called from ONE producer thread concurrently with
@@ -18,12 +26,11 @@
 // culling, whose 64-sample grid is absolute, to within the culling
 // threshold).
 //
-// Output level. The output is the sum of the strings' bridge forces (times
-// outputGain from the table) through a fixed stereo spread and a 5 Hz DC
-// blocker. A single ff note peaks between about -17 dBFS (mid range) and
-// -6 dBFS (A0, whose attack transient is large); dense pedalled chords can
-// exceed full scale, so the output passes a soft clipper that is transparent
-// below -1 dBFS (0.89) and never reaches 1.0.
+// Output level. The output is the sum of the keys' (vertical) bridge forces
+// (times outputGain from the table) through a fixed stereo spread and a 5 Hz
+// DC blocker. Dense pedalled ff chords can exceed full scale, so the output
+// passes a soft clipper that is transparent below -1 dBFS (0.89) and never
+// reaches 1.0.
 #pragma once
 
 #include <atomic>
@@ -34,6 +41,7 @@
 #include "pm_engine/events.h"
 #include "pm_hammer/hammer.h"
 #include "pm_string/mode_bank.h"
+#include "pm_voicing/bridge_admittance.h"
 #include "pm_voicing/piano_table.h"
 
 namespace pm {
@@ -47,6 +55,7 @@ struct EngineStats {
     int totalModes = 0;           // in use (excluding group padding)
     int groups = 0;
     int awakeGroups = 0;
+    int awakeModes = 0;           // in awake groups, excluding padding
     int activeHammers = 0;
     int peakActiveHammers = 0;
     std::uint64_t droppedEvents = 0;     // queue or pending list full
@@ -67,6 +76,8 @@ struct StrikeInfo {
     int contacts = 0;              // separate contact episodes
     float peakForce = 0.0f;        // N
     float feltLossFraction = 0.0f; // of the hammer's kinetic energy
+    float unaCorda = 0.0f;         // pedal amount latched for this strike
+    int fallbackSolves = 0;        // contact substeps solved by the fallback
 };
 
 class Engine {
@@ -82,11 +93,15 @@ public:
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    // Non-real-time. Builds the default table (A4 = 440 Hz) or uses 'table',
+    // Non-real-time. Builds the default table (A4 = 440 Hz, default stretch
+    // and unison width) or uses 'table', computes every key's normal modes
+    // (with the placeholder bridge admittance unless 'bridge' is given),
     // allocates everything and resets all state. maxFrames is the largest
     // buffer the host will render (used as the default constant latency).
     bool prepare(double sampleRate, int maxFrames) noexcept;
     bool prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept;
+    bool prepare(double sampleRate, int maxFrames, const PianoTable& table,
+                 const BridgeAdmittance& bridge) noexcept;
     bool prepared() const noexcept { return prepared_; }
 
     // Producer thread. Returns false (and counts a drop) when the queue is full.
@@ -138,6 +153,13 @@ public:
     int keyModeCount(int key) const noexcept { return keyModes_[key]; }
     int freeHammers() const noexcept { return freeCount_; }
     float sustain() const noexcept { return sustain_; }
+    bool sostenutoDown() const noexcept { return sostenuto_; }
+    bool sostenutoLatched(int key) const noexcept { return sostLatched_[key]; }
+    float unaCorda() const noexcept { return unaCorda_; }
+    // Normal modes that needed a perturbed eigen-solve / fell back to
+    // uncoupled oscillators, over all keys (from prepare).
+    int perturbedPartials() const noexcept { return perturbedPartials_; }
+    int uncoupledPartials() const noexcept { return uncoupledPartials_; }
     float damperAmount(int key) const noexcept { return damp_[key].cur; }
 
 private:
@@ -154,8 +176,10 @@ private:
     };
     struct Hammer {
         HammerState state;
+        HammerParams params;  // latched at launch (una corda)
         int key;
         std::uint64_t launchTime;
+        float unaCorda;
     };
     static constexpr std::uint8_t kStrikeOnly = 100;  // internal: deferred hammer launch
 
@@ -177,10 +201,14 @@ private:
     int maxFrames_ = 0;
     PianoTable table_{};
     HammerParams hammerParams_[kNumKeys]{};
+    // Una corda: offset growth of one string and felt softening, per key.
+    int unaString_[kNumKeys]{};
+    double unaMiss_[kNumKeys]{}, unaSoften_[kNumKeys]{};
     int keyModes_[kNumKeys]{};
     ModeBank bank_;
     ContactTables contact_;
     AlignedArray<SegmentIO> io_;
+    AlignedArray<std::uint8_t> groupModes_;  // modes in use per bank group
     AlignedArray<float> keyBuf_;   // kNumKeys x kSubBlock
     AlignedArray<float> mixL_, mixR_;
 
@@ -190,7 +218,11 @@ private:
     float panicAmount_[kNumKeys]{};
     Damper damp_[kNumKeys]{};
     float sustain_ = 0.0f;
+    bool sostenuto_ = false;
+    bool sostLatched_[kNumKeys]{};
+    float unaCorda_ = 0.0f;
     std::int64_t panicUntil_ = -1;
+    int perturbedPartials_ = 0, uncoupledPartials_ = 0;
 
     // Hammers.
     Hammer hammers_[kHammerPool]{};
@@ -239,7 +271,7 @@ private:
     int peakHammers_ = 0;
     int totalModes_ = 0;
     struct Published {
-        std::atomic<int> awakeGroups{0}, activeHammers{0}, peakHammers{0};
+        std::atomic<int> awakeGroups{0}, awakeModes{0}, activeHammers{0}, peakHammers{0};
         std::atomic<std::uint64_t> deferred{0}, late{0}, limited{0}, nonFinite{0};
         std::atomic<float> peakPre{0.0f};
     } pub_;

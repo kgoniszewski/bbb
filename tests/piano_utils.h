@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <numbers>
 #include <vector>
@@ -36,33 +37,70 @@ struct SingleKey {
     pm::HammerState hs;
     double fs;
 
-    SingleKey(const pm::KeyParams& k, double sampleRate, int oversampling = 0) : params(k), fs(sampleRate) {
+    SingleKey(const pm::KeyParams& k, double sampleRate, int oversampling = 0,
+              const pm::BridgeAdmittance* bridge = nullptr)
+        : params(k), fs(sampleRate) {
         if (oversampling > 0) params.contactOversampling = oversampling;
-        modes = pm::computeKeyModes(params, fs);
+        modes = bridge ? pm::computeKeyModes(params, fs, *bridge) : pm::computeKeyModes(params, fs);
         const int n = modes.count;
         bank.allocateSegments(&n, 1);
         contact.allocate(bank.capacity(), 1);
-        pm::loadKey(bank, contact, 0, params, fs);
+        pm::loadKeyModes(bank, contact, 0, params, modes, fs);
         bank.setSegmentDamper(0, 0.0f);
         hp = pm::hammerParams(params);
     }
     pm::HammerKeyModes view() { return contact.view(bank, 0); }
-    double stringEnergy() const {
+    const float* zr() { return bank.stateReData(); }
+    const float* zi() { return bank.stateImData(); }
+    // Physical energy of all strings.
+    double stringEnergy() { return pm::keyStringEnergy(modes, zr(), zi()); }
+    // Physical energy of partial p (index into modes.partials), over all
+    // strings and polarizations; and of string s, vertical, of partial p.
+    double partialEnergy(int p, int onlyOscillator = -1) {
+        const pm::KeyPartial& kp = modes.partials[static_cast<std::size_t>(p)];
+        const pm::UnisonPartial& u = kp.unison;
+        const int n = u.oscillators;
         double e = 0.0;
-        for (int i = 0; i < modes.count; ++i)
-            e += pm::modalEnergy(bank.stateRe(i), bank.stateIm(i), modes.freq[i], modes.sigma[i],
-                                 modes.modalMass);
+        for (int k = 0; k < n; ++k) {
+            if (onlyOscillator >= 0 && k != onlyOscillator) continue;
+            std::complex<double> z = 0.0;
+            for (int r = 0; r < kp.kept; ++r) {
+                const int i = kp.firstMode + r;
+                z += u.V[k * n + kp.keptIndex[r]] * std::complex<double>(zr()[i], zi()[i]);
+            }
+            e += pm::modalEnergy(z.real(), z.imag(), u.oscFreqHz[k], u.oscSigma[k], modes.modalMass);
+        }
         return e;
     }
-    double modeAmplitude(int i) const {  // sqrt of modal energy
-        return std::sqrt(pm::modalEnergy(bank.stateRe(i), bank.stateIm(i), modes.freq[i],
-                                         modes.sigma[i], modes.modalMass));
+    double partialAmplitude(int p) { return std::sqrt(partialEnergy(p)); }
+    // Rate at which the free strings lose energy now (internal and bridge
+    // losses), W: -dE/dt for E = sum_k (m/2) omega_k^2 |z_k|^2, z = V w.
+    double lossRate() {
+        double total = 0.0;
+        for (const pm::KeyPartial& kp : modes.partials) {
+            const pm::UnisonPartial& u = kp.unison;
+            const int n = u.oscillators;
+            std::complex<double> z[pm::kMaxOscillators], dz[pm::kMaxOscillators];
+            for (int k = 0; k < n; ++k) {
+                z[k] = dz[k] = 0.0;
+                for (int r = 0; r < kp.kept; ++r) {
+                    const int i = kp.firstMode + r, j = kp.keptIndex[r];
+                    const std::complex<double> w(zr()[i], zi()[i]);
+                    z[k] += u.V[k * n + j] * w;
+                    dz[k] += u.V[k * n + j] * u.mode[j].lambda * w;
+                }
+                const double om = 2.0 * std::numbers::pi * u.oscFreqHz[k];
+                total -= modes.modalMass * om * om * std::real(std::conj(z[k]) * dz[k]);
+            }
+        }
+        return total;
     }
     void strike(double v) { pm::launchHammer(hs, hp, view(), v); }
 };
 
 struct StrikeResult {
     double ke0 = 0, keEnd = 0, stringEnergy = 0, feltLoss = 0;  // at the end of the last contact
+    double stringLoss = 0;   // J lost by the strings to internal and bridge losses until then
     double contactSpan = 0;  // s, first to last contact
     double contactTime = 0;  // s, total in contact
     int contacts = 0;
@@ -80,14 +118,23 @@ inline StrikeResult runStrike(SingleKey& key, double velocity, int maxSamples = 
     const pm::HammerKeyModes m = key.view();
     bool wasIn = false;
     float y = 0.0f;
+    double lost = 0.0, rate0 = key.lossRate();
     for (int s = 0; s < maxSamples; ++s) {
         pm::runHammer(key.hs, key.hp, m, &y, 1);
         r.out.push_back(y);
         const bool in = key.hs.inContact;
+        if (key.hs.lastContact >= 0 && (in || wasIn)) {
+            const double rate1 = key.lossRate();
+            lost += 0.5 * (rate0 + rate1) / key.fs;  // trapezoid
+            rate0 = rate1;
+        } else {
+            rate0 = key.lossRate();
+        }
         if (wasIn && !in) {
             r.keEnd = 0.5 * key.hp.mass * key.hs.v * key.hs.v;
             r.stringEnergy = key.stringEnergy();
             r.feltLoss = key.hs.feltLoss;
+            r.stringLoss = lost;
         }
         wasIn = in;
         if (pm::hammerFinished(key.hs, m)) break;

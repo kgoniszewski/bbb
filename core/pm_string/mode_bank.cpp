@@ -14,14 +14,14 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
     const std::size_t ng = static_cast<std::size_t>(groups);
     const std::size_t ns = static_cast<std::size_t>(std::max(segments, 1));
     const bool ok = zr_.allocate(padded) && zi_.allocate(padded) && dr_.allocate(padded) &&
-                    ci_.allocate(padded) && wIn_.allocate(padded) && wOut_.allocate(padded) &&
+                    ci_.allocate(padded) && wIn_.allocate(padded) && wInIm_.allocate(padded) &&
+                    wOut_.allocate(padded) &&
                     dr0_.allocate(padded) && ci0_.allocate(padded) &&
                     dampRate_.allocate(padded) && dampAm1_.allocate(padded) &&
                     groupInOut_.allocate(ng) && active_.allocate(ng) &&
                     activeList_.allocate(ng) && segGroups_.allocate(ns + 1) &&
                     segDamp_.allocate(ns) && segInput_.allocate(ns) &&
-                    scratch_.allocate(static_cast<std::size_t>(kCullInterval) * simd::kWidth) &&
-                    zeros_.allocate(kCullInterval);
+                    scratch_.allocate(static_cast<std::size_t>(kCullInterval) * simd::kWidth);
     capacity_ = ok ? static_cast<int>(padded) : 0;
     size_ = 0;
     nSeg_ = ok ? segments : 0;
@@ -60,7 +60,7 @@ void ModeBank::resize(int count) noexcept {
     if (!singleSegment_) return;
     count = std::clamp(count, 0, capacity_);
     for (int i = count; i < capacity_; ++i) {
-        zr_[i] = zi_[i] = dr_[i] = ci_[i] = wIn_[i] = wOut_[i] = 0.0f;
+        zr_[i] = zi_[i] = dr_[i] = ci_[i] = wIn_[i] = wInIm_[i] = wOut_[i] = 0.0f;
         dr0_[i] = ci0_[i] = dampRate_[i] = dampAm1_[i] = 0.0f;
     }
     size_ = count;
@@ -127,8 +127,9 @@ void ModeBank::wakeSegment(int s) noexcept {
     for (int g = segFirstGroup(s); g < segFirstGroup(s + 1); ++g) active_[g] = 1;
 }
 
-void ModeBank::setWeights(int i, float wIn, float wOut) noexcept {
-    wIn_[i] = wIn;
+void ModeBank::setWeights(int i, float wInRe, float wInIm, float wOut) noexcept {
+    wIn_[i] = wInRe;
+    wInIm_[i] = wInIm;
     wOut_[i] = wOut;
     updateGroupGain(i / kGroupSize);
 }
@@ -164,7 +165,7 @@ int ModeBank::activeGroups() const noexcept {
 void ModeBank::updateGroupGain(int g) noexcept {
     float m = 0.0f;
     for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i)
-        m = std::max(m, std::abs(wIn_[i] * wOut_[i]));
+        m = std::max(m, std::hypot(wIn_[i], wInIm_[i]) * std::abs(wOut_[i]));
     groupInOut_[g] = m;
 }
 
@@ -194,8 +195,8 @@ void ModeBank::cullPass(const SegmentIO* io) noexcept {
 }
 
 void ModeBank::run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) noexcept {
-    const detail::BankView view{zr_.data(), zi_.data(), dr_.data(),
-                                ci_.data(), wIn_.data(), wOut_.data()};
+    const detail::BankView view{zr_.data(), zi_.data(), dr_.data(),  ci_.data(),
+                                wIn_.data(), wInIm_.data(), wOut_.data()};
     for (int s = 0; s < nSeg_; ++s) io[s].wrote = false;
     int pos = 0;
     while (pos < nFrames) {
@@ -204,7 +205,7 @@ void ModeBank::run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) no
             SegmentIO& sio = io[s];
             if (sio.skip) continue;
             const int g0 = segFirstGroup(s), g1 = segFirstGroup(s + 1);
-            const float* inChunk = sio.in ? sio.in + pos : zeros_.data();
+            const float* inChunk = sio.in ? sio.in + pos : nullptr;
 
             if (cullEnabled_ && sio.in) {
                 // |z| gained from input over the chunk is at most |wIn| * sum|u|.

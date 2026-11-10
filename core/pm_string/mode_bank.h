@@ -1,7 +1,14 @@
 // Bank of complex one-pole resonators (plan §1.5), structure of arrays.
 //
-//   z[n+1] = c * z[n] + wIn * u[n]          (u enters the real part)
-//   y[n]  += wOut * Im(z[n+1])
+//   z[n+1] = c * z[n] + wIn * u[n]          (wIn complex; real for a plain string)
+//   y[n]  += wOut * Im(z[n+1])               (wOut real)
+//
+// Output weights are real. A mode whose physical output weight is complex
+// (a coupled unison normal mode, pm_voicing/unison.h) is stored with its
+// state rotated by the weight's phase, which makes the weight real at no
+// run-time cost; its input weight then carries the inverse rotation, so the
+// input weight is complex. Without an input (the engine: hammers drive their
+// keys' modes themselves) the kernel skips the input entirely.
 //
 // Coefficients are computed in double and stored as float; state runs in
 // float. The real part is stored as d = Re(c) - 1 and the update evaluated as
@@ -93,7 +100,8 @@ public:
     // c = exp((-sigma + j*2*pi*freqHz) / fs), computed in double. Sets the
     // free coefficient; the segment's current damper amount is applied on top.
     void setMode(int i, double freqHz, double sigma, double fs) noexcept;
-    void setWeights(int i, float wIn, float wOut) noexcept;
+    void setWeights(int i, float wIn, float wOut) noexcept { setWeights(i, wIn, 0.0f, wOut); }
+    void setWeights(int i, float wInRe, float wInIm, float wOut) noexcept;
     // Extra decay rate (1/s) of mode i when its segment's damper amount is 1.
     void setDamperRate(int i, double sigmaDamp, double fs) noexcept;
     // Writing a non-zero state wakes the mode's group.
@@ -116,6 +124,7 @@ public:
     float stateRe(int i) const noexcept { return zr_[i]; }
     float stateIm(int i) const noexcept { return zi_[i]; }
     float weightIn(int i) const noexcept { return wIn_[i]; }
+    float weightInIm(int i) const noexcept { return wInIm_[i]; }
     float weightOut(int i) const noexcept { return wOut_[i]; }
 
     // Direct access for a solver that advances one segment's modes itself
@@ -159,18 +168,17 @@ private:
     void cullPass(const SegmentIO* io) noexcept;
     void run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) noexcept;
 
-    AlignedArray<float> zr_, zi_, dr_, ci_, wIn_, wOut_;  // dr = Re(c) - 1
+    AlignedArray<float> zr_, zi_, dr_, ci_, wIn_, wInIm_, wOut_;  // dr = Re(c) - 1
     AlignedArray<float> dr0_, ci0_;   // free-string coefficient
     AlignedArray<float> dampRate_;    // sigmaDamp / fs per mode
     AlignedArray<float> dampAm1_;     // current damper factor - 1
-    AlignedArray<float> groupInOut_;  // max |wIn * wOut| over the group
+    AlignedArray<float> groupInOut_;  // max |wIn| |wOut| over the group
     AlignedArray<std::uint8_t> active_;
     AlignedArray<int> activeList_;
     AlignedArray<int> segGroups_;     // first group of each segment, plus end
     AlignedArray<float> segDamp_;     // damper amount per segment
     AlignedArray<float> segInput_;    // sum |u| since the last cull pass, per segment
     AlignedArray<float> scratch_;     // kCullInterval * SIMD width
-    AlignedArray<float> zeros_;       // kCullInterval zero samples
 
     int capacity_ = 0;
     int size_ = 0;
