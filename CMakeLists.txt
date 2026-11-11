@@ -32,6 +32,7 @@ add_subdirectory(core/pm_hammer)
 add_subdirectory(core/pm_board)
 add_subdirectory(core/pm_voicing)
 add_subdirectory(core/pm_engine)
+add_subdirectory(core/pm_host)
 add_subdirectory(core/pm_api)
 
 if(PM_BUILD_TOOLS)

@@ -1,6 +1,7 @@
 // Engine input events (plan §3.1). Plain data, copied through the SPSC queue.
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 namespace pm {
@@ -39,6 +40,27 @@ struct ClockMapping {
     std::uint64_t hostTimeAtBufferStart = 0;
     double hostTicksPerSample = 0.0;
 };
+
+// Frames from the start of the buffer to host time t: floor((t - start) /
+// ticksPerSample), signed (negative = already past; correct across counter
+// wrap). The engine clamps negative results to 0 (due now) and keeps
+// results >= the buffer length pending for a later buffer.
+inline std::int64_t hostTimeToFrameDelta(std::uint64_t t, const ClockMapping& c) noexcept {
+    const auto dt = static_cast<std::int64_t>(t - c.hostTimeAtBufferStart);
+    double f = std::floor(static_cast<double>(dt) / c.hostTicksPerSample);
+    // Keep the conversion defined for absurd stamps (about 650 years at 48 kHz).
+    if (f > 1e15) f = 1e15;
+    if (f < -1e15) f = -1e15;
+    return static_cast<std::int64_t>(f);
+}
+
+// Host ticks per sample from a tick-to-nanosecond ratio (Apple:
+// mach_timebase_info, ns = ticks * numer / denom; numer = denom = 1 for a
+// nanosecond clock): ticks/sample = 1e9 / fs * denom / numer.
+inline double hostTicksPerSample(double sampleRate, std::uint32_t numer, std::uint32_t denom) noexcept {
+    if (!(sampleRate > 0.0) || numer == 0 || denom == 0) return 0.0;
+    return 1e9 / sampleRate * static_cast<double>(denom) / static_cast<double>(numer);
+}
 
 // MIDI 1.0 7-bit value -> 16-bit (0 stays 0, 127 becomes 65535).
 inline std::uint16_t value16FromMidi7(int v7) noexcept {

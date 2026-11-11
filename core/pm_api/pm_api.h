@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 5
+#define PM_API_VERSION_MINOR 6
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -125,6 +125,123 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value);
 int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value);
 
 void pm_engine_get_stats(const pm_engine* engine, pm_stats* stats);
+
+/* ------------------------------------------------------------------------
+ * App host (API 0.6). A pm_host owns an engine and connects it to the
+ * platform's threads (core/pm_host/host.h):
+ *   MIDI thread:  pm_host_midi_event_list / _ump / _bytes (one thread at a time)
+ *   UI thread:    pm_host_push_event, pm_host_monitor_pop, meters, parameters
+ *   audio thread: pm_host_render
+ *   any non-real-time thread: pm_host_prepare (blocks until the audio
+ *   thread has left pm_host_render; the audio thread never waits)
+ * Do not call pm_engine_prepare, pm_engine_push_event or pm_engine_render on
+ * the engine of a host; pm_engine_set_param / get_param / get_stats are fine.
+ *
+ * Time. MIDI timestamps are host-clock ticks (Core MIDI: mach_absolute_time);
+ * 0 means "now". pm_host_render takes the host time of the buffer's first
+ * frame (AudioTimeStamp.mHostTime; 0 if unknown). With the tick-to-
+ * nanosecond ratio from pm_host_set_timebase (mach_timebase_info: ns =
+ * ticks * numer / denom), ticks per sample = 1e9 / fs * denom / numer, and
+ * an event at host time t lands at frame floor((t - buffer start) / ticks
+ * per sample) of the buffer: events in the past at frame 0 (lowest-latency
+ * mode), events beyond the buffer stay queued for a later one. */
+typedef struct pm_host pm_host;
+
+enum pm_midi_kind {
+    PM_MIDI_NOTE_OFF = 1,
+    PM_MIDI_NOTE_ON = 2,
+    PM_MIDI_POLY_PRESSURE = 3,
+    PM_MIDI_CONTROL_CHANGE = 4,
+    PM_MIDI_PROGRAM_CHANGE = 5,
+    PM_MIDI_CHANNEL_PRESSURE = 6,
+    PM_MIDI_PITCH_BEND = 7,
+    PM_MIDI_SYSEX = 8,
+    PM_MIDI_SYSTEM_COMMON = 9,
+    PM_MIDI_REALTIME = 10,
+    PM_MIDI_UTILITY = 11,
+    PM_MIDI_OTHER = 12
+};
+
+/* One received MIDI message, for a MIDI monitor. status/data1/data2 are the
+ * MIDI 1.0 bytes (for MIDI 2.0 messages: the 1.0 equivalent); value is the
+ * full-resolution value (MIDI 1.0: data2, or the 14-bit pitch bend; MIDI
+ * 2.0: 16-bit velocity, 32-bit controller); words are the UMP words
+ * (word_count 0 for byte streams); length is a SysEx payload length. */
+typedef struct pm_midi_monitor_entry {
+    uint64_t host_time;
+    uint32_t source_id;
+    uint8_t kind;        /* pm_midi_kind */
+    uint8_t channel;     /* 0..15 */
+    uint8_t status;
+    uint8_t data1;
+    uint8_t data2;
+    uint8_t group;       /* UMP group */
+    uint8_t protocol;    /* 1 or 2 */
+    uint8_t word_count;
+    uint32_t value;
+    uint32_t length;
+    uint32_t words[4];
+} pm_midi_monitor_entry;
+
+typedef struct pm_host_load {
+    double mean_load;    /* render time / buffer period, mean since the last reset */
+    double recent_load;  /* smoothed over about 0.5 s */
+    double max_load;     /* worst buffer since the last reset */
+    double last_load;
+    double budget;       /* over_budget counts buffers above this fraction (default 0.7) */
+    uint64_t buffers;
+    uint64_t over_budget;
+    int32_t last_frames; /* frames of the last rendered buffer */
+    int32_t reserved;
+} pm_host_load;
+
+typedef struct pm_host_counters {
+    uint64_t midi_messages;     /* decoded, all kinds */
+    uint64_t midi_malformed;
+    uint64_t midi_events;       /* engine events produced from MIDI */
+    uint64_t dropped_events;    /* host queues full */
+    uint64_t monitor_dropped;   /* monitor ring full */
+} pm_host_counters;
+
+pm_host* pm_host_create(void);  /* NULL on allocation failure; not prepared */
+void pm_host_destroy(pm_host* host);
+pm_engine* pm_host_engine(pm_host* host);
+
+/* Tick-to-nanosecond ratio of the host clock (default 1/1: nanoseconds).
+ * Takes effect at the next pm_host_prepare. */
+void pm_host_set_timebase(pm_host* host, uint32_t numer, uint32_t denom);
+double pm_host_ticks_per_sample(double sample_rate, uint32_t numer, uint32_t denom);
+
+/* Non-real-time. Returns 1 on success. Also applies prepare-time parameters
+ * (tuning, soundboard, quality tier). Queued events are discarded. */
+int pm_host_prepare(pm_host* host, double sample_rate, int32_t max_frames);
+int pm_host_is_prepared(const pm_host* host);
+double pm_host_sample_rate(const pm_host* host);
+
+/* Audio thread. Forwards queued events, renders, and records the render
+ * time in the load meter. Silence while not prepared or while preparing. */
+void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, uint64_t host_time);
+
+/* MIDI thread. event_list points to a Core MIDI MIDIEventList (MIDI 1.0 or
+ * 2.0 protocol UMP); returns the number of packets. */
+uint32_t pm_host_midi_event_list(pm_host* host, const void* event_list, uint32_t source_id);
+void pm_host_midi_ump(pm_host* host, const uint32_t* words, int32_t count, uint64_t host_time,
+                      uint32_t source_id);
+void pm_host_midi_bytes(pm_host* host, const uint8_t* bytes, int32_t count, uint64_t host_time,
+                        uint32_t source_id);
+
+/* UI thread (a second producer, independent of the MIDI thread). Returns 1
+ * if queued. Use time_base PM_TIME_SAMPLE with time 0 for "now". */
+int pm_host_push_event(pm_host* host, const pm_event* event);
+
+/* UI thread. Returns 1 and fills entry while the monitor ring has entries. */
+int pm_host_monitor_pop(pm_host* host, pm_midi_monitor_entry* entry);
+void pm_host_set_monitor_enabled(pm_host* host, int enabled);
+
+void pm_host_get_load(const pm_host* host, pm_host_load* load);
+void pm_host_reset_load(pm_host* host);
+void pm_host_set_load_budget(pm_host* host, double fraction);
+void pm_host_get_counters(const pm_host* host, pm_host_counters* counters);
 
 #ifdef __cplusplus
 }

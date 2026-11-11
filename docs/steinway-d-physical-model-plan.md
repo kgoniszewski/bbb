@@ -441,7 +441,7 @@ All APIs below exist in iOS 14–18 and are expected unchanged in iPadOS 27. I f
 | Need | API | Notes |
 |---|---|---|
 | Client, setup changes | `MIDIClientCreateWithBlock` | Handle `.msgObjectAdded/Removed`, `.msgSetupChanged`; rescan sources |
-| Input with UMP | `MIDIInputPortCreateWithProtocol(…, ._2_0, …)` | Receives `MIDIEventList`; Core MIDI translates MIDI 1.0 devices to UMP. Fallback `._1_0` |
+| Input with UMP | `MIDIInputPortCreateWithProtocol(…, ._1_0, …)` | Receives `MIDIEventList`; with `._1_0` MIDI 1.0 devices arrive unscaled as UMP type 2. The parser (`core/pm_host/midi.h`) also decodes MIDI 2.0 channel voice (type 4), so `._2_0` for true MIDI 2.0 devices is a one-line change (M7) |
 | MIDI 2.0 endpoints | `MIDIUMPEndpointManager`, function blocks, MIDI-CI | iOS 18+. Use for discovery of true MIDI 2.0 devices and their protocol |
 | Stable identity | `kMIDIPropertyUniqueID`, name, manufacturer, model | Key for profile auto-selection and reconnection |
 | Bluetooth pairing | `CABTMIDICentralViewController` (CoreAudioKit), wrapped in `UIViewControllerRepresentable` | **[VERIFY]** whether a newer pairing API exists; fallback is this controller |
@@ -453,7 +453,7 @@ All APIs below exist in iOS 14–18 and are expected unchanged in iPadOS 27. I f
 
 **High-resolution velocity.** In UMP, MIDI 2.0 note-on carries 16-bit velocity. MIDI 1.0 devices are up-scaled by Core MIDI, so the event's resolution says nothing about the device; the profile stores the device's true resolution. MIDI 1.0 high-resolution velocity prefix (CC88) is handled in the 1.0 path. Note-off velocity is used for damper speed where the device sends it.
 
-**Timestamping and scheduling.** Core MIDI stamps each packet with host time. The receive block runs on a Core MIDI thread: it applies the device profile (cheap, allocation-free), then pushes to a single-producer/single-consumer ring per source thread. The render callback converts host time to a sample offset in the current buffer.
+**Timestamping and scheduling.** Core MIDI stamps each packet with host time. The receive block runs on a Core MIDI thread: it applies the device profile (cheap, allocation-free), then pushes to a single-producer/single-consumer ring per source thread. The render callback converts host time to a sample offset in the current buffer. Implemented in M2 by `core/pm_host` (C API `pm_host_*`): the Core MIDI thread parses the raw `MIDIEventList` and pushes engine events to one SPSC queue (and every decoded message to a monitor ring for the UI); the main thread (on-screen keyboard, pedal buttons) pushes to a second queue; the audio thread moves both into the engine's queue at the start of each buffer, so the engine keeps exactly one producer. Ticks per sample = 1e9 / fs × denom / numer (`mach_timebase_info`), an event lands at frame ⌊(t − buffer start) / ticks per sample⌋, and a timestamp of 0 means "now". Device profiles are M7.
 
 Two scheduling modes (user setting):
 
@@ -498,12 +498,12 @@ public:
 // Swift side: port creation and receive block. No allocation, no locks,
 // no Swift class access inside the block; it calls a C function.
 var port = MIDIPortRef()
-MIDIInputPortCreateWithProtocol(client, "In" as CFString, ._2_0, &port) { eventList, srcRefCon in
-    let sourceId = UInt16(truncatingIfNeeded: Int(bitPattern: srcRefCon))
-    pm_midi_receive(engineHandle, eventList, sourceId)   // C++: parse UMP, apply profile, push
+MIDIInputPortCreateWithProtocol(client, "In" as CFString, ._1_0, &port) { eventList, srcRefCon in
+    let sourceId = UInt32(truncatingIfNeeded: Int(bitPattern: srcRefCon))
+    pm_host_midi_event_list(host, UnsafeRawPointer(eventList), sourceId)  // C++: parse UMP, push
 }
-for source in MIDIClient.currentSources {
-    MIDIPortConnectSource(port, source.ref, UnsafeMutableRawPointer(bitPattern: Int(source.id)))
+for i in 0..<MIDIGetNumberOfSources() {   // and again on .msgObjectAdded (hot-plug)
+    MIDIPortConnectSource(port, MIDIGetSource(i), UnsafeMutableRawPointer(bitPattern: UInt(nextId())))
 }
 ```
 
@@ -704,16 +704,19 @@ core/                      C++20, no platform dependencies, no exceptions/RTTI i
   pm_voicing/              (non-RT) parameter tables → coefficient tables; unison eigen-solve;
                            tuning/stretch solver; temperament
   pm_engine/               render loop, event scheduling, quality tiers, table hand-off
-  pm_midi/                 UMP/MIDI 1.0 parsing, device profiles, mapping, takeover, recorder, SMF I/O
+  pm_host/                 (M2) app host: MIDI 1.0/UMP parsing, MIDI→engine events, MIDI/UI/monitor
+                           queues, prepare gate, render-load meter
+  pm_midi/                 device profiles, mapping, takeover, recorder, SMF I/O (M7, M9)
   pm_api/                  C API (stable ABI) used by Swift and by the Python bindings
 tools/
   render_cli/              offline render of MIDI → WAV (golden tests, A/B, fitting)
   reference_fdtd/          offline finite-difference reference model
   analysis/                Python: partial tracking, fits, metrics, reports, listening-test packs
-apple/
-  PianoKit/                Swift package: engine wrapper, MIDI manager (Core MIDI), presets, session
+Package.swift              (M2) Swift package PianoEngine: library PianoCore = core/ (C++), Swift sees pm_api.h
+apps/PianoApp/             (M2) SwiftUI app, iPadOS + macOS targets from one XcodeGen spec: engine
+                           wrapper, Core MIDI manager, audio session, Play and MIDI monitor screens
+apple/                     (planned, M5+)
   PianoAU/                 AUAudioUnit subclass (Objective-C++/C++ render block), shared by app and extension
-  App-iPadOS/, App-macOS/  SwiftUI apps
   AUv3Extension/           app extension target
 ```
 
@@ -723,6 +726,7 @@ Build: CMake for the core and tools (macOS, Linux CI), Swift Package / Xcode for
 
 - The standalone app hosts the same `AUAudioUnit` subclass in-process through `AVAudioEngine`, so app and AUv3 share one render path.
 - The render block is C++ inside an Objective-C++ file and touches only the engine pointer.
+- **M2 departs from this:** until the AUv3 exists (M5), the app renders through an `AVAudioSourceNode` whose Swift render block captures only the `pm_host` pointer and calls `pm_host_render` (no Swift objects, allocation or locks; the C++ side measures its own load). When `PianoAU` is written the app switches to it, and `pm_host` (queues, MIDI parsing, meter) moves behind the AU's render block unchanged.
 - Swift talks to the engine through the C API (`pm_api`) for control-rate work: load preset, set parameter, push event, read meters. Swift's direct C++ interoperability is acceptable for non-real-time code but the C API is kept as the stable surface because the Python tools use it too.
 - UI ← engine: lock-free meter and "last touched parameter" mailboxes polled at 30–60 Hz.
 
@@ -770,7 +774,7 @@ Effort is person-weeks for one developer **[ASSUMPTION]**. MVP = M0–M5.
 |---|---|---|---|---|---|
 | M0 | Foundations and hardware facts | Repositories, CMake, CI, `render_cli` skeleton, Python analysis skeleton; iPadOS 27 SDK review of Core MIDI/Audio; **M32 capture session on the iPad** producing a verified control table | Every [VERIFY] item of §3.2 resolved in writing; CI builds core on macOS and Linux | 2 | M32 sends less than hoped → mapping already assumes on-screen fallbacks |
 | M1 | Single inharmonic string + performance proof | Modal bank (scalar + NEON), pluck excitation, culling; device benchmark of 26,000 modes | Partial frequencies within 0.5 cent of formula; T60 within 3 %; **26,000 modes ≤ 35 % of one core at 48 kHz on the iPad Pro M2**, or a documented decision for fallback (multirate / fewer modes / two threads) | 3 | Budget missed → fallbacks listed; decide here, not later |
-| M2 | **First playable: hammer, 88 single strings, basic Core MIDI** | Hammer contact solver; one string per key with literature parameters; fixed radiation filter; iPad app with audio session, Core MIDI input (notes, velocity, CC64 on/off), hot-plug, lock-free queue, sample-accurate scheduling; minimal UI | Playable from the M32 over USB; key-to-sound median ≤ 10 ms; hammer energy test passes; no audio-thread allocations (Instruments) | 4 | Stiff contact instability in treble → 2× rate, implicit solve, clamp |
+| M2 | **First playable: hammer, 88 single strings, basic Core MIDI** | Hammer contact solver; one string per key with literature parameters; fixed radiation filter; iPad app with audio session, Core MIDI input (notes, velocity, CC64 on/off), hot-plug, lock-free queue, sample-accurate scheduling; minimal UI. As built: `core/pm_host` + `apps/PianoApp` (SwiftUI, iPad and Mac); MIDI goes beyond the row (continuous CC64, CC66, CC67, MIDI 2.0 UMP decoding) and the app already has the MIDI monitor needed for the M0 capture session | Playable from the M32 over USB; key-to-sound median ≤ 10 ms; hammer energy test passes; no audio-thread allocations (Instruments) | 4 | Stiff contact instability in treble → 2× rate, implicit solve, clamp |
 | M3 | Unisons, dampers, tuning | Coupled-mode unisons with two polarizations; damper model; note-off; stretch tuning solver; per-key table v0; offline FDTD reference | Double decay and beating visible in analysis; unison solver matches time-domain reference; tuning curve within ±5 cents of published Railsback shape | 5 | Eigen-solve conditioning near degenerate tuning → perturbation and fallback to uncoupled |
 | M4 | Soundboard, bridge coupling, pedals | Soundboard mode set v0; coupling loop with zones; sympathetic resonance; continuous CC64 half-pedal, sostenuto, una corda | Passivity test passes for 10⁴ random parameter sets; pedal-down bloom present and within 4 dB of reference per band; half-pedal produces graded T60 | 6 | Instability or double-counted admittance → driving-point/transfer split, coupling gain limiter |
 | M5 | **MVP: playable grand v0.5** | Stereo microphone radiation v0, early reflections + FDN, presets and state, Play screen with range strip and overlay, on-screen keyboard and pedal, panic, basic AUv3 that loads in a host | 30-minute play session without glitch at 64–128 frames; preset round-trip; AU validation passes | 4 | Scope creep in UI → fixed screen list |

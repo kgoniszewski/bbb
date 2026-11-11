@@ -15,8 +15,13 @@ offline finite-difference reference, and M4: a modal soundboard (v0 mode
 set from an orthotropic plate) coupled to every string through the bridge
 by a one-sample run-time loop (sympathetic resonance, pedal bloom),
 continuous half-pedalling, hammer-knock and damper-lift noise hooks, and a
-placeholder two-pickup output. There is no radiation or microphone model,
-no room, no longitudinal modes or duplex and no Apple code yet.
+placeholder two-pickup output, and the app half of M2: a portable host
+layer (MIDI 1.0 / UMP parsing, event queues from the MIDI and UI threads,
+a prepare gate, a render-load meter; `core/pm_host`, C API 0.6), a Swift
+package exposing the C API, and a SwiftUI app for iPad and Mac (see
+[iPad app](#ipad-app); not yet built by anyone, see its checklist). There
+is no radiation or microphone model, no room, no longitudinal modes or
+duplex yet.
 
 ## Layout
 
@@ -28,7 +33,10 @@ no room, no longitudinal modes or duplex and no Apple code yet.
 | `core/pm_board/` | Real-time soundboard modal bank (zone ports in and out, pickup read-outs, sleep) and the key/zone mixing of the coupling loop |
 | `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface (smooth placeholder kept for unit tests), soundboard mode set v0 and its admittances (`soundboard_model.h`), unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
-| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python |
+| `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
+| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, and (0.6) the app host `pm_host_*`; `include/` holds the Swift module map |
+| `Package.swift` | Swift package `PianoEngine`, library `PianoCore` (the C++ core, imported in Swift through the C API) |
+| `apps/PianoApp/` | SwiftUI app (iPadOS 17+, macOS 14+): XcodeGen spec `project.yml`, sources, and the package's Swift smoke test |
 | `tools/render_cli/` | Offline renderer: one plucked string to a mono WAV, or a text score through the engine to a stereo WAV |
 | `tools/reference_fdtd/` | Offline finite-difference stiff string + hammer (library and CLI), the reference for the real-time model |
 | `tools/bench/` | Modal kernel benchmark and engine benchmark |
@@ -351,7 +359,13 @@ every number.
 
 ## Tests
 
-`ctest` runs 25 suites. The M4 ones: `test_soundboard_model` (board
+`ctest` runs 28 suites. The app host ones: `test_midi_parser` (running
+status, real-time bytes inside messages, SysEx, malformed input, UMP in
+MIDI 1.0 and 2.0 protocol, the `MIDIEventList` layout, controller mapping,
+fuzzing), `test_load_meter` and `test_host` (MIDI host timestamps land on
+the same samples as the equivalent sample-time events, through all three
+MIDI entry points; monitor ring and overflow; prepare under a running
+audio thread; no allocation on the MIDI, UI and audio paths). The M4 ones: `test_soundboard_model` (board
 targets, positive-real loop, admittance against a time-domain drive of the
 run-time bank, bake + loop = driving point), `test_soundboard_coupling`
 (no double counting), `test_passivity` (10^4 random reduced systems with
@@ -361,3 +375,169 @@ bloom per third octave, monotonic in the sympathetic gain) and
 moves, re-pedalling keeps energy). Unit tests of the unison solver and the
 M3 double-decay tests use the smooth placeholder admittance, which the
 soundboard replaced in the engine.
+
+## iPad app
+
+A minimal SwiftUI app (M2, "first playable") that plays the engine from a
+USB MIDI keyboard (target: Komplete Kontrol M32) on an iPad Pro M2, and
+also runs on a Mac. **It has been written without access to Xcode: nobody
+has compiled it yet.** The C++ part it relies on (`core/pm_host`, the C
+API) is tested by CTest, and the Swift package builds and passes its
+smoke test with `swift build` / `swift test` on Linux (Swift 6.1); the app
+sources were only syntax-checked (`swiftc -parse`), apart from two files
+type-checked against the C API.
+
+### Structure
+
+- `Package.swift` (repository root): package `PianoEngine`, library
+  `PianoCore` = every `.cpp` of `core/` compiled as C++20 with `-O3
+  -fno-exceptions -fno-rtti -DNDEBUG` (also in Debug: the engine is far
+  too slow unoptimised). Swift sees only `core/pm_api/pm_api.h` through
+  `core/pm_api/include/module.modulemap`. CMake does not use these files.
+- `apps/PianoApp/project.yml`: XcodeGen spec. Two targets sharing the
+  sources: `PianoApp` (iPadOS 17+, background audio) and `PianoAppMac`
+  (macOS 14+). Swift 5 language mode (`SWIFT_VERSION = 5.0`, strict
+  concurrency minimal), so Swift 6 data-race checking does not apply. The
+  schemes run the Release configuration.
+- `apps/PianoApp/PianoApp/`:
+  `EngineHost.swift` (owns `pm_host`, background prepare queue, events
+  from the UI), `AudioController.swift` (AVAudioEngine + AVAudioSourceNode
+  whose render block calls `pm_host_render` with the C pointer only; on
+  iOS the AVAudioSession: playback category, preferred 48 kHz and 64
+  frames, granted values read back, interruptions, route changes,
+  media-services reset, re-prepare on a sample-rate change),
+  `MIDIController.swift` (Core MIDI client, event-list input port with the
+  MIDI 1.0 protocol, every source connected, hot-plug; the receive block
+  passes the raw `MIDIEventList` to `pm_host_midi_event_list`),
+  `MIDIMonitor.swift` + `MonitorView.swift` (log drained from the host's
+  lock-free ring on the main thread), `PlayView.swift` (status, sources,
+  sustain, panic, quality tier, soundboard on/off, CPU meter, keyboard
+  strip), `KeyboardView.swift`, `AppModel.swift`, `PianoApp.swift`.
+
+Threads: Core MIDI's thread parses and queues (one SPSC queue), the main
+thread queues on-screen notes and pedals (a second queue), the audio
+thread moves both into the engine at the start of each buffer and
+renders. `pm_host_prepare` closes a gate and waits until the audio
+thread has left `pm_host_render` (the audio thread never waits; it outputs
+silence while the engine prepares, about a second).
+
+Timing: Core MIDI timestamps and `AudioTimeStamp.mHostTime` are both
+`mach_absolute_time` ticks; `pm_host_set_timebase` takes
+`mach_timebase_info` (ticks per sample = 1e9 / fs x denom / numer, 500 at
+48 kHz on Apple silicon) and an event lands at frame floor((t - buffer
+start) / ticks per sample). The default lowest-latency mode puts events
+that are already due (every live MIDI event) at frame 0 of the next
+buffer; events stamped beyond the buffer wait for theirs; timestamp 0
+means "now".
+
+### Build and run on the Mac
+
+```sh
+# 1. Optional sanity check of the package (C++ through SwiftPM, Swift sees the C API):
+swift build
+swift test                      # PianoCoreTests: version, MIDI in, audio out
+
+# 2. Generate and open the Xcode project:
+brew install xcodegen
+cd apps/PianoApp
+xcodegen                        # writes PianoApp.xcodeproj (not committed)
+open PianoApp.xcodeproj
+```
+
+In Xcode: select the `PianoApp` target, Signing & Capabilities, choose
+your Team (bundle id placeholder `com.example.piano.app`: change it if
+Xcode says it is taken). Then:
+
+- **Mac first:** scheme `PianoAppMac`, destination "My Mac", Run. Plug the
+  M32 into the Mac; the Play tab lists it under MIDI sources.
+- **iPad:** connect the iPad (Developer Mode on), scheme `PianoApp`,
+  destination the iPad, Run. Then connect the M32 to the iPad's USB-C
+  port (directly, or through a powered hub if it does not power up).
+
+Without XcodeGen: in Xcode, File > New > Project > Multiplatform App
+(SwiftUI, Swift), name `PianoApp`; delete the generated `ContentView.swift`
+and app file; drag the files of `apps/PianoApp/PianoApp/` into the
+project (both targets); File > Add Package Dependencies > Add Local... >
+the repository root, add the product `PianoCore` to the app target; in
+Build Settings set Swift Language Version to 5 and the iOS deployment
+target to 17.0; in Signing & Capabilities add Background Modes > Audio;
+edit the scheme's Run configuration to Release.
+
+### What to test (M2 acceptance, plan §7)
+
+- [ ] **Playable from the M32 over USB.** Notes with velocity, sustain
+      pedal in the M32's pedal socket (CC64; continuous values give
+      half-pedal), unplug and replug the M32 while holding a chord with the
+      pedal down: no hanging notes (removal releases all notes and pedals),
+      the M32 reappears in the source list and plays again.
+- [ ] **Key-to-sound latency, median <= 10 ms.** The app shows the granted
+      I/O buffer and (iPad) the session's output latency. Expected budget
+      at 48 kHz / 64 frames: USB MIDI about 1 ms + waiting for the next
+      buffer 0-1.3 ms + one buffer 1.3 ms + output latency (wired
+      headphones typically 1-3 ms; the built-in speakers more; Bluetooth
+      100+ ms, unsuitable). Measuring: record, with a second device (phone
+      or the Mac with a microphone), the click of a key being struck hard
+      together with the iPad's output (a speaker or headphone right next
+      to the microphone); in an audio editor measure from the key click to
+      the tone onset for 20 or more strikes; report the median and the
+      worst. The key's own travel before the switch closes adds a few ms
+      the test cannot separate, so the result is an upper bound.
+- [ ] **No audio-thread allocations (Instruments).** Product > Profile
+      (Release) > Allocations. Record while playing chords with the pedal
+      for 30 s. In the Call Tree, check "Separate by Thread" and find the
+      audio I/O thread (on iOS named like `AURemoteIO::IOThread`, on macOS
+      `com.apple.audio.IOThread.client`): there must be no allocations
+      under `pm_host_render` or the render block. The same check for Core
+      MIDI's receive thread under `pm_host_midi_event_list` (Core MIDI may
+      allocate in its own frames above our call; that is outside our
+      code). On the host side the same property is checked by
+      `test_host` and `test_rt_alloc`.
+- [ ] Hammer energy test: covered by the CTest suites (M2 portable part).
+
+Also: plugging headphones in and out (route change; the status shows the
+new output and sample rate), a phone call or Siri (interruption; the
+piano comes back afterwards), backgrounding the app while a note sounds
+(it keeps playing: background audio), quality tier and soundboard
+switches (each re-prepares, about a second of silence).
+
+### Reading the CPU meter
+
+The meter is the render time of each buffer divided by the buffer
+period (frames / sample rate), measured inside `pm_host_render`:
+"Now" is smoothed over about 0.5 s, "Mean" and "Max" are since the last
+Reset, and the counter shows buffers above 70 %. Targets on the iPad Pro
+M2 (CLAUDE.md): mean at most 50 %, worst buffer at most 70 %. Above
+100 % a buffer was late and you hear a click. Note-on buffers carry the
+hammer solves and are the peaks; the first buffers after a prepare can be
+slow too, so press Reset after the app has settled. "Render buffer" shows
+the frames the system actually asked for, which can differ from the
+granted I/O buffer (for example 4096 while the screen is locked). If
+mean or max exceed the targets, try Balanced and Eco and note the
+numbers.
+
+### M32 capture session (plan §3.2, M0 item)
+
+Goal: learn exactly what the M32 sends on iPadOS in its default mode.
+Open the MIDI Monitor tab, press Clear, then work through the list below.
+Before each item press **Marker** and write down "marker N = item".
+Move each control slowly over its whole range, then quickly.
+
+1. Keys: the lowest and highest key, softly and hard (velocity range).
+2. Octave - and + buttons, each a few times, then a key after each press
+   (do the buttons send anything? which notes do keys send after them?).
+3. Each of the eight knobs: turn clockwise then counter-clockwise; touch
+   without turning (touch-sensitive knobs).
+4. Pitch strip: touch, slide, release (does it return to centre?).
+5. Mod strip: touch, slide, release (does it hold?).
+6. Every transport button (Play, Rec, Stop, Loop, Metro, Tempo, ...),
+   the 4-D encoder (rotate both ways, push, push in four directions) and
+   every other button (Shift, Scale, Arp, Undo, Quantize, Preset up/down,
+   Browse, ...).
+7. A sustain pedal in the pedal socket: press and release slowly
+   (on/off only, or continuous?).
+
+Then press Pause, Copy (or Share to Files / Mail) and send back the text
+together with the marker list. The log is tab-separated: time since the
+previous message (ms), source, group, channel, type, decoded data, raw
+UMP words. Also note the iPad model and iPadOS version and whether the
+M32 was connected directly or through a hub.

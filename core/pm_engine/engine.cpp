@@ -336,11 +336,7 @@ void Engine::drainQueue(const ClockMapping* clock) noexcept {
         if (e.timeBase == TimeBase::SampleTime) {
             when = static_cast<std::int64_t>(e.time);
         } else if (clock && clock->hostTicksPerSample > 0.0) {
-            // Signed difference: correct across counter wrap and for past events.
-            const auto dt = static_cast<std::int64_t>(e.time - clock->hostTimeAtBufferStart);
-            when = now + static_cast<std::int64_t>(
-                             std::floor(static_cast<double>(dt) / clock->hostTicksPerSample)) +
-                   latency;
+            when = now + hostTimeToFrameDelta(e.time, *clock) + latency;
         }
         if (when < now) {
             if (constant && e.timeBase == TimeBase::HostTime) ++late_;

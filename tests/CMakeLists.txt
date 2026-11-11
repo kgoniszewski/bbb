@@ -40,3 +40,13 @@ add_test(NAME test_c_api COMMAND test_c_api)
 add_executable(test_fdtd test_fdtd.cpp)
 target_link_libraries(test_fdtd PRIVATE pm_engine pm_fdtd Threads::Threads)
 add_test(NAME test_fdtd COMMAND test_fdtd)
+
+# App host: MIDI parsing, load meter, host glue through the C API.
+foreach(t test_midi_parser test_load_meter)
+  add_executable(${t} ${t}.cpp)
+  target_link_libraries(${t} PRIVATE pm_host Threads::Threads)
+  add_test(NAME ${t} COMMAND ${t})
+endforeach()
+add_executable(test_host test_host.cpp)
+target_link_libraries(test_host PRIVATE pm_api Threads::Threads)
+add_test(NAME test_host COMMAND test_host)

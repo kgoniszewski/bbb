@@ -91,6 +91,35 @@ int main(void) {
     EXPECT(st.awake_modes > 0 && st.awake_modes <= st.total_modes);
     pm_engine_destroy(eng);
     pm_engine_destroy(NULL);
+
+    /* App host (API 0.6), from C: MIDI bytes in, audio out, meters. */
+    {
+        pm_host* h = pm_host_create();
+        pm_host_load load;
+        pm_host_counters hc;
+        pm_midi_monitor_entry me;
+        const uint8_t on[3] = {0x90, 60, 100};
+        const uint32_t ump = 0x20B04000u; /* CC64 = 0 */
+        EXPECT(h != NULL);
+        pm_host_set_timebase(h, 125, 3);
+        EXPECT(pm_engine_set_param(pm_host_engine(h), PM_PARAM_SOUNDBOARD_ENABLED, 0.0) == 1);
+        EXPECT(pm_host_prepare(h, 48000.0, 256) == 1 && pm_host_is_prepared(h) == 1);
+        pm_host_midi_bytes(h, on, 3, 0, 1);
+        pm_host_midi_ump(h, &ump, 1, 0, 1);
+        EXPECT(pm_host_monitor_pop(h, &me) == 1 && me.kind == PM_MIDI_NOTE_ON && me.data1 == 60);
+        peak = 0.0f;
+        for (b = 0; b < 20; ++b) {
+            pm_host_render(h, left, right, 256, 0);
+            for (i = 0; i < 256; ++i)
+                if (fabsf(left[i]) > peak) peak = fabsf(left[i]);
+        }
+        EXPECT(peak > 0.001f);
+        pm_host_get_load(h, &load);
+        EXPECT(load.buffers == 20 && load.budget > 0.0);
+        pm_host_get_counters(h, &hc);
+        EXPECT(hc.midi_messages == 2 && hc.midi_events == 2);
+        pm_host_destroy(h);
+    }
     printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
