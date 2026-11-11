@@ -333,6 +333,22 @@ silicon target (SSE2, 4-wide like NEON, is the closer proxy). A coupled
 string mode costs the free block kernel plus a forced pass of about 0.6
 times that.
 
+After the summary lines comes a per-phase breakdown of every case, in µs
+per buffer: the most expensive buffer, the mean over the top 1 % (the
+buffers at or above p99) and the mean over all buffers, split into
+`events` (event handling, control tick, wake-ups, impulse-response cache
+and loop-kernel updates), `hammer` (contact solves), `free` (the bank's
+block pass; board off: the whole bank), `forced` (input added to the
+coupled modes), `board` (zone kernel, noise, knocks, board step) and
+`other` (output, filters, limiter, cull passes). It lets a run on the
+target attribute peaks without a profiler: note-onset buffers are mostly
+`hammer`, whose cost per hammer can be compared with the hammer-solver
+lines. bench_engine links the profiling build of the engine
+(`pm_engine_profile`, compiled with `PM_PROFILE`); the library used by
+the app, the C API and the tests has no timers. The timers add about 130
+clock reads per buffer with the board on (10 with it off), included in
+every number.
+
 ## Tests
 
 `ctest` runs 25 suites. The M4 ones: `test_soundboard_model` (board

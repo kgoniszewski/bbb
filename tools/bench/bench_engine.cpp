@@ -15,6 +15,15 @@
 // Board-on cases run at the quality tier given by --tier (default full);
 // --tiers runs the pedal-down and cluster cases at every tier.
 //
+// After the summary lines, a per-phase breakdown of every case (us per
+// buffer): the most expensive buffer, the mean over the top 1 % of buffers
+// (those at or above p99) and the mean over all buffers, split into event
+// handling (incl. control tick, wake-ups, impulse-response cache), hammer
+// solves, the bank's free pass, the forced pass, zone kernel + board step,
+// and the rest (output, filters, cull passes). The engine is linked from its
+// profiling build (pm_engine_profile, PM_PROFILE): about 130 clock reads
+// per 64-frame buffer with the board on, 10 without, included in all times.
+//
 //   bench_engine [--seconds 3] [--block 64] [--fs 48000] [--tier full|balanced|eco] [--tiers]
 #include <algorithm>
 #include <chrono>
@@ -42,12 +51,38 @@ pm::Event ev(std::uint64_t t, pm::EventType type, int note, int v7) {
     return e;
 }
 
+constexpr int kPhases = pm::EngineProfile::kPhases;
+
+struct Phases {
+    double us[kPhases + 1] = {};  // the engine's phases, then the rest
+    double total = 0.0;
+};
+
 struct Result {
     double avgPercent, p99Percent, maxPercent;
     double first100msPercent;  // average over the first 100 ms measured
     int awakeModesEnd;
     double meanAwakeModes;
+    Phases maxBuf, top1, all;  // per-phase breakdown
+    int maxIndex = 0, topCount = 0;
 };
+
+Phases phasesOf(const pm::EngineProfile& p) {
+    Phases r;
+    double sum = 0.0;
+    for (int i = 0; i < kPhases; ++i) {
+        r.us[i] = p.us[i];
+        sum += p.us[i];
+    }
+    r.us[kPhases] = std::max(0.0, p.totalUs - sum);
+    r.total = p.totalUs;
+    return r;
+}
+
+void accumulate(Phases& acc, const Phases& p, double w) {
+    for (int i = 0; i <= kPhases; ++i) acc.us[i] += w * p.us[i];
+    acc.total += w * p.total;
+}
 
 // Renders 'warm' seconds unmeasured, then 'seconds' measured. 'events'
 // returns the events due in [t0, t1).
@@ -69,15 +104,27 @@ Result run(pm::Engine& eng, double fs, int block, double warm, double seconds, E
     const double period = block / fs;
     const int firstBlocks = std::max(1, static_cast<int>(0.1 * fs / block));
     std::vector<double> dts(static_cast<std::size_t>(blocks));
+    std::vector<Phases> ph(static_cast<std::size_t>(blocks));
     double total = 0.0, first = 0.0, awake = 0.0;
     for (int b = 0; b < blocks; ++b) {
         step(&dts[b]);
+        ph[b] = phasesOf(eng.profile());
         total += dts[b];
         if (b < firstBlocks) first += dts[b];
         awake += eng.stats().awakeModes;
     }
     res.meanAwakeModes = awake / blocks;
     res.first100msPercent = 100.0 * first / (firstBlocks * period);
+    // Breakdown, ranked by the engine's own render time (the same buffers
+    // as the timing above to within the timer overhead).
+    std::vector<int> order(static_cast<std::size_t>(blocks));
+    for (int b = 0; b < blocks; ++b) order[b] = b;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return ph[a].total > ph[b].total; });
+    res.maxIndex = order[0];
+    res.maxBuf = ph[order[0]];
+    res.topCount = std::max(1, blocks - static_cast<int>(0.99 * (blocks - 1)));
+    for (int i = 0; i < res.topCount; ++i) accumulate(res.top1, ph[order[i]], 1.0 / res.topCount);
+    for (int b = 0; b < blocks; ++b) accumulate(res.all, ph[b], 1.0 / blocks);
     std::sort(dts.begin(), dts.end());
     res.avgPercent = 100.0 * total / (blocks * period);
     res.p99Percent = 100.0 * dts[static_cast<std::size_t>(0.99 * (blocks - 1))] / period;
@@ -199,6 +246,7 @@ int main(int argc, char** argv) {
         }
     const char* tierName[3] = {"full", "balanced", "eco"};
     std::printf("  board-on cases at tier %s unless named\n", tierName[static_cast<int>(tier)]);
+    std::vector<Result> results;
     for (const Case& c : cases) {
         eng.setCulling(c.cull, -100.0f);
         pm::SoundboardConfig bc;
@@ -216,10 +264,33 @@ int main(int argc, char** argv) {
                     "max %6.2f %%; awake modes mean %5.0f, at end %5d\n",
                     c.name, r.avgPercent, r.first100msPercent, r.p99Percent, r.maxPercent,
                     r.meanAwakeModes, r.awakeModesEnd);
+        results.push_back(r);
     }
     std::printf("  (awake modes exclude group padding; with culling on, partials more than 100 dB\n"
                 "   down are never processed. The max of a single buffer includes any preemption\n"
                 "   by the OS.)\n");
+
+    std::printf("  per-phase breakdown, us per %d-frame buffer (%.0f us = 100 %% of one core):\n"
+                "    %-35s %-14s %7s %7s %7s %7s %7s %7s %8s\n",
+                block, 1e6 * block / fs, "case", "buffers", "events", "hammer", "free", "forced", "board",
+                "other", "total");
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const Result& r = results[i];
+        char label[3][32];
+        std::snprintf(label[0], sizeof label[0], "max (#%d)", r.maxIndex);
+        std::snprintf(label[1], sizeof label[1], "top 1%% (%d)", r.topCount);
+        std::snprintf(label[2], sizeof label[2], "mean");
+        const Phases* rows[3] = {&r.maxBuf, &r.top1, &r.all};
+        for (int j = 0; j < 3; ++j) {
+            std::printf("    %-35s %-14s", j == 0 ? cases[i].name : "", label[j]);
+            for (int p = 0; p <= kPhases; ++p) std::printf(" %7.1f", rows[j]->us[p]);
+            std::printf(" %8.1f\n", rows[j]->total);
+        }
+    }
+    std::printf("  (events: event handling, control tick, wake-ups, impulse-response cache and kernel\n"
+                "   updates; hammer: contact solves; free: the bank's block pass (board off: the whole\n"
+                "   bank); forced: input added to the coupled modes; board: zone kernel, noise, knocks\n"
+                "   and board step; other: output, filters, limiter, cull passes, hammer release.)\n");
 
     // One hammer alone, per key: median over 200 strikes at mf.
     std::printf("  hammer solver, one hammer, us per %d-frame buffer (median of 200 mf strikes):\n", block);
