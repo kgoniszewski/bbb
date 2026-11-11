@@ -28,22 +28,39 @@ void runModesScalar(const BankView& b, const int* groups, int nGroups, const flo
     }
 }
 
-void stepRunsScalar(const BankView& b, const int* seg, const int* m0, const int* m1, int nRuns,
-                    const float* in, float* out) noexcept {
-    for (int r = 0; r < nRuns; ++r) {
-        const float u = in[seg[r]];
-        float acc = 0.0f;
-        for (int m = m0[r]; m < m1[r]; ++m) {
-            const float zr = b.zr[m], zi = b.zi[m];
-            const float ar = zr + b.wInRe[m] * u;
-            const float ai = zi + b.wInIm[m] * u;
-            const float nr = (ar + b.dr[m] * zr) - b.ci[m] * zi;
-            const float ni = (ai + b.dr[m] * zi) + b.ci[m] * zr;
-            b.zr[m] = nr;
-            b.zi[m] = ni;
-            acc += b.wOut[m] * ni;
+void impulseScalar(const BankView& b, const int* groups, int nGroups, float* out, int n) noexcept {
+    for (int gi = 0; gi < nGroups; ++gi) {
+        const int m0 = groups[gi] * ModeBank::kGroupSize;
+        for (int m = m0; m < m0 + ModeBank::kGroupSize; ++m) {
+            const float dr = b.dr[m], ci = b.ci[m], wo = b.wOut[m];
+            float zr = b.wInRe[m], zi = b.wInIm[m];
+            for (int k = 0; k < n; ++k) {
+                const float nr = (zr + dr * zr) - ci * zi;
+                const float ni = (zi + dr * zi) + ci * zr;
+                zr = nr;
+                zi = ni;
+                out[k] += wo * zi;
+            }
         }
-        out[seg[r]] += acc;
+    }
+}
+
+void forcedScalar(const BankView& b, const int* groups, int nGroups, const float* u, int n) noexcept {
+    for (int gi = 0; gi < nGroups; ++gi) {
+        const int m0 = groups[gi] * ModeBank::kGroupSize;
+        for (int m = m0; m < m0 + ModeBank::kGroupSize; ++m) {
+            const float dr = b.dr[m], ci = b.ci[m];
+            float ar = 0.0f, ai = 0.0f;
+            for (int k = 0; k < n; ++k) {
+                const float nr = ((ar + u[k]) + dr * ar) - ci * ai;
+                const float ni = (ai + dr * ai) + ci * ar;
+                ar = nr;
+                ai = ni;
+            }
+            const float wr = b.wInRe[m], wi = b.wInIm[m];
+            b.zr[m] += wr * ar - wi * ai;
+            b.zi[m] += wr * ai + wi * ar;
+        }
     }
 }
 
@@ -75,7 +92,9 @@ constexpr int kGroupsPerStep = 2;
 // HasInput = false is the free-running case (every key in the engine: the
 // hammer solver drives its modes itself): four FMAs and one output FMA per
 // mode and sample. With an input the complex input weight adds two.
-template <int NG, bool HasInput>
+// Impulse = true: start from the input weight instead of the state and do
+// not store the state (impulse response, see modal_kernels.h).
+template <int NG, bool HasInput, bool Impulse = false>
 inline void step(const BankView& b, const int* groups, const float* in, float* scratch,
                  int n) noexcept {
     constexpr int NV = NG * kVecPerGroup;
@@ -85,8 +104,8 @@ inline void step(const BankView& b, const int* groups, const float* in, float* s
     int base[NV];
     for (int v = 0; v < NV; ++v) {
         base[v] = groups[v / kVecPerGroup] * ModeBank::kGroupSize + (v % kVecPerGroup) * kWidth;
-        zr[v] = load(b.zr + base[v]);
-        zi[v] = load(b.zi + base[v]);
+        zr[v] = load((Impulse ? b.wInRe : b.zr) + base[v]);
+        zi[v] = load((Impulse ? b.wInIm : b.zi) + base[v]);
         dr[v] = load(b.dr + base[v]);
         ci[v] = load(b.ci + base[v]);
         wo[v] = load(b.wOut + base[v]);
@@ -118,9 +137,39 @@ inline void step(const BankView& b, const int* groups, const float* in, float* s
         }
         store(scratch + k * kWidth, add(acc0, acc1));
     }
+    if constexpr (!Impulse)
+        for (int v = 0; v < NV; ++v) {
+            store(b.zr + base[v], zr[v]);
+            store(b.zi + base[v], zi[v]);
+        }
+}
+
+// Horner accumulation of the input in c for NG groups at once (in registers).
+template <int NG>
+inline void forcedStep(const BankView& b, const int* groups, const float* u, int n) noexcept {
+    constexpr int NV = NG * kVecPerGroup;
+    vf ar[NV], ai[NV], dr[NV], ci[NV];
+    int base[NV];
     for (int v = 0; v < NV; ++v) {
-        store(b.zr + base[v], zr[v]);
-        store(b.zi + base[v], zi[v]);
+        base[v] = groups[v / kVecPerGroup] * ModeBank::kGroupSize + (v % kVecPerGroup) * kWidth;
+        dr[v] = load(b.dr + base[v]);
+        ci[v] = load(b.ci + base[v]);
+        ar[v] = zero();
+        ai[v] = zero();
+    }
+    for (int k = 0; k < n; ++k) {
+        const vf x = set1(u[k]);
+        for (int v = 0; v < NV; ++v) {
+            const vf nr = fnmadd(ci[v], ai[v], fmadd(dr[v], ar[v], add(ar[v], x)));
+            const vf ni = fmadd(ci[v], ar[v], fmadd(dr[v], ai[v], ai[v]));
+            ar[v] = nr;
+            ai[v] = ni;
+        }
+    }
+    for (int v = 0; v < NV; ++v) {
+        const vf wr = load(b.wInRe + base[v]), wi = load(b.wInIm + base[v]);
+        store(b.zr + base[v], fnmadd(wi, ai[v], fmadd(wr, ar[v], load(b.zr + base[v]))));
+        store(b.zi + base[v], fmadd(wi, ar[v], fmadd(wr, ai[v], load(b.zi + base[v]))));
     }
 }
 
@@ -135,43 +184,23 @@ void runAll(const BankView& b, const int* groups, int nGroups, const float* in, 
 
 }  // namespace
 
-// Memory-bound (seven loads and two stores per vector for six FMAs), so the
-// loop is kept simple; two accumulators shorten the output chain.
-void stepRunsSimd(const BankView& b, const int* seg, const int* m0, const int* m1, int nRuns,
-                  const float* in, float* out) noexcept {
-    for (int r = 0; r < nRuns; ++r) {
-        const vf u = set1(in[seg[r]]);
-        vf acc0 = zero(), acc1 = zero();
-        int m = m0[r];
-        const int end = m1[r];
-        for (; m + 2 * kWidth <= end; m += 2 * kWidth) {
-            for (int h = 0; h < 2; ++h) {
-                const int i = m + h * kWidth;
-                const vf zr = load(b.zr + i), zi = load(b.zi + i);
-                const vf dr = load(b.dr + i), ci = load(b.ci + i);
-                const vf ar = fmadd(load(b.wInRe + i), u, zr);
-                const vf ai = fmadd(load(b.wInIm + i), u, zi);
-                const vf nr = fnmadd(ci, zi, fmadd(dr, zr, ar));
-                const vf ni = fmadd(ci, zr, fmadd(dr, zi, ai));
-                store(b.zr + i, nr);
-                store(b.zi + i, ni);
-                if (h == 0) acc0 = fmadd(load(b.wOut + i), ni, acc0);
-                else acc1 = fmadd(load(b.wOut + i), ni, acc1);
-            }
-        }
-        for (; m < end; m += kWidth) {
-            const vf zr = load(b.zr + m), zi = load(b.zi + m);
-            const vf dr = load(b.dr + m), ci = load(b.ci + m);
-            const vf ar = fmadd(load(b.wInRe + m), u, zr);
-            const vf ai = fmadd(load(b.wInIm + m), u, zi);
-            const vf nr = fnmadd(ci, zi, fmadd(dr, zr, ar));
-            const vf ni = fmadd(ci, zr, fmadd(dr, zi, ai));
-            store(b.zr + m, nr);
-            store(b.zi + m, ni);
-            acc0 = fmadd(load(b.wOut + m), ni, acc0);
-        }
-        out[seg[r]] += hsum(add(acc0, acc1));
-    }
+void impulseSimd(const BankView& b, const int* groups, int nGroups, float* out, int n,
+                 float* scratch) noexcept {
+    for (int k = 0; k < n; ++k) store(scratch + k * kWidth, zero());
+    int gi = 0;
+    for (; gi + kGroupsPerStep <= nGroups; gi += kGroupsPerStep)
+        step<kGroupsPerStep, false, true>(b, groups + gi, nullptr, scratch, n);
+    for (; gi < nGroups; ++gi) step<1, false, true>(b, groups + gi, nullptr, scratch, n);
+    for (int k = 0; k < n; ++k) out[k] += hsum(load(scratch + k * kWidth));
+}
+
+// No output and no input weights in the loop: four FMAs and an add per mode
+// and sample, so more groups fit in registers than in step().
+void forcedSimd(const BankView& b, const int* groups, int nGroups, const float* u, int n) noexcept {
+    constexpr int G = kGroupsPerStep;
+    int gi = 0;
+    for (; gi + G <= nGroups; gi += G) forcedStep<G>(b, groups + gi, u, n);
+    for (; gi < nGroups; ++gi) forcedStep<1>(b, groups + gi, u, n);
 }
 
 void runModesSimd(const BankView& b, const int* groups, int nGroups, const float* in,

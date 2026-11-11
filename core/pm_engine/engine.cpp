@@ -131,6 +131,8 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
             statK0_[k] = bank_.staticCorrection0(k);
             statK1_[k] = bank_.staticCorrection1(k);
         }
+        if (!loop_.configure(keyZone_, kNumKeys, board_.zoneCount(), 2)) return false;
+        loop_.setGain(symGain_);
         // Peak gain from a key's bank output to the output, over every key,
         // pickup and board resonance (the modal sum evaluated at each mode's
         // frequency), for the culling threshold.
@@ -197,9 +199,11 @@ void Engine::resetState() noexcept {
         cullOffsetApplied_[k] = 0.0f;
         bank_.setSegmentCullOffset(k, 0.0f, 0.0f);
         io_[k].skip = false;
-        u_[k] = uPrev_[k] = fKey_[k] = fCoupled_[k] = 0.0f;
+        uPrev_[k] = 0.0f;
+        bank_.setCoupledInputHistory(k, 0.0f);
     }
     board_.clearState();
+    if (boardOn_) loop_.reset();
     for (int z = 0; z < Soundboard::kMaxZones; ++z) zoneF_[z] = zoneD_[z] = noiseLp_[z] = 0.0f;
     for (float& h : hpX_[0]) h = 0.0f;
     for (float& h : hpX_[1]) h = 0.0f;
@@ -210,8 +214,6 @@ void Engine::resetState() noexcept {
     noiseAmp_ = 0.0f;
     pedal_ = pedalPrev_ = pedalFrom_ = 0.0f;
     pedalStart_ = 0;
-    for (int k = 0; k < kNumKeys; ++k) keyActive_[k] = false;
-    nActiveKeys_ = nOutZones_ = 0;
     sustain_ = 0.0f;
     sostenuto_ = false;
     for (int k = 0; k < kNumKeys; ++k) sostLatched_[k] = false;
@@ -637,6 +639,10 @@ void Engine::readParams() noexcept {
             const double th = 0.25 * kPi * (pan + 1.0);
             gainL_[k] = static_cast<float>(std::cos(th));
             gainR_[k] = static_cast<float>(std::sin(th));
+            if (boardOn_) {
+                loop_.setTapGain(0, k, gainL_[k]);
+                loop_.setTapGain(1, k, gainR_[k]);
+            }
         }
     }
     masterTarget_ = std::pow(10.0f, std::clamp(masterGainDb_.load(std::memory_order_relaxed),
@@ -651,77 +657,49 @@ void Engine::readParams() noexcept {
     }
 }
 
-// One sub-block with the soundboard loop (see the header): uncoupled string
-// modes as a block, then hammers, coupled modes, board and the key inputs
-// sample by sample. Output into mixL_/mixR_ (board) and hfL_/hfR_ (direct).
+// One sub-block with the soundboard loop (see the header): every awake string
+// mode advances freely as a block, then the hammers, the zone core of the
+// loop and the board run sample by sample, then the loop's input is added
+// to the strings' state (CouplingLoop, pm_board/soundboard.h). Output into
+// mixL_/mixR_ (board) and hfL_/hfR_ (direct).
 void Engine::processBoard(int n) noexcept {
     for (int a = 0; a < activeCount_; ++a) {
         const int k = hammers_[active_[a]].key;
         hView_[a] = contact_.view(bank_, k);
         io_[k].skip = true;
+        uPrev_[k] = bank_.coupledInputHistory(k);
     }
-    bank_.processSegmentsUncoupled(io_.data(), n);
-    bank_.beginCoupled(io_.data());
-
-    // Keys that can carry a force or need an input during this sub-block.
-    // A key that wakes during it is in the wakeable list already.
-    bool want[kNumKeys] = {};
-    for (int a = 0; a < activeCount_; ++a) want[hammers_[active_[a]].key] = true;
-    const int* list = nullptr;
-    for (int i = 0, c = bank_.coupledSegments(list); i < c; ++i) want[list[i]] = true;
-    for (int i = 0, c = bank_.wakeableSegments(list); i < c; ++i) want[list[i]] = true;
-    nActiveKeys_ = 0;
-    bool zoneUsed[Soundboard::kMaxZones] = {};
-    for (int k = 0; k < kNumKeys; ++k) {
-        if (want[k] || io_[k].wrote) {
-            activeKeys_[nActiveKeys_++] = k;
-            zoneUsed[keyZone_[k].z0] = true;
-            if (keyZone_[k].w1 != 0.0f) zoneUsed[keyZone_[k].z0 + 1] = true;
-            keyActive_[k] = true;
-        } else if (keyActive_[k]) {
-            keyActive_[k] = false;
-            u_[k] = uPrev_[k] = fKey_[k] = 0.0f;
-            bank_.setCoupledInputHistory(k, 0.0f);  // its static correction restarts from rest
-        }
-    }
-    nOutZones_ = 0;
-    if (symGain_ > 0.0f)
-        for (int z = 0; z < board_.zoneCount(); ++z)
-            if (zoneUsed[z]) outZones_[nOutZones_++] = z;
+    bank_.processSegmentsFree(io_.data(), n);
+    loop_.begin(bank_, io_.data(), n);
+    const int* outZones = nullptr;
+    const int nOut = loop_.outZones(outZones);
 
     const int zones = board_.zoneCount();
     const float pi2 = 2.0f * static_cast<float>(kPi);
     for (int i = 0; i < n; ++i) {
+        for (int z = 0; z < zones; ++z) zoneF_[z] = 0.0f;
+        hfL_[i] = hfR_[i] = 0.0f;
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
-            stepHammer(h.state, h.params, hView_[a], &u_[h.key], &fKey_[h.key], 1);
-        }
-        bank_.stepCoupled(u_, fCoupled_);
-        float hl = 0.0f, hr = 0.0f;
-        for (int z = 0; z < zones; ++z) zoneF_[z] = 0.0f;
-        for (int j = 0; j < nActiveKeys_; ++j) {
-            const int k = activeKeys_[j];
-            float f;
-            if (!io_[k].skip) {
-                // The bank wrote fCoupled_ only for keys with awake coupled
-                // groups; a key without (uncoupled groups only, or asleep)
-                // has no coupled output.
-                f = (bank_.segmentHasAwakeCoupled(k) ? fCoupled_[k] : 0.0f) + (io_[k].wrote ? io_[k].out[i] : 0.0f);
-            } else {
-                f = fKey_[k] - (statK0_[k] * u_[k] + statK1_[k] * uPrev_[k]);
-            }
-            fKey_[k] = f;
-            uPrev_[k] = u_[k];
+            const int k = h.key;
+            const float u = loop_.keyInput(k, i);
+            float f = 0.0f;
+            stepHammer(h.state, h.params, hView_[a], &u, &f, 1);
+            // A hammer owns all of its key's modes: the key's full taps apply.
+            f -= statK0_[k] * u + statK1_[k] * uPrev_[k];
+            uPrev_[k] = u;
             if (f == 0.0f) continue;
             const KeyZone& kz = keyZone_[k];
             const float fn = f * kz.forceScale;
-            hl += gainL_[k] * fn;
-            hr += gainR_[k] * fn;
+            hfL_[i] += gainL_[k] * fn;
+            hfR_[i] += gainR_[k] * fn;
             zoneF_[kz.z0] += kz.w0 * fn;
             if (kz.w1 != 0.0f) zoneF_[kz.z0 + 1] += kz.w1 * fn;
         }
-        hfL_[i] = hl;
-        hfR_[i] = hr;
+        float tap[2] = {0.0f, 0.0f};
+        loop_.forces(i, zoneF_, tap);
+        hfL_[i] += tap[0];
+        hfR_[i] += tap[1];
 
         if (noiseAmp_ > 0.0f) {
             for (int z = 0; z < zones; ++z) {
@@ -743,18 +721,12 @@ void Engine::processBoard(int n) noexcept {
             if (++kn.age >= knockLen_) knocks_[j] = knocks_[--nKnocks_];
             else ++j;
         }
-        board_.step(zoneF_, zoneD_, pick_, Kernel::Simd, outZones_, nOutZones_);
-        if (symGain_ > 0.0f)
-            for (int j = 0; j < nActiveKeys_; ++j) {
-                const int k = activeKeys_[j];
-                const KeyZone& kz = keyZone_[k];
-                float u = kz.w0 * zoneD_[kz.z0];
-                if (kz.w1 != 0.0f) u += kz.w1 * zoneD_[kz.z0 + 1];
-                u_[k] = symGain_ * u;
-            }
+        board_.step(zoneF_, zoneD_, pick_, Kernel::Simd, outZones, nOut);
+        loop_.push(i, zoneD_);
         mixL_[i] = kBoardOutputGain * pick_[0];
         mixR_[i] = kBoardOutputGain * pick_[1];
     }
+    loop_.end(bank_, io_.data(), n);
     bank_.endCoupled(io_.data(), n);
 }
 

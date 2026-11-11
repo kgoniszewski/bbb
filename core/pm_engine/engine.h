@@ -6,12 +6,13 @@
 //
 // Soundboard loop (plan §1.6, pm_board/soundboard.h, soundboard_model.h).
 // Per sample: the hammers and the coupled string modes (partials inside the
-// board's modal range) advance with the bridge displacement computed at the
+// loop's band) advance with the bridge displacement computed at the
 // previous sample; every key's bridge force goes to the zone forces; the
 // board advances and returns zone displacements, mixed into each key's
 // input for the next sample (times the sympathetic gain). String modes
-// above the modal range are advanced a sub-block at a time and only drive
-// the board. The bake of every key excludes exactly what the loop feeds
+// above the loop's band only drive the board. The recursion is evaluated
+// exactly but block-wise (CouplingLoop): only the hammers, an 18-zone core
+// and the board are stepped per sample. The bake of every key excludes exactly what the loop feeds
 // back (no double counting). Sustain-pedal bloom, sympathetic resonance and
 // string-board hybridisation all come out of this loop; there is no special
 // case for any of them.
@@ -140,6 +141,7 @@ class Engine {
 public:
     static constexpr int kHammerPool = 32;
     static constexpr int kSubBlock = 32;     // also the control-rate grid
+    static_assert(kSubBlock <= CouplingLoop::kMaxBlock, "sub-block longer than the loop's kernel");
     static constexpr int kQueueSize = 1024;
     static constexpr int kMaxPending = 1024;
     static constexpr double kPanicSigma = 70.0;  // 1/s: every partial T60 <= 0.1 s
@@ -336,15 +338,9 @@ private:
     float symGain_ = 0.0f;
     KeyZone keyZone_[kNumKeys]{};
     int keyCoupled_[kNumKeys]{};
-    float u_[kNumKeys]{}, uPrev_[kNumKeys]{}, fKey_[kNumKeys]{}, fCoupled_[kNumKeys]{};
+    CouplingLoop loop_;
+    float uPrev_[kNumKeys]{};  // last input of hammer-owned keys
     float statK0_[kNumKeys]{}, statK1_[kNumKeys]{};  // static correction taps (soundboard_model.h)
-    // Keys taking part in the loop during the current sub-block (a hammer,
-    // awake groups, or wakeable by input) and the zones they read.
-    int activeKeys_[kNumKeys]{};
-    int nActiveKeys_ = 0;
-    bool keyActive_[kNumKeys]{};
-    int outZones_[Soundboard::kMaxZones]{};
-    int nOutZones_ = 0;
     float zoneF_[Soundboard::kMaxZones]{}, zoneD_[Soundboard::kMaxZones]{}, pick_[Soundboard::kMaxPickups]{};
     float hfGain_ = 0.0f;
     // The culling threshold refers to the output; through the board a bank

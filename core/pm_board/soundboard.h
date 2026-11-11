@@ -21,7 +21,9 @@
 // F[n] and returns the displacement at the end of its update, which the
 // strings receive at n + 1. With this alignment the per-mode loop transfer,
 // read as an admittance, is positive real (soundboard_model.h,
-// loopModeAdmittance), so the zone-port loop is passive.
+// loopModeAdmittance), so the zone-port loop is passive. CouplingLoop
+// computes exactly this recursion, but only the board and an 18-zone core
+// are stepped per sample; the string modes run a sub-block at a time.
 //
 // Sleep. With no input for kSleepInterval samples and every output bound
 // below its threshold the state is zeroed and step() costs nothing until a
@@ -121,5 +123,114 @@ inline void zonesToKeys(const KeyZone* kz, const float* zoneDisp, int keys, floa
         keyIn[k] = gain * u;
     }
 }
+
+// The string-board loop solved exactly per sub-block (plan §1.6, M4 note;
+// mode_bank.h, "Coupled processing").
+//
+// Every key is a single-input single-output system for the loop: input u_k
+// (gain times its interpolated zone displacement), output F_k (its bridge
+// force). Over a sub-block of n samples its output is its free response F0_k
+// (no input, a block pass of the bank) plus the convolution of its input
+// with its impulse response h_k (n taps, static correction included). Keys
+// enter the zones through at most two adjacent zones each, so the forced
+// part summed into zone forces is a convolution of the zone displacements
+// with a banded zone-to-zone kernel
+//   G_ab[j] = g sum_k a_ak a_bk forceScale_k h_k[j]     (a, b zones of key k)
+// (about 50 non-zero entries for 18 zones). Per sample only this core runs:
+// zone force = free part + sum_j G[j] d[i-j], board step, new displacement.
+// At the end of the sub-block each key's input sequence is known and the
+// bank adds its share to the key's state (Horner, mode_bank.h). This is the
+// per-sample loop rearranged by superposition, not an approximation: the
+// trajectory is the same up to rounding, so stability and passivity are
+// those of the per-sample loop (soundboard_model.h, test_passivity).
+// h_k changes with the key's damper amount and awake set; it is recomputed
+// (about one free pass of the key's coupled modes) only when it changes.
+//
+// Keys owned by a hammer solver (io[k].skip) are not part of G: the caller
+// steps them per sample with keyInput() and adds their force itself.
+//
+// configure() is non-real-time; everything else is RT.
+class CouplingLoop {
+public:
+    static constexpr int kMaxBlock = 32;
+    static constexpr int kMaxKeys = 128;
+    static constexpr int kMaxEntries = 4 * kMaxKeys;
+
+    static constexpr int kMaxTaps = 2;
+
+    // kz[keys]: the keys' zones and force scales; zones of the board. 'taps'
+    // extra outputs (a direct path, e.g. stereo) receive sum_k tapGain[t][k]
+    // forceScale_k F_k, exactly like the zone forces.
+    bool configure(const KeyZone* kz, int keys, int zones, int taps = 0) noexcept;
+    // RT (rebuilds the kernel at the next sub-block when changed).
+    void setTapGain(int t, int k, float g) noexcept {
+        if (tapGain_[t][k] != g) dirty_ = true;
+        tapGain_[t][k] = g;
+    }
+    void setGain(float g) noexcept {
+        if (g != gain_) dirty_ = true;
+        gain_ = g;
+    }
+    float gain() const noexcept { return gain_; }
+    void reset() noexcept;
+
+    // Sub-block of n <= kMaxBlock samples, after ModeBank::processSegmentsFree.
+    // Keys that receive an input: awake or wakeable coupled groups (as the
+    // bank reports them) and skipped keys.
+    void begin(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel = Kernel::Simd) noexcept;
+    // Zones whose displacement the loop needs (pass to Soundboard::step).
+    int outZones(const int*& list) const noexcept {
+        list = outZones_;
+        return nOut_;
+    }
+    // ADDS to zoneForce the zone forces of sample i (free responses of all
+    // non-skipped keys and the forced response to d[0..i]), and to tap[t]
+    // the taps' outputs (tap may be null when there are none).
+    void forces(int i, float* zoneForce, float* tap, Kernel kernel = Kernel::Simd) noexcept;
+    // Input of key k at sample i (gain times its zone displacement).
+    float keyInput(int k, int i) const noexcept {
+        const KeyZone& z = kz_[k];
+        float u = z.w0 * d_[i * Soundboard::kMaxZones + z.z0];
+        if (z.w1 != 0.0f) u += z.w1 * d_[i * Soundboard::kMaxZones + z.z0 + 1];
+        return gain_ * u;
+    }
+    // The board's zone displacements after sample i (input of sample i + 1).
+    void push(int i, const float* zoneDisp) noexcept;
+    // Applies the inputs of the sub-block to the bank (and wakes groups).
+    void end(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel = Kernel::Simd) noexcept;
+
+    // Inspection: keys in the loop (awake coupled groups) during the last sub-block.
+    int memberCount() const noexcept { return nMembers_; }
+    int entryCount() const noexcept { return nEnt_; }
+
+private:
+    void rebuildKernel() noexcept;
+
+    int keys_ = 0, zones_ = 0, taps_ = 0, nEnt_ = 0, entPad_ = 0;
+    float tapGain_[kMaxTaps][kMaxKeys]{};
+    float gain_ = 0.0f;
+    bool dirty_ = true;
+    KeyZone kz_[kMaxKeys]{};
+    // Destination: a zone, or zones + t for tap t.
+    int entDst_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{}, entSrc_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{};
+    int tapEnt_[kMaxTaps][Soundboard::kMaxZones]{};
+    int keyEnt_[kMaxKeys][4]{};       // entries of key k: (z0,z0), (z0,z1), (z1,z0), (z1,z1)
+    float keyEntW_[kMaxKeys][4]{};    // their weights a_ak a_bk
+    AlignedArray<float> h_;           // kMaxKeys x kMaxBlock
+    float k1_[kMaxKeys]{};
+    std::uint32_t ver_[kMaxKeys]{};
+    bool hasH_[kMaxKeys]{}, member_[kMaxKeys]{}, listen_[kMaxKeys]{};
+    int members_[kMaxKeys]{}, listenList_[kMaxKeys]{};
+    int nMembers_ = 0, nListen_ = 0;
+    AlignedArray<float> G_;           // kMaxBlock x entPad
+    AlignedArray<float> dE_;          // kMaxBlock x entPad: source displacement per entry
+    AlignedArray<float> acc_;         // entPad
+    AlignedArray<float> d_;           // (kMaxBlock + 1) x kMaxZones
+    AlignedArray<float> f0_;          // kMaxBlock x (kMaxZones + kMaxTaps): free zone forces and taps
+    AlignedArray<float> u_;           // kMaxBlock
+    int outZones_[Soundboard::kMaxZones]{};
+    int nOut_ = 0;
+    bool zoneOut_[Soundboard::kMaxZones]{}, zoneOutPrev_[Soundboard::kMaxZones]{};
+};
 
 }  // namespace pm

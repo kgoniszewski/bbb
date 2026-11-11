@@ -160,23 +160,27 @@ public:
     void processSegments(SegmentIO* io, int nFrames, Kernel kernel = Kernel::Simd) noexcept;
 
     // Coupled processing (soundboard loop, pm_board/soundboard.h). The first
-    // segmentCoupledGroups(s) groups of segment s are "coupled": they take
-    // a per-sample input from the loop and must be advanced one sample at a
-    // time with stepCoupled(); the remaining groups are advanced a sub-block
-    // at a time by processSegmentsUncoupled() (no input). Per sub-block of
-    // n samples (n <= kCullInterval, never crossing a multiple of
-    // kCullInterval in absolute time):
-    //   processSegmentsUncoupled(io, n); beginCoupled(io);
-    //   n x stepCoupled(in, out);        endCoupled(io, n);
-    // Segments marked io[s].skip are left alone by all of these. Culling:
-    // a sleeping coupled group wakes as soon as the input accumulated since
-    // the last cull pass could have moved its output above the threshold
-    // (the same bound as process()); the cull pass runs in endCoupled() on
-    // the absolute kCullInterval grid.
+    // segmentCoupledGroups(s) groups of segment s are "coupled": they take an
+    // input u from the loop, one sample after the board produced it. The
+    // loop is solved exactly per sub-block of n samples (n <= kCullInterval,
+    // never crossing a multiple of kCullInterval in absolute time):
+    //   processSegmentsFree(io, n)      every awake group without input: the
+    //                                   free response F0 (overwrites io[s].out)
+    //   loop, sample by sample:         F[i] = F0[i] + sum_j h[j] u[i-j] - k1 uPrev [i = 0]
+    //                                   (h, k1 from coupledResponse())
+    //   applyCoupledInput(s, u, n)      adds the input's share to the state
+    //   endCoupled(io, n)               culling on the absolute grid
+    // In exact arithmetic this is the same recursion as stepping every coupled
+    // mode one sample at a time with its input (superposition), so it has the
+    // per-sample loop's stability and passivity, but each mode is touched
+    // twice per sub-block in registers instead of once per sample in memory.
+    // Culling: a sleeping coupled group wakes at the end of the sub-block in
+    // which the input accumulated since the last cull pass could have moved
+    // its output above the threshold (the same bound as process()).
     void setSegmentCoupledGroups(int s, int groups) noexcept;  // non-RT
     // Static correction of the coupled input (pm_voicing/soundboard_model.h):
-    // stepCoupled() subtracts k0 u[n] + k1 u[n-1] per awake coupled group
-    // from its segment's output, so that sleeping groups (which do not
+    // the segment's output is corrected by -(k0 u[n] + k1 u[n-1]), summed
+    // over its awake coupled groups, so that sleeping groups (which do not
     // respond) are not corrected. computeStaticCorrection() derives both
     // taps from the current coefficients and input/output weights (damper
     // amount 0): k0 + k1 = sum wOut Im(wIn / (1 - c)) (static gain),
@@ -185,26 +189,33 @@ public:
     // Sum over all coupled groups of segment s (awake or not).
     float staticCorrection0(int s) const noexcept;
     float staticCorrection1(int s) const noexcept;
-    // The previous input of segment s as stepCoupled() remembers it (state
-    // of the static correction; tests that set the whole state use these).
+    // The last input of segment s (state of the static correction).
     float coupledInputHistory(int s) const noexcept { return segInPrev_[s]; }
     void setCoupledInputHistory(int s, float u) noexcept { segInPrev_[s] = u; }
     int segmentCoupledGroups(int s) const noexcept { return segCoupled_[s]; }
-    // RT. Overwrites io[s].out[0..n) with the uncoupled groups' output where
-    // they are awake (io[s].wrote), like processSegments.
-    void processSegmentsUncoupled(SegmentIO* io, int nFrames, Kernel kernel = Kernel::Simd) noexcept;
-    void beginCoupled(const SegmentIO* io) noexcept;
-    // RT. One sample: in[s] is segment s's input, out[s] receives its coupled
-    // groups' output for every segment with awake coupled groups (the
-    // segments listed by coupledSegments()); other entries are untouched.
-    void stepCoupled(const float* in, float* out, Kernel kernel = Kernel::Simd) noexcept;
-    // RT, valid after beginCoupled() until the next change of the awake
-    // set: segments with awake coupled groups, and segments that are asleep
-    // (in part) but can still be woken by their input.
-    int coupledSegments(const int*& list) noexcept;
-    // Whether stepCoupled() writes out[s] (segment has awake coupled groups).
-    bool segmentHasAwakeCoupled(int s) const noexcept { return segHasRuns_[s] != 0; }
-    int wakeableSegments(const int*& list) noexcept;
+    // Changes whenever coupledResponse(s) would change (damper amount,
+    // coefficients, weights, or the awake set of the coupled groups).
+    std::uint32_t coupledVersion(int s) const noexcept { return segVersion_[s]; }
+    // RT. The response of segment s's output to a unit input at sample 0,
+    // h[0..n), over its awake coupled groups, static correction included;
+    // *k1 = the correction's tap on the previous input. Returns false (h
+    // untouched) when no coupled group is awake. Costs about one free pass
+    // of the coupled groups over n samples: call it only when
+    // coupledVersion() changed.
+    bool coupledResponse(int s, float* h, int n, float* k1, Kernel kernel = Kernel::Simd) noexcept;
+    bool segmentHasAwakeCoupled(int s) const noexcept;
+    // Has sleeping coupled groups that input could wake (culling on and the
+    // segment's input threshold not raised out of reach).
+    bool segmentWakeable(int s) const noexcept;
+    // RT. Every awake group (coupled or not) of each segment not marked
+    // skip, without input; outputs overwrite io[s].out where io[s].wrote.
+    void processSegmentsFree(SegmentIO* io, int nFrames, Kernel kernel = Kernel::Simd) noexcept;
+    // RT. Adds input u[0..n) to the awake coupled groups of segment s (their
+    // state was advanced freely over the same n samples), records u for the
+    // static correction and the wake-up bound, and wakes sleeping coupled
+    // groups when the bound is exceeded (from their quasi-static deflection
+    // under u[n-1]).
+    void applyCoupledInput(int s, const float* u, int n, Kernel kernel = Kernel::Simd) noexcept;
     void endCoupled(const SegmentIO* io, int nFrames) noexcept;
 
     int activeGroups() const noexcept;
@@ -222,8 +233,16 @@ private:
     void applyDamper(int i) noexcept;
     void cullPass(const SegmentIO* io) noexcept;
     void run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) noexcept;
-    void rebuildRuns() noexcept;
     void wakeCoupled(int s, float u) noexcept;
+    void setActive(int g, std::uint8_t on) noexcept {
+        if (active_[g] == on) return;
+        active_[g] = on;
+        const int s = groupSeg_[g];
+        if (g < segFirstGroup(s) + segCoupled_[s]) ++segVersion_[s];
+    }
+    void touchAll() noexcept {
+        for (int s = 0; s < nSeg_; ++s) ++segVersion_[s];
+    }
 
     AlignedArray<float> zr_, zi_, dr_, ci_, wIn_, wInIm_, wOut_;  // dr = Re(c) - 1
     AlignedArray<float> dr0_, ci0_;   // free-string coefficient
@@ -238,14 +257,11 @@ private:
     AlignedArray<float> scratch_;     // kCullInterval * SIMD width
     // Coupled processing.
     AlignedArray<int> segCoupled_;    // coupled groups per segment
-    AlignedArray<std::uint8_t> segSkip_, segSleeping_, segHasRuns_;
+    AlignedArray<int> groupSeg_;      // segment of each group
+    AlignedArray<std::uint32_t> segVersion_;
     AlignedArray<float> segWakeGain_; // max groupInOut over the coupled groups
-    AlignedArray<int> runSeg_, runM0_, runM1_, runSegList_, wakeList_;
-    int nRunSegs_ = 0, nWake_ = 0;
-    AlignedArray<float> groupK0_, groupK1_, segK0_, segK1_, segInPrev_;
+    AlignedArray<float> groupK0_, groupK1_, segInPrev_;
     AlignedArray<float> segCullScale_, segInputScale_;  // per-segment threshold factors
-    int nRuns_ = 0;
-    bool runsDirty_ = true;
 
     int capacity_ = 0;
     int size_ = 0;

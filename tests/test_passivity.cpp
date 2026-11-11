@@ -69,7 +69,12 @@ struct Result {
     bool finite = true;
 };
 
-Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples) {
+// delayed = true: the deliberately non-passive variant the exact block
+// solve replaces: the board sees only the strings' free response over each
+// sub-block, and the strings' response to the board's displacement enters
+// their state at the end of the sub-block (a feedback delay of up to one
+// sub-block). The test must flag it.
+Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool delayed = false) {
     Rng r{seed};
     pm::PlateParams pp;
     pp.lengthX = r.uni(1.6, 2.2);
@@ -169,41 +174,50 @@ Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples) {
     for (int i = 0; i < board.modes; ++i)
         sb.setState(i, static_cast<float>(sb.stateRe(i) * scale), static_cast<float>(sb.stateIm(i) * scale));
 
-    std::vector<float> u(static_cast<std::size_t>(nk), 0.0f), F(static_cast<std::size_t>(nk)),
-        Fc(static_cast<std::size_t>(nk));
-    float zf[pm::Soundboard::kMaxZones], zd[pm::Soundboard::kMaxZones], pk[pm::Soundboard::kMaxPickups];
+    pm::CouplingLoop loop;
+    loop.configure(kz.data(), nk, board.zones);
+    loop.setGain(static_cast<float>(g));
+    float zf[pm::Soundboard::kMaxZones], zd[pm::Soundboard::kMaxZones] = {}, pk[pm::Soundboard::kMaxPickups];
     const double e0 = stringEnergy() + sb.energy();
     double q3 = 0.0, q4 = 0.0;
     int n3 = 0, n4 = 0;
-    for (int s = 0; s < samples; ++s) {
-        const int sub = s % 32;
-        if (sub == 0) {
-            bank.processSegmentsUncoupled(io.data(), 32);
-            bank.beginCoupled(io.data());
-        }
-        bank.stepCoupled(u.data(), Fc.data());
-        for (int i = 0; i < nk; ++i) F[i] = Fc[i] + (io[i].wrote ? io[i].out[sub] : 0.0f);
-        for (int z = 0; z < board.zones; ++z) zf[z] = 0.0f;
-        pm::keysToZones(kz.data(), F.data(), nk, zf);
-        sb.step(zf, zd, pk);
-        if (g > 0.0) pm::zonesToKeys(kz.data(), zd, nk, static_cast<float>(g), u.data());
-        if (sub == 31) {
-            bank.endCoupled(io.data(), 32);
-            const double e = stringEnergy() + sb.energy();
-            if (!std::isfinite(e)) {
-                res.finite = false;
-                return res;
+    // The engine's sub-block sequence, production code throughout.
+    for (int s = 0; s + 32 <= samples; s += 32) {
+        bank.processSegmentsFree(io.data(), 32);
+        loop.begin(bank, io.data(), 32);
+        const int* oz = nullptr;
+        const int no = loop.outZones(oz);
+        for (int i = 0; i < 32; ++i) {
+            for (int z = 0; z < board.zones; ++z) zf[z] = 0.0f;
+            if (delayed) {
+                for (int k = 0; k < nk; ++k)
+                    if (io[k].wrote) {
+                        const float f = io[k].out[i] * kz[k].forceScale;
+                        zf[kz[k].z0] += kz[k].w0 * f;
+                        if (kz[k].w1 != 0.0f) zf[kz[k].z0 + 1] += kz[k].w1 * f;
+                    }
+            } else {
+                loop.forces(i, zf, nullptr);
             }
-            res.peak = std::max(res.peak, e / e0);
-            if (4 * (s + 1) > 3 * samples) {
-                q4 += e;
-                ++n4;
-            } else if (2 * (s + 1) > samples) {
-                q3 += e;
-                ++n3;
-            }
-            res.final = e / e0;
+            sb.step(zf, zd, pk, pm::Kernel::Simd, oz, no);
+            loop.push(i, zd);
         }
+        loop.end(bank, io.data(), 32);
+        bank.endCoupled(io.data(), 32);
+        const double e = stringEnergy() + sb.energy();
+        if (!std::isfinite(e)) {
+            res.finite = false;
+            return res;
+        }
+        res.peak = std::max(res.peak, e / e0);
+        if (4 * (s + 32) > 3 * samples) {
+            q4 += e;
+            ++n4;
+        } else if (2 * (s + 32) > samples) {
+            q3 += e;
+            ++n3;
+        }
+        res.final = e / e0;
     }
     res.lateRise = n3 > 0 && n4 > 0 && q3 > 0.0 ? (q4 / n4) / (q3 / n3) : 0.0;
     return res;
@@ -240,4 +254,20 @@ TEST(energy_never_grows_random_sets) {
                 "E(end)/E(0) %.4f, worst mean(last quarter)/mean(third quarter) %.4f; %d violations\n",
                 kSets, modes, boardModes, worstPeak, worstFinal, worstLate, bad);
     CHECK(bad == 0);
+}
+
+// The test detects a loop that is not passive: the block-delayed variant
+// (runSet, delayed) on the same random sets.
+TEST(delayed_loop_is_flagged) {
+    pm::ScopedFlushDenormals ftz;
+    pm::PianoTable base;
+    pm::buildPianoTable(base);
+    const int kSets = 500;
+    int bad = 0;
+    for (int i = 0; i < kSets; ++i) {
+        const Result r = runSet(base, 1000 + std::uint64_t(i), i % 50 == 0 ? 24000 : 1216, true);
+        if (!(r.finite && r.peak <= 1.03 && r.final <= 1.0 && r.lateRise <= 1.001)) ++bad;
+    }
+    std::printf("  block-delayed loop: %d of %d random sets violate passivity\n", bad, kSets);
+    CHECK(bad >= kSets / 20);
 }
