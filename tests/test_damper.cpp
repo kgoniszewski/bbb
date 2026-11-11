@@ -45,9 +45,11 @@ double maxStep(const std::vector<float>& y, int from, int to) {
 
 }  // namespace
 
-// Damper logic on the string sound (soundboard off: the board's low modes
-// keep ringing after the strings are damped; release decay with the board
-// is measured per partial in test_half_pedal).
+// Damper logic on the string sound. Soundboard off for a physical reason:
+// with it, the undamped top strings (key 69 up) and the board's own low
+// modes, rung through the bridge, keep sounding after the strings are
+// damped, so the level never falls 60 dB; release decay with the board is
+// measured per partial in test_half_pedal.
 TEST(note_off_decays_without_click) {
     pm::Engine eng;
     noBoard(eng);
@@ -68,7 +70,10 @@ TEST(note_off_decays_without_click) {
     }
 }
 
-// With the pedal down the note keeps ringing exactly as if the key were held.
+// With the pedal down the note keeps ringing exactly as if the key were held
+// (board off for a physical reason: with it, the pedal also frees every
+// other string, which then resonates through the bridge, unlike with the key
+// held alone).
 TEST(pedal_keeps_ringing) {
     pm::Engine eng;
     noBoard(eng);
@@ -92,10 +97,11 @@ TEST(pedal_keeps_ringing) {
     CHECK(t60 <= 0.4);
 }
 
-// Keys from 69 up have no dampers: note-off changes nothing.
+// Keys from 69 up have no dampers: note-off changes nothing (with the
+// soundboard and its loop on).
 TEST(top_keys_have_no_dampers) {
     pm::Engine eng;
-    noBoard(eng);
+    eng.setNoiseLevels(0.0f, 0.0f);
     for (int note : {89, 96, 108}) {
         eng.prepare(kFs, 64);
         const Stereo held = renderEngine(eng, {noteOn(0, note, 100)}, 48000);
@@ -106,7 +112,9 @@ TEST(top_keys_have_no_dampers) {
         std::printf("  note %d: note-off vs held max difference %.3g\n", note, d);
         CHECK(d == 0.0);
     }
-    // Key 68 (note 88) still has one.
+    // Key 68 (note 88) still has one (board off, for the reason above: the
+    // undamped strings above it ring on through the bridge).
+    noBoard(eng);
     eng.prepare(kFs, 64);
     const Stereo s = renderEngine(eng, {noteOn(0, 88, 100), noteOff(24000, 88)}, 72000);
     CHECK(timeTo60(s, 24000) < 0.5);

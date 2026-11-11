@@ -43,6 +43,13 @@ int main(void) {
     EXPECT(pm_engine_set_param(eng, PM_PARAM_SYMPATHETIC, 0.7) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_SYMPATHETIC, &v) == 1 && fabs(v - 0.7) < 1e-12);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_SOUNDBOARD_ENABLED, 1.0) == 1);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_QUALITY_TIER, PM_QUALITY_BALANCED) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_QUALITY_TIER, &v) == 1 && v == PM_QUALITY_BALANCED);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_QUALITY_TIER, 3.0) == 0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_LOOP_CUTOFF_HZ, 1500.0) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_LOOP_CUTOFF_HZ, &v) == 1 && v == 1500.0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_LOOP_CUTOFF_HZ, 0.0) == 1);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_QUALITY_TIER, PM_QUALITY_FULL) == 1);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_KNOCK_LEVEL, 0.0) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_KNOCK_LEVEL, &v) == 1 && v == 0.0);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_DAMPER_NOISE_LEVEL, 0.01) == 1);

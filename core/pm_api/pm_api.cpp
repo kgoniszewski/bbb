@@ -22,7 +22,7 @@ uint32_t pm_api_version(void) {
     return (PM_API_VERSION_MAJOR << 16) | (PM_API_VERSION_MINOR << 8) | PM_API_VERSION_PATCH;
 }
 
-const char* pm_version_string(void) { return "0.4.0 (M4)"; }
+const char* pm_version_string(void) { return "0.5.0 (M4)"; }
 
 pm_engine* pm_engine_create(void) {
     pm_engine* e = new (std::nothrow) pm_engine();
@@ -116,6 +116,13 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
             return 1;
         }
         case PM_PARAM_DAMPED_CULL_OFFSET_DB: e.setDampedCullOffsetDb(static_cast<float>(value)); return 1;
+        case PM_PARAM_QUALITY_TIER: {
+            const int t = static_cast<int>(value);
+            if (!(value >= 0.0) || t > PM_QUALITY_ECO) return 0;
+            engine->board.tier = static_cast<pm::QualityTier>(t);
+            return 1;
+        }
+        case PM_PARAM_LOOP_CUTOFF_HZ: engine->board.loopCutoffHz = value > 0.0 ? value : 0.0; return 1;
         default: return 0;
     }
 }
@@ -139,6 +146,8 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_UNISON_WIDTH: *value = engine->voicing.unisonWidth; return 1;
         case PM_PARAM_SOUNDBOARD_ENABLED: *value = engine->board.enabled ? 1.0 : 0.0; return 1;
         case PM_PARAM_SYMPATHETIC: *value = engine->board.sympathetic; return 1;
+        case PM_PARAM_QUALITY_TIER: *value = static_cast<double>(engine->board.tier); return 1;
+        case PM_PARAM_LOOP_CUTOFF_HZ: *value = engine->board.loopCutoffHz; return 1;
         case PM_PARAM_KNOCK_LEVEL: *value = e.knockLevel(); return 1;
         case PM_PARAM_DAMPER_NOISE_LEVEL: *value = e.damperNoiseLevel(); return 1;
         case PM_PARAM_HALF_PEDAL_P0_TREBLE: *value = e.halfPedalCurve().p0Treble; return 1;

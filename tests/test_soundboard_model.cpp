@@ -1,6 +1,7 @@
 // Soundboard mode set v0 (plan §1.6): targets of the default plate, the
 // discrete loop's passivity per mode, and the admittance interface against a
 // direct time-domain drive of the run-time modal bank.
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdio>
@@ -29,7 +30,8 @@ double meanRe(const pm::BoardModel& b, int key, double f0, double f1) {
 }  // namespace
 
 // First mode 50-60 Hz, modal density approaching one per 20-30 Hz above
-// 1 kHz, loss factors 1-3 %, 300-600 modes is the plan's range but the
+// 1 kHz, loss factors 1-3.5 % above 1 kHz and up to about 10 % for the lowest modes
+// (soundboard_model.h: rim and case participation), 300-600 modes is the plan's range but the
 // density target with the modal range 5 kHz implies about 200 (see the
 // README); driving-point impedance of order 1e3 kg/s in the mid range.
 TEST(default_board_meets_targets) {
@@ -39,20 +41,21 @@ TEST(default_board_meets_targets) {
         n13 += f >= 1000.0 && f < 3000.0;
         n35 += f >= 3000.0 && f < 5000.0;
     }
-    double etaMin = 1.0, etaMax = 0.0;
+    double etaMin = 1.0, etaMax = 0.0, etaMid = 0.0;
     for (int i = 0; i < b.modes; ++i) {
         const double eta = b.sigma[i] / (kPi * b.freq[i]);
         etaMin = std::min(etaMin, eta);
         etaMax = std::max(etaMax, eta);
+        if (b.freq[i] >= 1000.0) etaMid = std::max(etaMid, eta);
     }
     std::printf("  %d modes below %.0f Hz, first %.1f %.1f %.1f Hz; 1-3 kHz: one per %.1f Hz, 3-5 kHz: one per "
-                "%.1f Hz; asymptotic one per %.1f Hz; loss factor %.3f-%.3f; mass %.1f kg\n",
+                "%.1f Hz; asymptotic one per %.1f Hz; loss factor %.3f-%.3f (above 1 kHz at most %.3f); mass %.1f kg\n",
                 b.modes, b.params.maxFreqHz, b.freq[0], b.freq[1], b.freq[2], 2000.0 / n13, 2000.0 / n35,
-                1.0 / b.density, etaMin, etaMax, b.mass);
+                1.0 / b.density, etaMin, etaMax, etaMid, b.mass);
     CHECK(b.freq[0] >= 50.0 && b.freq[0] <= 60.0);
     CHECK(2000.0 / n13 >= 18.0 && 2000.0 / n13 <= 32.0);
     CHECK(2000.0 / n35 >= 18.0 && 2000.0 / n35 <= 32.0);
-    CHECK(etaMin >= 0.01 && etaMax <= 0.03 + 1e-12);
+    CHECK(etaMin >= 0.01 && etaMid <= 0.035 && etaMax <= 0.11);
     CHECK(b.modes >= 150 && b.modes <= 600);
     for (int key : {16, 28, 40, 52, 64, 76}) {
         const double zMid = 1.0 / meanRe(b, key, 200.0, 2000.0);
@@ -168,4 +171,44 @@ TEST(bake_plus_loop_is_driving_point) {
                 100.0 * clamped / total);
     CHECK_LE(worst, 1e-9);
     CHECK_LE(double(clamped) / total, 0.05);
+}
+
+// Bass driving-point impedance in a plausible range (soundboard_model.h,
+// board revision): published bridge impedances of grands (Wogram 1980;
+// Giordano 1998 for an upright; Conklin 1996, part II) are of order
+// 1e3 kg/s from 50 to 500 Hz with resonance dips of a few hundred kg/s,
+// i.e. conductance peaks within about 10 dB of the local mean. The uniform
+// plate with a 3 % loss factor dipped to 50-70 kg/s at its lowest modes
+// (peaks 18-25 times the mean), which made bass fundamentals there hybridise
+// into string-board doublets. Targets over keys 1-52, 40-500 Hz: median
+// |Z| 700-2000 kg/s, every key's minimum |Z| above 120 kg/s and its largest
+// Re Y within 9 times its mean (19 dB).
+TEST(bass_driving_point_not_peaky) {
+    const pm::BoardModel& b = pm::defaultBoard();
+    std::vector<double> all, mins;
+    double worstPeak = 0.0;
+    for (int key = 1; key <= 52; ++key) {
+        double mn = 1e30, sum = 0.0, peak = 0.0;
+        int n = 0;
+        for (double f = 40.0; f <= 500.0; f *= 1.003, ++n) {
+            const cd y = pm::boardDrivingPoint(b, key, f);
+            const double z = 1.0 / std::abs(y);
+            mn = std::min(mn, z);
+            all.push_back(z);
+            sum += y.real();
+            peak = std::max(peak, y.real());
+        }
+        mins.push_back(mn);
+        worstPeak = std::max(worstPeak, peak / (sum / n));
+    }
+    std::sort(all.begin(), all.end());
+    std::sort(mins.begin(), mins.end());
+    const double median = all[all.size() / 2];
+    std::printf("  keys 1-52, 40-500 Hz: |Z| median %.0f kg/s (5 %% %.0f, 95 %% %.0f); per-key minimum |Z|: median "
+                "%.0f, lowest %.0f kg/s; largest Re Y / mean Re Y %.1f\n",
+                median, all[all.size() / 20], all[all.size() * 19 / 20], mins[mins.size() / 2], mins.front(),
+                worstPeak);
+    CHECK(median >= 700.0 && median <= 2000.0);
+    CHECK(mins.front() >= 120.0);
+    CHECK(worstPeak <= 9.0);
 }

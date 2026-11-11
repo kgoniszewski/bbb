@@ -9,7 +9,13 @@
 //  1. A4 (key 49) = a4Hz.
 //  2. Temperament octave A3-A4: A3 is tuned to A4 as a 4:2 octave (partial 4
 //     of A3 = partial 2 of A4); the eleven keys between divide that octave
-//     equally (equal temperament inside the stretched octave).
+//     equally on their second partials (equal temperament inside the
+//     stretched octave, set on upper partials as an aural tuner hears
+//     intervals; with ratios from B alone this differs from dividing the
+//     first partials by the variation of B over the octave, < 0.01 cent).
+// With sounding ratios (PartialRatios) every r_k(n) below is replaced by the
+// ratio of the sounding frequencies.
+//
 //  3. Upwards, key k from key k-12 (and k-24): 4:2 up to key 56 (E5),
 //     blending to 2:1 by key 68 (E6); above key 76 (C7) the 2:1 octave
 //     blends towards the 4:1 double octave (partial 4 of key k-24 = partial
@@ -30,10 +36,12 @@
 
 namespace pm {
 
-struct TuningOptions {
-    double a4Hz = 440.0;
-    double stretch = 1.0;            // 0 .. 1.5 (clamped)
-    bool equalTemperament = false;   // true: ignore B, plain 12-TET
+// Sounding partial ratios f_k,n / f_k,1 for n = 1..kTunerPartials, per key
+// (e.g. including the bridge's partial shifts, key_loader.h); keys or
+// entries left at 0 use r_k(n).
+inline constexpr int kTunerPartials = 10;
+struct PartialRatios {
+    double r[kNumKeys][kTunerPartials + 1] = {};
 };
 
 // Octave-type weights used for key k (0 for keys tuned by equal division or
@@ -48,7 +56,10 @@ OctaveWeights octaveWeights(int key) noexcept;
 double partialRatio(double B, int n) noexcept;
 
 // f1Out[88]: sounding first-partial targets. B[88]: per-key inharmonicity.
-void virtualTuner(const double* B, const TuningOptions& opt, double* f1Out) noexcept;
+// With 'ratios', the octave partial pairs are matched on those ratios
+// instead of r_k(n).
+void virtualTuner(const double* B, const TuningOptions& opt, double* f1Out,
+                  const PartialRatios* ratios = nullptr) noexcept;
 
 // Deviation of f1 from 12-TET (A4 = a4Hz), cents.
 double centsFromEqualTemperament(double f1, int key, double a4Hz) noexcept;

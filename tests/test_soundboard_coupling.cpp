@@ -76,22 +76,27 @@ double run(const pm::PianoTable& t, int key, int p, double g, const pm::KeyModeS
     pm::SegmentIO io;
     float buf[pm::ModeBank::kCullInterval];
     io.out = buf;
-    float u = 0.0f, F = 0.0f, zf[pm::Soundboard::kMaxZones], zd[pm::Soundboard::kMaxZones], pk[4];
+    pm::CouplingLoop loop;
+    loop.configure(&kz, 1, b.zones);
+    loop.setGain(static_cast<float>(g));
+    float zf[pm::Soundboard::kMaxZones], zd[pm::Soundboard::kMaxZones] = {}, pk[4];
     const int n0 = static_cast<int>(0.05 * kFs), n1 = static_cast<int>(0.55 * kFs);
     double a0 = 0.0;
-    for (int s = 0; s < n1; ++s) {
-        if (s % 32 == 0) {
-            bank.processSegmentsUncoupled(&io, 32);
-            bank.beginCoupled(&io);
+    for (int s = 0; s < n1; s += 32) {
+        loop.begin(bank, sb, &io);
+        bank.processSegmentsFree(&io, 32);
+        loop.collect(bank, &io, 32);
+        const int* oz = nullptr;
+        const int no = loop.outZones(oz);
+        for (int i = 0; i < 32; ++i) {
+            for (int z = 0; z < b.zones; ++z) zf[z] = 0.0f;
+            loop.forces(i, zf, nullptr);
+            sb.step(zf, zd, pk, pm::Kernel::Simd, oz, no);
+            loop.push(i, zd);
         }
-        bank.stepCoupled(&u, &F);
-        if (io.wrote) F += buf[s % 32];
-        for (int z = 0; z < b.zones; ++z) zf[z] = 0.0f;
-        pm::keysToZones(&kz, &F, 1, zf);
-        sb.step(zf, zd, pk);
-        if (g > 0.0) pm::zonesToKeys(&kz, zd, 1, static_cast<float>(g), &u);
-        if (s % 32 == 31) bank.endCoupled(&io, 32);
-        if (s == n0 - 1) a0 = amplitude();
+        loop.end(bank, &io, 32);
+        bank.endCoupled(&io, 32);
+        if (s + 32 == n0) a0 = amplitude();
     }
     return std::log(a0 / amplitude()) / ((n1 - n0) / kFs);
 }

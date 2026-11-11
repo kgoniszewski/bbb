@@ -5,7 +5,9 @@
 #include <numbers>
 
 #include "pm_string/string_modes.h"
+#include "pm_voicing/complex_eigen.h"
 #include "pm_voicing/soundboard_model.h"
+#include "pm_voicing/tuning.h"
 
 namespace pm {
 
@@ -53,42 +55,48 @@ private:
     const BridgeAdmittance& b_;
 };
 
-// Evaluates any admittance at the real frequency only.
-class RealFrequency final : public BridgeAdmittance {
-public:
-    explicit RealFrequency(const BridgeAdmittance& b) : b_(b) {}
-    Admittance2 at(int key, double f) const noexcept override { return b_.at(key, f); }
-    std::complex<double> crossRatio(int key, double f) const noexcept override { return b_.crossRatio(key, f); }
-
-private:
-    const BridgeAdmittance& b_;
-};
-
-// The partial solved with the admittance evaluated at the complex frequency
-// of its dominant normal mode (one fixed-point step against the total
-// admittance), not at the uncoupled real frequency: where the board's
+// Complex frequency at which a partial's bake is evaluated: its dominant
+// normal mode (by excitation x output) against the total admittance (one
+// fixed-point step), not the uncoupled real frequency: where the board's
 // admittance varies on the scale of the mode's frequency shift or decay
 // rate, the two differ by several % in Re Y, and a run-time loop acts at
 // the mode's actual (complex) frequency.
+cd bakeLambda(const KeyParams& k, double f0, int n, const BridgeAdmittance& total) {
+    const UnisonPartial pre = solveUnisonPartial(partialSpec(k, f0, n, total));
+    int best = 0;
+    for (int j = 1; j < pre.oscillators; ++j)
+        if (pre.mode[j].score > pre.mode[best].score) best = j;
+    return pre.mode[best].lambda;
+}
+
 UnisonPartial solveCoupled(const KeyParams& k, double f0, int n, const BridgeAdmittance& bridge,
                            const BridgeAdmittance& total) {
     UnisonPartialSpec spec = partialSpec(k, f0, n, bridge);
-    if (k.bridgeCoupling) {
-        const UnisonPartial pre = solveUnisonPartial(partialSpec(k, f0, n, total));
-        int best = 0;
-        for (int j = 1; j < pre.oscillators; ++j)
-            if (pre.mode[j].score > pre.mode[best].score) best = j;
-        spec.Y = bridge.atLambda(k.key, pre.mode[best].lambda);
-    }
+    if (k.bridgeCoupling) spec.Y = bridge.atLambda(k.key, bakeLambda(k, f0, n, total));
     return solveUnisonPartial(spec);
 }
 
-// Excitation x output weighted mean frequency of the partial's modes.
-double soundingFrequency(const UnisonPartial& u) {
+// Weight of a mode in the sounding pitch: its output energy over the tuning
+// window, amplitude^2 * INT exp(-2 sigma t) dt over [kTuningStartS,
+// kTuningStartS + kTuningWindowS].
+double tuningWeight(double score, cd lambda) {
+    const double s2 = -2.0 * lambda.real();
+    const double e = std::fabs(s2) < 1e-9 ? kTuningWindowS
+                                          : std::exp(-s2 * kTuningStartS) * -std::expm1(-s2 * kTuningWindowS) / s2;
+    return score * score * e;
+}
+
+// Energy-weighted mean frequency of the partial's modes. A hammer drives
+// the strings of a unison nearly in phase, so a mode's amplitude is its
+// output weight times the coherent sum of its string inputs.
+double soundingFrequency(const UnisonPartial& u, int strings) {
     double num = 0.0, den = 0.0;
     for (int j = 0; j < u.oscillators; ++j) {
-        num += u.mode[j].score * u.mode[j].lambda.imag();
-        den += u.mode[j].score;
+        cd in = 0.0;
+        for (int st = 0; st < strings; ++st) in += u.mode[j].input[st];
+        const double w = tuningWeight(u.mode[j].wOut * std::abs(in), u.mode[j].lambda);
+        num += w * u.mode[j].lambda.imag();
+        den += w;
     }
     return den > 0.0 ? num / den / (2.0 * kPi) : u.mode[0].lambda.imag() / (2.0 * kPi);
 }
@@ -105,6 +113,187 @@ StringParams stringParams(const KeyParams& k) {
 }  // namespace
 
 int keyPartialCount(const KeyParams& k, double fs) { return countStringModes(stringParams(k), fs); }
+
+SoundingPartial soundingPartial(const KeyParams& k, double f0, int n, const BridgeAdmittance& bridge) {
+    SoundingPartial r;
+    const TotalAdmittance total(bridge);
+    const UnisonPartial u = k.bridgeCoupling ? solveCoupled(k, f0, n, bridge, total)
+                                             : solveUnisonPartial(partialSpec(k, f0, n, bridge));
+    r.freqHz = soundingFrequency(u, std::clamp(k.strings, 1, kMaxStrings));
+    {
+        int lead = 0;
+        for (int j = 1; j < u.oscillators; ++j)
+            if (u.mode[j].score > u.mode[lead].score) lead = j;
+        r.sigma = -u.mode[lead].lambda.real();
+    }
+    if (!k.bridgeCoupling) return r;
+    UnisonPartialSpec spec = partialSpec(k, f0, n, bridge);
+    const int S = spec.strings, no = 2 * S;
+    // Not in a run-time loop: the bake is all the strings see, and u is exact.
+    if (!(spec.freqHz < bridge.loopCutoffHz())) return r;
+    cd pole[kMaxEigenN], res[kMaxEigenN];
+    const int M = bridge.loopPoles(k.key, spec.freqHz, pole, res, std::min(kMaxLoopPoles, kMaxEigenN - no));
+
+    // The partial's oscillators and the nearby board modes of the loop as one
+    // linear system: board mode m is a state b_m with
+    //   db_m/dt = pole_m b_m + c_m e^T z,   dz/dt = A_rest z - kappa e sum_m c_m b_m,
+    // c_m^2 = residue_m, e = (1 vertical, r horizontal), which reproduces
+    // -kappa e e^T sum residue / (s - pole) in the oscillators' equations.
+    // A_rest carries the rest of the run-time admittance, evaluated at the
+    // root being tracked (refined by fixed-point steps).
+    const cd lb = bakeLambda(k, f0, n, total);
+    const cd rc = bridge.crossRatio(k.key, spec.freqHz);
+    const double beta = spec.phi / (spec.modalMass * 2.0 * kPi * spec.freqHz);
+    int best = 0;
+    for (int j = 1; j < u.oscillators; ++j)
+        if (u.mode[j].score > u.mode[best].score) best = j;
+    cd le = u.mode[best].lambda;
+    const int N = no + M;
+    Admittance2 baked = bridge.atLambda(k.key, lb);
+    const Admittance2 load = bridge.loopLoading(k.key, spec.freqHz);
+    baked = {baked.vv + load.vv, baked.vh + load.vh, baked.hh + load.hh};
+    for (int it = 0; it < 8; ++it) {
+        Admittance2 yrt = bridge.loopLambda(k.key, le);
+        yrt = {baked.vv + yrt.vv, baked.vh + yrt.vh, baked.hh + yrt.hh};
+        cd ex = 0.0;
+        for (int m = 0; m < M; ++m) ex += res[m] / (le - pole[m]);
+        spec.Y = {yrt.vv - ex, yrt.vh - rc * ex, yrt.hh - rc * rc * ex};
+        cd A[kMaxEigenN * kMaxEigenN] = {}, Ar[kMaxOscillators * kMaxOscillators];
+        unisonMatrix(spec, Ar);
+        for (int a = 0; a < no; ++a)
+            for (int b = 0; b < no; ++b) A[a * N + b] = Ar[a * no + b];
+        for (int m = 0; m < M; ++m) {
+            const cd c = std::sqrt(res[m]);
+            for (int a = 0; a < no; ++a) {
+                const cd e = a < S ? cd(1.0) : rc;
+                A[a * N + no + m] = -spec.kappa * e * c;
+                A[(no + m) * N + a] = c * e;
+            }
+            A[(no + m) * N + no + m] = pole[m];
+        }
+        cd lam[kMaxEigenN], V[kMaxEigenN * kMaxEigenN], Vi[kMaxEigenN * kMaxEigenN];
+        if (!eigenDecompose(N, A, lam, V, Vi).ok) return r;
+        // Participation of the strings in each mode (sums to 2S over the
+        // modes); the sounding partial is the energy-weighted mean of the
+        // string-dominated modes, the pitch a tuner settles on once the
+        // board-dominated modes (board decay) have died away.
+        double part[kMaxEigenN], score[kMaxEigenN];
+        int top = 0;
+        for (int j = 0; j < N; ++j) {
+            cd p = 0.0, o = 0.0;
+            for (int a = 0; a < no; ++a) {
+                p += Vi[j * N + a] * V[a * N + j];
+                o += (a < S ? spec.outV : spec.outH) * V[a * N + j];
+            }
+            cd in = 0.0;
+            for (int st = 0; st < S; ++st) in += beta * (Vi[j * N + st] + spec.strikeHorizontal * Vi[j * N + S + st]);
+            part[j] = p.real();
+            score[j] = std::abs(o) * std::abs(in);
+            if (part[j] > part[top]) top = j;
+        }
+        double num = 0.0, den = 0.0, sb = -1.0, other = 0.0, otherF = 0.0;
+        int lead = top;
+        for (int j = 0; j < N; ++j) {
+            if (part[j] > 0.5 || j == top) {
+                const double w = tuningWeight(score[j], lam[j]);
+                num += w * lam[j].imag();
+                den += w;
+                if (score[j] > sb) {
+                    sb = score[j];
+                    lead = j;
+                }
+            } else if (part[j] > other) {
+                other = part[j];
+                otherF = lam[j].imag() / (2.0 * kPi);
+            }
+        }
+        r.freqHz = den > 0.0 ? num / den / (2.0 * kPi) : lam[top].imag() / (2.0 * kPi);
+        r.participation = part[lead];
+        r.sigma = -lam[lead].real();
+        r.boardFreqHz = otherF;
+        r.boardParticipation = other;
+        r.hybrid = M > 0;
+        const cd next = lam[lead];
+        const bool done = std::abs(next - le) < 1e-8 * std::abs(le);
+        le = next;
+        if (done) break;
+    }
+    return r;
+}
+
+double compensatedF0(const KeyParams& k, const BridgeAdmittance& bridge) {
+    double f0 = k.f0;
+    if (!k.bridgeCoupling) return f0;
+    // Secant steps in log f0 (the first a plain ratio step).
+    double x0 = 0.0, e0 = 0.0;
+    for (int it = 0; it < 16; ++it) {
+        const double f = soundingPartial(k, f0, 1, bridge).freqHz;
+        if (!(f > 0.0)) break;
+        const double x = std::log(f0), e = std::log(k.f1 / f);
+        if (std::fabs(e) < 6e-8) break;
+        double step = e;
+        if (it > 0 && std::fabs(e - e0) > 1e-12)
+            step = std::clamp(-e * (x - x0) / (e - e0), -4.0 * std::fabs(e), 4.0 * std::fabs(e));
+        x0 = x;
+        e0 = e;
+        f0 = std::exp(x + step);
+    }
+    return f0;
+}
+
+void tuneToSoundingPartials(PianoTable& t, const BridgeAdmittance& bridge) {
+    if (t.tuning.equalTemperament) return;
+    // Only the partials the tuner compares (tuning.h): 4:2 at A3-A4; above
+    // A4 partials 1, 2 of key k, 2, 4 of k - 12 and 4 of k - 24; below A3
+    // partials 4, 6, 10 of key k and 2, 3, 5 of k + 12.
+    bool need[kNumKeys + 1][kTunerPartials + 1] = {};
+    need[37][4] = need[49][2] = true;
+    for (int k = 50; k <= kNumKeys; ++k) {
+        const OctaveWeights w = octaveWeights(k);
+        if (w.w42 > 0.0) need[k][2] = need[k - 12][4] = true;
+        if (w.w21 > 0.0) need[k - 12][2] = true;
+        if (w.w41 > 0.0) need[k - 24][4] = true;
+    }
+    for (int k = 1; k <= 36; ++k) {
+        const OctaveWeights w = octaveWeights(k);
+        if (w.w42 > 0.0) need[k][4] = need[k + 12][2] = true;
+        if (w.w63 > 0.0) need[k][6] = need[k + 12][3] = true;
+        if (w.w105 > 0.0) need[k][10] = need[k + 12][5] = true;
+    }
+    // The ratios are taken with each string at its compensated pitch for the
+    // current target, as the engine will bake it; a second pass takes them
+    // again at the new targets (a partial near a board mode shifts with its
+    // distance from it).
+    // Applied as a correction of the table's own targets (which may carry
+    // per-key edits): f1 *= (tuner on sounding ratios) / (tuner on r_k(n)).
+    double B[kNumKeys], f1[kNumKeys], plain[kNumKeys], base[kNumKeys];
+    for (int i = 0; i < kNumKeys; ++i) {
+        B[i] = t.keys[i].B;
+        base[i] = t.keys[i].f1;
+    }
+    virtualTuner(B, t.tuning, plain);
+    for (int pass = 0; pass < 2; ++pass) {
+        PartialRatios ratios;
+        for (int i = 0; i < kNumKeys; ++i) {
+            const KeyParams& k = t.keys[i];
+            if (!k.bridgeCoupling) continue;
+            double f0 = 0.0;
+            for (int n = 2; n <= kTunerPartials; ++n) {
+                if (!need[i + 1][n] || partialFrequency(k.f0, k.B, n) >= k.maxFreqHz) continue;
+                if (f0 == 0.0) f0 = compensatedF0(k, bridge);
+                ratios.r[i][n] = soundingPartial(k, f0, n, bridge).freqHz / k.f1;
+            }
+        }
+        virtualTuner(B, t.tuning, f1, &ratios);
+        for (int i = 0; i < kNumKeys; ++i) {
+            KeyParams& k = t.keys[i];
+            k.f1 = base[i] * f1[i] / plain[i];
+            k.f0 = k.f1 / std::sqrt(1.0 + k.B);
+            const double c = 2.0 * k.length * k.f0;
+            k.linearDensity = k.tension / (c * c);
+        }
+    }
+}
 
 const BridgeAdmittance& defaultBridge() noexcept {
     static const SoundboardBridge board(defaultBoard(), 48000.0, 0.0);
@@ -133,21 +322,12 @@ KeyModeSet computeKeyModes(const KeyParams& k, double fs, const BridgeAdmittance
     s.modalMass = 0.5 * k.linearDensity * k.length;
     const int nPartials = keyPartialCount(k, fs);
 
-    // Pitch compensation of partial 1 (two fixed-point steps suffice: the
-    // shift is a fraction of a cent), against the total admittance, so that
-    // a bake that leaves part of the bridge to a run-time loop is tuned like
-    // the full bake.
-    double f0 = k.f0;
-    if (k.bridgeCoupling && nPartials > 0) {
-        const TotalAdmittance total(bridge);
-        for (int it = 0; it < 3; ++it) {
-            // Real-frequency evaluation here: at a partial sitting on a board
-            // resonance the complex-frequency fixed point is not robust.
-            const RealFrequency real(total);
-            const UnisonPartial u = solveCoupled(k, f0, 1, real, real);
-            f0 *= k.f1 / soundingFrequency(u);
-        }
-    }
+    // Pitch compensation of partial 1: the sounding partial (soundingPartial,
+    // which resolves a partial hybridised with a board mode of the run-time
+    // loop) is brought to k.f1 to 1e-4 cent. Near a board resonance the
+    // sounding frequency moves less than f0 (string-board repulsion), hence
+    // secant steps.
+    const double f0 = nPartials > 0 ? compensatedF0(k, bridge) : k.f0;
     s.pitchRatio = f0 / k.f0;
 
     const double a = k.damperPos - 0.5 * k.damperWidth, b = k.damperPos + 0.5 * k.damperWidth;

@@ -174,6 +174,14 @@ void Soundboard::setState(int i, float re, float im) noexcept {
     if (re != 0.0f || im != 0.0f) asleep_ = false;
 }
 
+float Soundboard::zoneDisplacement(int z) const noexcept {
+    if (asleep_) return 0.0f;
+    const float* row = zoneShape_.data() + std::size_t(z) * padded_;
+    float s = 0.0f;
+    for (int i = 0; i < padded_; ++i) s += row[i] * pi_[i];
+    return s;
+}
+
 double Soundboard::energy() const noexcept {
     double e = 0.0;
     for (int i = 0; i < modes_; ++i) {
@@ -223,6 +231,269 @@ void Soundboard::step(const float* F, float* disp, float* vel, Kernel kernel, co
                    bi_.data(), zoneShape_.data(), pickRe_.data(), pickIm_.data(), disp, vel, outZones, nOut);
     ++steps_;
     if (++sinceCheck_ == kSleepInterval) sleepCheck();
+}
+
+// ---------------------------------------------------------------- CouplingLoop
+
+namespace {
+constexpr int kZ = Soundboard::kMaxZones;
+}  // namespace
+
+bool CouplingLoop::configure(const KeyZone* kz, int keys, int zones, int taps) noexcept {
+    if (keys < 1 || keys > kMaxKeys || zones < 1 || zones > kZ || taps < 0 || taps > kMaxTaps) return false;
+    keys_ = keys;
+    zones_ = zones;
+    taps_ = taps;
+    int ent[kZ * kZ];
+    for (int& e : ent) e = -1;
+    nEnt_ = 0;
+    for (int k = 0; k < keys; ++k) {
+        kz_[k] = kz[k];
+        const int za[2] = {kz[k].z0, kz[k].z0 + 1};
+        const float wa[2] = {kz[k].w0, kz[k].w1};
+        const int nz = kz[k].w1 != 0.0f ? 2 : 1;
+        if (kz[k].z0 < 0 || kz[k].z0 + nz > zones) return false;
+        for (int q = 0; q < 4; ++q) {
+            keyEnt_[k][q] = -1;
+            keyEntW_[k][q] = 0.0f;
+        }
+        for (int a = 0; a < nz; ++a)
+            for (int b = 0; b < nz; ++b) {
+                int& e = ent[za[a] * kZ + za[b]];
+                if (e < 0) {
+                    e = nEnt_++;
+                    entDst_[e] = za[a];
+                    entSrc_[e] = za[b];
+                }
+                keyEnt_[k][2 * a + b] = e;
+                keyEntW_[k][2 * a + b] = wa[a] * wa[b];
+            }
+    }
+    // Tap t reads every zone some key uses.
+    for (int t = 0; t < taps; ++t)
+        for (int z = 0; z < kZ; ++z) tapEnt_[t][z] = -1;
+    for (int t = 0; t < taps; ++t)
+        for (int k = 0; k < keys; ++k)
+            for (int a = 0; a < (kz[k].w1 != 0.0f ? 2 : 1); ++a) {
+                int& e = tapEnt_[t][kz[k].z0 + a];
+                if (e >= 0) continue;
+                e = nEnt_++;
+                entDst_[e] = zones + t;
+                entSrc_[e] = kz[k].z0 + a;
+            }
+    entPad_ = (nEnt_ + simd::kWidth - 1) / simd::kWidth * simd::kWidth;
+    const std::size_t ep = static_cast<std::size_t>(entPad_);  // bounds the packed width
+    if (!h_.allocate(std::size_t{kMaxKeys} * kMaxBlock) || !G_.allocate(kMaxBlock * ep) ||
+        !dE_.allocate(kMaxBlock * ep) || !acc_.allocate(ep) || !d_.allocate((kMaxBlock + 1) * std::size_t{kZ}) ||
+        !f0_.allocate(kMaxBlock * std::size_t{kZ + kMaxTaps}) || !u_.allocate(kMaxBlock))
+        return false;
+    reset();
+    return true;
+}
+
+void CouplingLoop::reset() noexcept {
+    for (int k = 0; k < kMaxKeys; ++k) {
+        hasH_[k] = member_[k] = listen_[k] = false;
+        ver_[k] = 0;
+    }
+    for (int z = 0; z < kZ; ++z) zoneOut_[z] = zoneOutPrev_[z] = false;
+    for (int i = 0; i <= kMaxBlock; ++i)
+        for (int z = 0; z < kZ; ++z) d_[i * kZ + z] = 0.0f;
+    nMembers_ = nListen_ = nOut_ = 0;
+    dirty_ = true;
+}
+
+void CouplingLoop::rebuildKernel() noexcept {
+    // Pack the entries the members use.
+    int pos[kMaxEntries + kMaxTaps * kZ];
+    for (int e = 0; e < nEnt_; ++e) pos[e] = -1;
+    nAct_ = 0;
+    auto use = [&](int e) {
+        if (pos[e] < 0) {
+            pos[e] = nAct_;
+            actDst_[nAct_] = entDst_[e];
+            actSrc_[nAct_] = entSrc_[e];
+            ++nAct_;
+        }
+        return pos[e];
+    };
+    for (int m = 0; m < nMembers_; ++m) {
+        const int k = members_[m];
+        for (int q = 0; q < 4; ++q)
+            if (keyEnt_[k][q] >= 0) use(keyEnt_[k][q]);
+        for (int t = 0; t < taps_; ++t)
+            for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a) use(tapEnt_[t][kz_[k].z0 + a]);
+    }
+    actPad_ = (nAct_ + simd::kWidth - 1) / simd::kWidth * simd::kWidth;
+    const std::size_t ep = static_cast<std::size_t>(actPad_);
+    for (std::size_t i = 0; i < kMaxBlock * ep; ++i) G_[i] = 0.0f;
+    for (int m = 0; m < nMembers_; ++m) {
+        const int k = members_[m];
+        const float s = gain_ * kz_[k].forceScale;
+        const float* h = h_.data() + std::size_t(k) * kMaxBlock;
+        for (int q = 0; q < 4; ++q) {
+            if (keyEnt_[k][q] < 0) continue;
+            const int e = pos[keyEnt_[k][q]];
+            const float w = s * keyEntW_[k][q];
+            for (int j = 0; j < kMaxBlock; ++j) G_[j * ep + e] += w * h[j];
+        }
+        // Tap t: sum_k tapGain fs F_k with u_k = g (w0 d_z0 + w1 d_z1).
+        for (int t = 0; t < taps_; ++t)
+            for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a) {
+                const float w = s * tapGain_[t][k] * (a == 0 ? kz_[k].w0 : kz_[k].w1);
+                const int e = pos[tapEnt_[t][kz_[k].z0 + a]];
+                for (int j = 0; j < kMaxBlock; ++j) G_[j * ep + e] += w * h[j];
+            }
+    }
+    dirty_ = false;
+}
+
+void CouplingLoop::begin(ModeBank& bank, const Soundboard& board, const SegmentIO* io, Kernel kernel) noexcept {
+    const bool loop = gain_ != 0.0f;
+    // Keys that take input, and the zones they read. A zone not read in the
+    // last sub-block takes its displacement from the board's state, and a
+    // key that starts listening its input history from it: a wake-up or the
+    // static correction then starts from the input the strings actually had.
+    int nl = 0;
+    for (int k = 0; k < keys_; ++k) {
+        const bool lis = loop && (io[k].skip || bank.segmentHasAwakeCoupled(k) || bank.segmentWakeable(k));
+        // A key that stops listening restarts its static correction from rest.
+        if (listen_[k] && !lis) bank.setCoupledInputHistory(k, 0.0f);
+        newListener_[k] = lis && !listen_[k];
+        listen_[k] = lis;
+        if (lis) listenList_[nl++] = k;
+    }
+    nListen_ = nl;
+    for (int z = 0; z < kZ; ++z) zoneOut_[z] = false;
+    for (int l = 0; l < nl; ++l) {
+        const KeyZone& z = kz_[listenList_[l]];
+        zoneOut_[z.z0] = true;
+        if (z.w1 != 0.0f) zoneOut_[z.z0 + 1] = true;
+    }
+    nOut_ = 0;
+    for (int z = 0; z < zones_; ++z) {
+        if (zoneOut_[z]) outZones_[nOut_++] = z;
+        if (zoneOut_[z] && !zoneOutPrev_[z]) d_[z] = board.zoneDisplacement(z);
+    }
+    for (int l = 0; l < nl; ++l) {
+        const int k = listenList_[l];
+        if (!newListener_[k]) continue;
+        const float u0 = keyInput(k, 0);
+        bank.setCoupledInputHistory(k, u0);
+        if (!io[k].skip) bank.wakeAllCoupled(k, u0);
+    }
+
+    // Members and impulse responses.
+    int nm = 0;
+    for (int k = 0; k < keys_; ++k) {
+        bool mem = false;
+        if (listen_[k] && !io[k].skip) {
+            const std::uint32_t v = bank.coupledVersion(k);
+            if (v != ver_[k] || !hasH_[k]) {
+                hasH_[k] = bank.coupledResponse(k, h_.data() + std::size_t(k) * kMaxBlock, &k1_[k], kernel);
+                ver_[k] = v;
+                if (hasH_[k] || member_[k]) dirty_ = true;
+            }
+            mem = hasH_[k];
+        }
+        if (mem != member_[k]) dirty_ = true;
+        member_[k] = mem;
+        if (mem) members_[nm++] = k;
+    }
+    nMembers_ = nm;
+    if (dirty_) rebuildKernel();
+}
+
+void CouplingLoop::collect(ModeBank& bank, const SegmentIO* io, int n) noexcept {
+    // Free zone forces: every key's free output, and the static correction's
+    // tap on the last input of the previous sub-block.
+    constexpr int W = kZ + kMaxTaps;
+    for (int i = 0; i < n * W; ++i) f0_[i] = 0.0f;
+    for (int k = 0; k < keys_; ++k) {
+        if (io[k].skip || !io[k].wrote) continue;
+        const KeyZone& z = kz_[k];
+        const float* y = io[k].out;
+        const float a0 = z.w0 * z.forceScale, a1 = z.w1 * z.forceScale;
+        float* f = f0_.data();
+        if (a1 != 0.0f)
+            for (int i = 0; i < n; ++i) {
+                f[i * W + z.z0] += a0 * y[i];
+                f[i * W + z.z0 + 1] += a1 * y[i];
+            }
+        else
+            for (int i = 0; i < n; ++i) f[i * W + z.z0] += a0 * y[i];
+        for (int t = 0; t < taps_; ++t) {
+            const float a = tapGain_[t][k] * z.forceScale;
+            for (int i = 0; i < n; ++i) f[i * W + kZ + t] += a * y[i];
+        }
+    }
+    for (int m = 0; m < nMembers_; ++m) {
+        const int k = members_[m];
+        const KeyZone& z = kz_[k];
+        const float c = -k1_[k] * bank.coupledInputHistory(k) * z.forceScale;
+        f0_[z.z0] += z.w0 * c;
+        if (z.w1 != 0.0f) f0_[z.z0 + 1] += z.w1 * c;
+        for (int t = 0; t < taps_; ++t) f0_[kZ + t] += tapGain_[t][k] * c;
+    }
+}
+
+void CouplingLoop::forces(int i, float* zoneForce, float* tap, Kernel kernel) noexcept {
+    const float* f = f0_.data() + i * (kZ + kMaxTaps);
+    for (int z = 0; z < zones_; ++z) zoneForce[z] += f[z];
+    for (int t = 0; t < taps_; ++t) tap[t] += f[kZ + t];
+    if (nMembers_ == 0) return;
+    // The forced part: sum_j G[j] d[i - j] over the packed entries.
+    const int ep = actPad_;
+    const float* d = d_.data() + i * kZ;
+    float* de = dE_.data() + std::size_t(i) * ep;
+    for (int e = 0; e < nAct_; ++e) de[e] = d[actSrc_[e]];
+    for (int e = nAct_; e < ep; ++e) de[e] = 0.0f;
+    float* acc = acc_.data();
+    if (kernel == Kernel::Simd) {
+        using namespace simd;
+        const float* G = G_.data();
+        const float* D = dE_.data();
+        for (int e = 0; e < ep; e += kWidth) {
+            vf a0 = zero(), a1 = zero();
+            int j = 0;
+            for (; j + 1 <= i; j += 2) {
+                a0 = fmadd(load(G + j * ep + e), load(D + (i - j) * ep + e), a0);
+                a1 = fmadd(load(G + (j + 1) * ep + e), load(D + (i - j - 1) * ep + e), a1);
+            }
+            if (j <= i) a0 = fmadd(load(G + j * ep + e), load(D + (i - j) * ep + e), a0);
+            store(acc + e, add(a0, a1));
+        }
+    } else {
+        for (int e = 0; e < nAct_; ++e) {
+            float a = 0.0f;
+            for (int j = 0; j <= i; ++j) a += G_[j * ep + e] * dE_[(i - j) * ep + e];
+            acc[e] = a;
+        }
+    }
+    for (int e = 0; e < nAct_; ++e) {
+        const int dz = actDst_[e];
+        if (dz < zones_) zoneForce[dz] += acc[e];
+        else tap[dz - zones_] += acc[e];
+    }
+}
+
+void CouplingLoop::push(int i, const float* zoneDisp) noexcept {
+    float* d = d_.data() + (i + 1) * kZ;
+    for (int o = 0; o < nOut_; ++o) d[outZones_[o]] = zoneDisp[outZones_[o]];
+}
+
+void CouplingLoop::end(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel) noexcept {
+    float* u = u_.data();
+    for (int l = 0; l < nListen_; ++l) {
+        const int k = listenList_[l];
+        for (int i = 0; i < n; ++i) u[i] = keyInput(k, i);
+        if (io[k].skip) bank.setCoupledInputHistory(k, u[n - 1]);
+        else bank.applyCoupledInput(k, u, n, kernel);
+    }
+    for (int z = 0; z < kZ; ++z) {
+        d_[z] = d_[n * kZ + z];
+        zoneOutPrev_[z] = zoneOut_[z];
+    }
 }
 
 }  // namespace pm

@@ -54,14 +54,19 @@ no room, no longitudinal modes or duplex and no Apple code yet.
   inputs per string for the hammer. Partials 1-20 keep all 2S normal modes,
   higher ones the 3 with the largest excitation x output (configurable):
   17,034 modes for the default table at 48 kHz. The first-partial pitch
-  shift caused by the bridge reactance is compensated per key.
+  shift caused by the bridge is compensated per key (see Tuning).
 - **Soundboard (plan §1.6, `core/pm_voicing/soundboard_model.h`).** v0
   mode set from a simply supported orthotropic plate, 1.93 x 1.25 m, ribs
   and bridges folded into equivalent stiffnesses (Dx 2,430, Dy 20,000,
-  Dxy 2,090 N m) and 6.6 kg/m^2 (15.9 kg); loss factor 3 %. 191 modes below
-  5 kHz (configurable cap and mode count), first mode 58.3 Hz, one mode per
+  Dxy 2,090 N m) and 6.6 kg/m^2 (15.9 kg); loss factor 3 % above about
+  1 kHz, rising to 10 % at the lowest modes (+ 0.08 / (1 + (f / 150 Hz)^2):
+  rim and case participation, an estimate), mode frequencies scattered by
+  +-2 % (seeded) to break the uniform plate's regularity. 190 modes below
+  5 kHz (configurable cap and mode count), first mode 57.6 Hz, one mode per
   24-26 Hz above 1 kHz; mean driving-point impedance at the bridge 1,400-
-  1,900 kg/s (0.2-8 kHz). Treble bridge (keys 21-88) and bass bridge (1-20)
+  1,900 kg/s (0.2-8 kHz). Bass bridge, 40-500 Hz (keys 1-52): median |Z|
+  1,130 kg/s, every key's minimum above 150 kg/s, Re Y peaks within 8x its
+  mean (the plain 3 % plate dipped to 50-70 kg/s, peaks 18-25x). Treble bridge (keys 21-88) and bass bridge (1-20)
   are Bezier curves on the plate; every key has its own bridge point (shape
   values averaged over a 5 cm contact) and reaches the run-time board
   through 18 zones (4 bass, 14 treble) by hat-function weights. Above 5 kHz
@@ -75,53 +80,76 @@ no room, no longitudinal modes or duplex and no Apple code yet.
   is positive semi-definite.
 - **Baked versus fed back (no double counting).** The run-time loop feeds
   the board modes back to the strings of every key whose partials lie in the
-  modal range. Its exact self-term at key k (the one-sample discrete loop
+  loop band: the modal range (5 kHz) at the Full quality tier, 2 kHz at
+  Balanced, 1 kHz at Eco (`SoundboardConfig::tier`, `loopCutoffHz`; C API
+  `PM_PARAM_QUALITY_TIER`, `PM_PARAM_LOOP_CUTOFF_HZ`). Its exact self-term at key k (the one-sample discrete loop
   with the zone-interpolated shape, the sympathetic gain g and the string's
   residual end stiffness) is removed from that key's bake, so bake + loop =
   driving point (real part of the remainder clamped at 0 where interpolated
   shapes exceed the true point: 1.6 % of frequency points). Partials above
-  the modal range bake the full admittance and only drive the board. The
+  the loop band bake the full admittance and only drive the board. The
   admittance is evaluated at the complex frequency of each partial's
   dominant mode. `test_soundboard_coupling` measures a key alone on the
   board with the real loop: 20 partials of C2, C4, C6 decay as predicted,
   median deviation 0.23 %, worst 3.5 % (C2's fundamental, next to the
   board's two lowest modes).
-- **Loop (one sample, `core/pm_board/soundboard.h`).** Per sample: hammers
-  and the coupled string modes advance with the input computed at the
-  previous sample, each key's bridge force (minus its static correction,
-  below) goes into the zone forces, the board advances and returns zone
-  displacements, which become each key's input. With this alignment every
-  board mode's loop transfer is positive real, so the zone-port loop is
-  passive (`test_passivity`: 10^4 random reduced systems, no energy growth).
+- **Loop (one-sample feedback, solved per sub-block, `core/pm_board/soundboard.h`).**
+  The recursion: hammers and the coupled string modes advance with the input
+  computed at the previous sample, each key's bridge force (minus its
+  static correction, below) goes into the zone forces, the board advances
+  and returns zone displacements, which become each key's input. With this
+  alignment every board mode's loop transfer is positive real, so the
+  zone-port loop is passive (`test_passivity`: 10^4 random reduced systems,
+  no energy growth; a loop fed back with the wrong sign is flagged). It is
+  evaluated exactly but block-wise (`CouplingLoop`): over a sub-block a
+  key's bridge force is its free response (the ordinary block kernel) plus
+  its input convolved with its impulse response; summed into the zones
+  this is a banded zone-to-zone kernel (about 50 entries for 18 zones), so
+  only the hammers, that kernel and the board run per sample, and at the end
+  of the sub-block each coupled mode adds the input's share to its state
+  (Horner in c). The same recursion, rearranged: its trajectory equals the
+  per-sample loop to rounding.
   Static correction: driven by a bridge displacement, each string mode
   responds quasi-statically with 2T/L (1 + B n^2) u, the same for every
   partial, so the truncated modal sum is a large negative stiffness on the
   board (uncorrected, a few keys in a zone diverge at 0 Hz); each key
   subtracts its exact static response, K0 u[n] + K1 u[n-1] matched to the
   discrete bank's static gain and slope, leaving the convergent, passive
-  end stiffness of the string. A latency longer than one sample was ruled
-  out: block-delayed loops are not passive (see the plan note in §1.6).
+  end stiffness of the string.
 - **Output (PLACEHOLDER until the radiation model).** Board velocity at two
   pickup points (bass side left, treble side right) plus a direct path for
   partials above the modal range (panned bridge forces, high-passed at
   4.5 kHz, scaled by the board's mean transfer admittance near 5 kHz).
-  Level, with mf = MIDI 80 and ff = 112: mf mid-range peaks -19 to -17
-  dBFS, 12-note ff clusters at or below -1.3 dBFS (below the limiter).
+  Level, with mf = MIDI 80 and ff = 112: mf single notes C3-C5 peak at -33
+  to -22 dBFS, velocity 127 at -17 dBFS at most, 12-note clusters every
+  100 ms at -7 (ff) to -5 dBFS (127, pedal down), all 88 keys at 127 at once
+  -1.4 dBFS: the limiter (above -1 dBFS) is not reached.
   `SoundboardConfig::enabled = false` gives the M3 output (A/B).
-- **Decay times.** The bake now follows the board, so decay varies note to
-  note and partial to partial. Fundamentals, eigen-predicted prompt /
-  aftersound T60 (M3 placeholder in brackets): C2 14.3 / 45 s (10.5 / 40),
-  C4 3.6 / 17-19 s (2.6 / 20), C6 1.4 / 5.8 s (0.75 / 6.0); C3 lies in a gap
-  between board modes (21.8 / 28 s), C5 on a peak (0.6 / 11 s).
+- **Decay times.** The bake follows the board, so decay varies note to
+  note and partial to partial. Fundamentals at mf, prompt / aftersound T60
+  measured on the engine output: C2 7.6 / 52 s, C3 16 / 6.8 s, C4 2.6 /
+  24 s, C5 0.44 / 12 s, C6 1.9 / 7.5 s. Neighbouring keys' prompt decay of
+  the fundamental differs by a median factor 1.6 (90 % below 3.3, worst
+  8.8, around C5): fewer extremes than the plain 3 % plate (90 % below 5.9,
+  worst 14, one growing mode), but still a v0 board.
 - **Unison detuning.** Per-string cents offsets from a deterministic seed
   (a spread pattern, randomly permuted, +-30 % jitter, zero mean; about
   +-0.5 cent), times a global unison width; horizontal modes 0.2 cent sharp.
 - **Tuning (plan §2.3).** A virtual tuner sets each key's sounding first
   partial: A4 = 440 Hz, temperament octave A3-A4 as a 4:2 octave divided
-  equally, 4:2 octaves outwards blending to 2:1 (E5-E6) and towards the 4:1
-  double octave above C7, and to 6:3 (C3-D2) and towards 10:5 at A0. Result:
-  -24 cents at A0, -3.5 at C2, -1.5 at C4, 0 at A4, +4.2 at C6, +34 at C8.
-  Stretch amount 0-150 %, A4 and plain equal temperament are options.
+  equally (on the second partials), 4:2 octaves outwards blending to 2:1
+  (E5-E6) and towards the 4:1 double octave above C7, and to 6:3 (C3-D2)
+  and towards 10:5 at A0. Result on the table: -24 cents at A0, -3.5 at C2,
+  -1.5 at C4, 0 at A4, +4.2 at C6, +34 at C8. Stretch amount 0-150 %, A4
+  and plain equal temperament are options. With the soundboard, the engine
+  re-runs the tuner on the partials as they sound on the board (bridge
+  shifts and string-board hybrids included; targets move by up to 13 cents
+  where a board mode pulls a fundamental against its upper partials, D2),
+  and compensates each key so that its sounding first partial (energy-
+  weighted mean of the string-dominated normal modes over the first second;
+  a partial on a board resonance is solved together with the nearby board
+  modes) is on target: every key within 1 cent measured alone (one listed
+  exception at 1.1 cents, `test_engine_sound`).
 - **Hammer contact.** One hammer (whole hammer mass) meets the S strings of
   its key at small per-string offsets (hammer-string mating, +-15 um), one
   Hunt-Crossley felt contact per string. While active it owns its key's
@@ -170,8 +198,9 @@ no room, no longitudinal modes or duplex and no Apple code yet.
   or absolute engine sample indices. Lowest-latency mode puts due events at
   the start of the buffer; constant-latency mode adds a fixed delay
   (default: one buffer) to host-time events. Buffers are cut at event times
-  and on fixed grids, so output is bit-identical for any buffer size and a
-  note-on lands on its exact sample.
+  and on fixed grids, so output is the same for any buffer size and a
+  note-on lands on its exact sample (to rounding, -100 to -110 dB: the
+  soundboard loop sums per sub-block).
 - **Real-time.** `render()` does not allocate, lock, throw or do I/O
   (checked by a test that counts every `operator new`).
 
@@ -297,10 +326,12 @@ down (with culling, and with culling off so every mode runs), a typical
 case (a four-note chord re-struck twice a second, pedal up), a 12-note ff
 cluster struck every 100 ms, a pedal-down sympathetic case (staccato chords
 every 0.5 s, every string free), the worst and cluster cases with the board
-off (A/B), and the cost of one hammer per buffer for eight keys. Numbers
-from x86 machines are only indicative for the Apple silicon target. The
-coupled string modes are stepped one sample at a time (the loop requires
-it), which costs about twice the block kernel per mode.
+off (A/B), and the cost of one hammer per buffer for eight keys;
+`--tier balanced|eco` and `--tiers` run the board cases at the other
+quality tiers. Numbers from x86 machines are only indicative for the Apple
+silicon target (SSE2, 4-wide like NEON, is the closer proxy). A coupled
+string mode costs the free block kernel plus a forced pass of about 0.6
+times that.
 
 ## Tests
 
@@ -308,7 +339,7 @@ it), which costs about twice the block kernel per mode.
 targets, positive-real loop, admittance against a time-domain drive of the
 run-time bank, bake + loop = driving point), `test_soundboard_coupling`
 (no double counting), `test_passivity` (10^4 random reduced systems with
-the production components), `test_sympathetic` (silently held key, pedal
+the production components; a sign-flipped loop is flagged), `test_sympathetic` (silently held key, pedal
 bloom per third octave, monotonic in the sympathetic gain) and
 `test_half_pedal` (graded T60 against pedal position, no click on pedal
 moves, re-pedalling keeps energy). Unit tests of the unison solver and the

@@ -110,6 +110,7 @@ void buildPianoTable(PianoTable& table, const TableOptions& opt) noexcept {
     tun.stretch = opt.stretch;
     tun.equalTemperament = opt.equalTemperament;
     virtualTuner(B, tun, f1);
+    table.tuning = tun;
 
     for (int i = 0; i < kNumKeys; ++i) {
         KeyParams& k = table.keys[i];

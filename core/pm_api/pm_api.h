@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 4
+#define PM_API_VERSION_MINOR 5
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -75,8 +75,20 @@ enum pm_param {
     PM_PARAM_HALF_PEDAL_P0_TREBLE = 17,   /* pedal position where the treble dampers start to lift, 0.30 */
     PM_PARAM_HALF_PEDAL_P0_BASS = 18,     /* the same for the bass, default 0.40 */
     PM_PARAM_HALF_PEDAL_WIDTH = 19,       /* width of the transition zone, default 0.25 */
-    PM_PARAM_DAMPED_CULL_OFFSET_DB = 20   /* seated dampers woken by the bridge only this far above the
+    PM_PARAM_DAMPED_CULL_OFFSET_DB = 20,  /* seated dampers woken by the bridge only this far above the
                                              culling threshold, default 120 (never) */
+    /* Soundboard loop quality: take effect at the next pm_engine_prepare. */
+    PM_PARAM_QUALITY_TIER = 21,           /* pm_quality_tier, default PM_QUALITY_FULL */
+    PM_PARAM_LOOP_CUTOFF_HZ = 22          /* > 0 overrides the tier's loop band (Hz), default 0 */
+};
+
+/* Partials below the loop band are fed back by the string-board loop
+ * (sympathetic resonance, bloom); the others only drive the board. Loop
+ * cost is proportional to the fed-back partials. */
+enum pm_quality_tier {
+    PM_QUALITY_FULL = 0,      /* the board's whole modal range (5 kHz) */
+    PM_QUALITY_BALANCED = 1,  /* 2 kHz: half the fed-back modes, bloom within 0.7 dB */
+    PM_QUALITY_ECO = 2        /* 1 kHz: a quarter, bloom within about 1.5-3 dB */
 };
 
 typedef struct pm_stats {

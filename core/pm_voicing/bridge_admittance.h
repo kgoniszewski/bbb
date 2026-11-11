@@ -47,6 +47,21 @@ public:
     virtual Admittance2 totalLambda(int key, std::complex<double> lambda) const noexcept {
         return total(key, lambda.imag() / 6.283185307179586);
     }
+    // Run-time loops only (pitch of a partial that hybridises with a board
+    // mode, key_loader.h). loopPoles(): the loop's resonant poles near fHz,
+    // at most max, as residue / (s - pole) terms of the vertical admittance,
+    // approximately (the caller refines against loopLambda()); 0: none.
+    // loopLambda(): the self admittance the run-time loop adds at the complex
+    // frequency lambda (dynamic, unlike the frozen bake atLambda());
+    // loopLoading(): the smooth loading of the board by the other keys'
+    // strings that the loop also adds. What the strings see at run time is
+    // atLambda(bake point) + loopLoading(f) + loopLambda(lambda).
+    virtual int loopPoles(int /*key*/, double /*fHz*/, std::complex<double>* /*pole*/,
+                          std::complex<double>* /*residue*/, int /*max*/) const noexcept {
+        return 0;
+    }
+    virtual Admittance2 loopLambda(int /*key*/, std::complex<double> /*lambda*/) const noexcept { return {}; }
+    virtual Admittance2 loopLoading(int /*key*/, double /*fHz*/) const noexcept { return {}; }
 };
 
 // No coupling at all (rigid bridge): every string and polarization is an

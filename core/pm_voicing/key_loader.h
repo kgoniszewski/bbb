@@ -67,12 +67,51 @@ int keyPartialCount(const KeyParams& k, double fs);
 // bridge motion it causes). By reciprocity a vertical bridge displacement u
 // drives oscillator k with the force (o_k / outputGain) u, i.e.
 // dz_k/dt += o_k / (outputGain m omega) u: the sympathetic input. The first-partial pitch
-// shift caused by the bridge reactance is compensated: every string is
-// scaled by pitchRatio so that the excitation x output weighted mean
-// frequency of partial 1's normal modes equals k.f1.
+// shift caused by the bridge is compensated: every string is scaled by
+// pitchRatio so that the sounding first partial (soundingPartial) equals k.f1.
 KeyModeSet computeKeyModes(const KeyParams& k, double fs, const BridgeAdmittance& bridge);
 // With the default placeholder admittance (RigidBridge if !k.bridgeCoupling).
 KeyModeSet computeKeyModes(const KeyParams& k, double fs);
+
+// The sounding frequency of partial n of key k (strings scaled to f0), as a
+// tuner hears it: the energy-weighted mean frequency of its normal modes,
+// each weighted by its output energy over the tuning window (kTuningWindowS
+// seconds from kTuningStartS after the strike, i.e. after the attack;
+// amplitude = output weight x the coherent sum of the string inputs, a
+// hammer driving the strings in phase). A detuned unison sounds as a beating
+// cluster around this mean; weakly excited aftersound modes hardly count. Without a run-time loop for that partial, over its normal modes. With one, the
+// partial's oscillators are solved against the run-time admittance (frozen
+// bake plus the dynamic loop) at their own complex frequency, together with
+// up to kMaxLoopPoles nearby board modes of the loop as explicit states, so
+// that a partial sitting on a board resonance resolves into its string-board
+// doublet; the sounding frequency is then the weighted mean over the
+// string-dominated modes (string participation > 0.5), and the strongest
+// board-dominated mode is reported alongside.
+inline constexpr int kMaxLoopPoles = 6;
+inline constexpr double kTuningStartS = 0.05, kTuningWindowS = 1.0;
+struct SoundingPartial {
+    double freqHz = 0.0;
+    double participation = 1.0;       // strings' share of the leading sounding mode
+    double sigma = 0.0;               // decay rate of the leading sounding mode, 1/s
+    double boardFreqHz = 0.0;         // strongest board-dominated mode (hybrid only)
+    double boardParticipation = 0.0;  // strings' share of that mode
+    bool hybrid = false;              // solved with explicit board modes
+};
+SoundingPartial soundingPartial(const KeyParams& k, double f0, int n, const BridgeAdmittance& bridge);
+
+// f0 at which the sounding first partial of key k (soundingPartial) is at
+// k.f1 (the pitch compensation of computeKeyModes, to 1e-4 cent).
+double compensatedF0(const KeyParams& k, const BridgeAdmittance& bridge);
+
+// Re-runs the virtual tuner (tuning.h) on the table with the sounding
+// partial ratios of every bridge-coupled key (partials 1..kTunerPartials,
+// soundingPartial against 'bridge'), so that the octave partial pairs the
+// tuner matches coincide as they sound, bridge shifts and string-board
+// hybrids included. Applied as a correction of the table's targets (the
+// ratio of the two tuner results), so per-key edits of f1 are kept. Updates
+// f1, f0 and the linear density (tension and length kept). Nothing to do
+// for equal temperament.
+void tuneToSoundingPartials(PianoTable& t, const BridgeAdmittance& bridge);
 
 // The default bridge: the default soundboard's full driving-point
 // admittance (soundboard_model.h, no run-time loop).

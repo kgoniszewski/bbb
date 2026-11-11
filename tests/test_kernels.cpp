@@ -137,3 +137,68 @@ TEST(block_size_does_not_change_output) {
         CHECK(maxDiff(ya, yb) == 0.0);
     }
 }
+
+// Block-coupled kernels (mode_bank.h, "Coupled processing"): the free pass
+// plus the forced pass reproduce stepping every mode with its input sample
+// by sample (runModes with input), and the output predicted from the free
+// response and coupledResponse() (no static correction set here) matches;
+// for the scalar references and the SIMD kernels of both new passes
+// (impulse response, forced update).
+TEST(block_coupled_matches_per_sample_input) {
+    for (Kernel k : {Kernel::Scalar, Kernel::Simd}) {
+        const int modes = 16 * 7;  // a segment of 7 groups, all coupled
+        std::mt19937 rng(9);
+        std::uniform_real_distribution<double> uf(30.0, 5000.0), us(0.2, 20.0), uw(-1.0, 1.0);
+        ModeBank a, b;
+        const int nm = modes;
+        a.allocateSegments(&nm, 1);
+        b.allocateSegments(&nm, 1);
+        for (int i = 0; i < modes; ++i) {
+            const double f = uf(rng), s = us(rng);
+            const float wr = static_cast<float>(0.01 * uw(rng)), wi = static_cast<float>(0.01 * uw(rng));
+            const float wo = static_cast<float>(uw(rng) / modes);
+            const float zr = static_cast<float>(uw(rng)), zi = static_cast<float>(uw(rng));
+            for (ModeBank* m : {&a, &b}) {
+                m->setMode(i, f, s, kFs);
+                m->setWeights(i, wr, wi, wo);
+                m->setState(i, zr, zi);
+            }
+        }
+        for (ModeBank* m : {&a, &b}) {
+            m->setCulling(false);
+            m->setSegmentDamper(0, 0.3f);
+            m->setSegmentCoupledGroups(0, 7);
+        }
+        float h[ModeBank::kResponseTaps], k1 = 0.0f;
+        CHECK(a.coupledResponse(0, h, &k1, k));
+        double worstOut = 0.0, worstState = 0.0, peak = 0.0;
+        std::vector<float> ref(32), blk(32), u = noise(32, 3, 1.0f);
+        for (int rep = 0; rep < 50; ++rep) {
+            // Reference: per-sample stepping with input.
+            SegmentIO ioa;
+            ioa.in = u.data();
+            ioa.out = ref.data();
+            a.processSegments(&ioa, 32, k);
+            // Block: free pass, then the forced pass; output from the response.
+            SegmentIO iob;
+            iob.out = blk.data();
+            b.processSegmentsFree(&iob, 32, k);
+            for (int i = 0; i < 32; ++i) {
+                double y = blk[i];
+                for (int j = 0; j <= i; ++j) y += double(h[j]) * u[i - j];
+                blk[i] = static_cast<float>(y);
+            }
+            b.applyCoupledInput(0, u.data(), 32, k);
+            for (int i = 0; i < 32; ++i) peak = std::max(peak, double(std::fabs(ref[i])));
+            for (int i = 0; i < modes; ++i)
+                worstState = std::max(worstState, double(std::fabs(a.stateRe(i) - b.stateRe(i))) +
+                                                      std::fabs(a.stateIm(i) - b.stateIm(i)));
+            for (int i = 0; i < 32; ++i) worstOut = std::max(worstOut, double(std::fabs(blk[i] - ref[i])));
+            u = noise(32, 100 + rep, 1.0f);
+        }
+        std::printf("  %s: block vs per-sample: worst state difference %.2e, worst output difference %.2e (peak %.2e)\n",
+                    k == Kernel::Simd ? simdKernelName() : "scalar", worstState, worstOut, peak);
+        CHECK_LE(worstState, 1e-5);
+        CHECK_LE(worstOut, 1e-4 * peak);
+    }
+}

@@ -63,6 +63,8 @@ void usage() {
         "  --unison-width X   scales the unison detuning (default 1; 0 = strings in unison)\n"
         "  --no-board         soundboard off (A/B: M3 output, no sympathetic loop)\n"
         "  --sympathetic G    sympathetic loop gain 0..1.5 (default 1)\n"
+        "  --tier T           loop quality: full (default), balanced, eco\n"
+        "  --loop-cutoff HZ   loop band, overrides the tier\n"
         "  --knock N          hammer knock level, N per m/s (default 0.02; 0 = off)\n"
         "  --damper-noise N   damper-lift noise level (default 0.004; 0 = off)\n",
         d.f0, d.B, d.b1, d.b3, d.length, d.linearDensity, d.outputPos, d.outputGain,
@@ -110,6 +112,13 @@ int pianoMain(int argc, char** argv) {
         else if (a == "--stretch") ok = num && d >= 0.0 && d <= 1.5, voicing.stretch = d;
         else if (a == "--unison-width") ok = num && d >= 0.0, voicing.unisonWidth = d;
         else if (a == "--sympathetic") ok = num && d >= 0.0 && d <= 1.5, board.sympathetic = d;
+        else if (a == "--loop-cutoff") ok = num && d > 0.0, board.loopCutoffHz = d;
+        else if (a == "--tier") {
+            if (std::strcmp(v, "full") == 0) board.tier = pm::QualityTier::Full;
+            else if (std::strcmp(v, "balanced") == 0) board.tier = pm::QualityTier::Balanced;
+            else if (std::strcmp(v, "eco") == 0) board.tier = pm::QualityTier::Eco;
+            else ok = false;
+        }
         else if (a == "--knock") ok = num && d >= 0.0, knock = d;
         else if (a == "--damper-noise") ok = num && d >= 0.0, damperNoise = d;
         else if (a == "--format") {

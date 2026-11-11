@@ -2,7 +2,9 @@
 #include <cmath>
 #include <cstdio>
 
+#include "pm_voicing/key_loader.h"
 #include "pm_voicing/piano_table.h"
+#include "pm_voicing/soundboard_model.h"
 #include "pm_voicing/tuning.h"
 #include "test_harness.h"
 
@@ -99,4 +101,48 @@ TEST(stretch_amount_and_reference_pitch) {
     CHECK_LE(worstEt, 1e-9);
     CHECK_LE(worstScale, 1e-9);
     CHECK_NEAR(a442.keys[48].f1, 442.0, 1e-9);
+}
+
+// With the soundboard, the engine re-runs the tuner on the sounding partials
+// (key_loader.h tuneToSoundingPartials): bridge shifts and string-board
+// hybrids included, the pure-type octave pairs coincide as they sound
+// (each key at its compensated pitch, as the engine bakes it). The retune
+// moves the targets by the board's pull on the partials (a first partial
+// pulled by a nearby board mode relative to its upper partials propagates
+// along the octave chain): reported.
+TEST(octaves_coincide_on_sounding_partials) {
+    pm::PianoTable t;
+    pm::buildPianoTable(t);
+    const pm::BoardModel& board = pm::defaultBoard();
+    const pm::SoundboardBridge pre(board, 48000.0, 1.0, &t);
+    pm::PianoTable tuned = t;
+    pm::tuneToSoundingPartials(tuned, pre);
+    const pm::SoundboardBridge bridge(board, 48000.0, 1.0, &tuned);
+    double f0c[pm::kNumKeys];
+    for (int k = 0; k < pm::kNumKeys; ++k)
+        f0c[k] = pm::compensatedF0(tuned.keys[k], bridge);
+    auto sounding = [&](int key, int n) { return pm::soundingPartial(tuned.keys[key - 1], f0c[key - 1], n, bridge).freqHz; };
+    double worst = 0.0, maxShift = 0.0;
+    int worstKey = 0, shiftKey = 0;
+    for (int k = 1; k <= pm::kNumKeys; ++k)
+        if (std::fabs(cents(tuned, k) - cents(t, k)) > std::fabs(maxShift)) {
+            maxShift = cents(tuned, k) - cents(t, k);
+            shiftKey = k;
+        }
+    auto check = [&](int lo, int hi, int nLo, int nHi) {
+        const double d = 1200.0 * std::log2(sounding(hi, nHi) / sounding(lo, nLo));
+        if (std::fabs(d) > std::fabs(worst)) {
+            worst = d;
+            worstKey = hi;
+        }
+    };
+    for (int k = 29; k <= 37; ++k) check(k, k + 12, 4, 2);
+    for (int k = 50; k <= 56; ++k) check(k - 12, k, 4, 2);
+    for (int k = 2; k <= 18; ++k)
+        if (pm::octaveWeights(k).w63 == 1.0) check(k, k + 12, 6, 3);
+    for (int k = 68; k <= 76; ++k) check(k - 12, k, 2, 1);
+    std::printf("  pure-type octaves on the sounding partials: worst mismatch %+.3f cents (key %d); largest change of "
+                "a target by the retune %+.2f cents (key %d)\n",
+                worst, worstKey, maxShift, shiftKey);
+    CHECK_LE(std::fabs(worst), 0.2);
 }
