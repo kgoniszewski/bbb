@@ -20,19 +20,37 @@ constexpr double kPi = std::numbers::pi;
 // while each extra Newton evaluation would cost S pow calls per substep.
 constexpr double kSolveTol = 1e-10;
 
-// One substep of free propagation of all modes, w <- C w, returning
-// y_s = sum Im(proj_s w) for every string and (if wantOut) sum wOut Im w
-// afterwards. Same dr form and operation order as the bank kernel.
-template <int S>
-inline void propagate(const HammerKeyModes& m, bool wantOut, float* ySum, float& oSum) noexcept {
+// One substep: the pending force of the previous substep (if Pend) is added
+// and all modes are propagated, w <- C (w + sum_s b_s F_s); with In the
+// sympathetic input wIn u is added after the rotation. Returns
+// y_s = sum Im(proj_s w) for every string and (if wantOut) sum wOut Im w.
+// Same dr form and operation order as the bank kernel.
+template <int S, bool Pend, bool In>
+inline void propagate(const HammerKeyModes& m, const double* force, float u, bool wantOut, float* ySum,
+                      float& oSum) noexcept {
     using namespace simd;
     vf accY[S], accO = zero();
-    for (int s = 0; s < S; ++s) accY[s] = zero();
+    [[maybe_unused]] vf f[S];
+    for (int s = 0; s < S; ++s) {
+        accY[s] = zero();
+        if constexpr (Pend) f[s] = set1(static_cast<float>(force[s]));
+    }
+    [[maybe_unused]] const vf uu = set1(u);
     for (int i = 0; i < m.count; i += kWidth) {
-        const vf zr = load(m.zr + i), zi = load(m.zi + i);
+        vf zr = load(m.zr + i), zi = load(m.zi + i);
+        if constexpr (Pend) {
+            for (int s = 0; s < S; ++s) {
+                zr = fmadd(load(m.bRe[s] + i), f[s], zr);
+                zi = fmadd(load(m.bIm[s] + i), f[s], zi);
+            }
+        }
         const vf d = load(m.dSub + i), c = load(m.sSub + i);
-        const vf nr = fnmadd(c, zi, fmadd(d, zr, zr));
-        const vf ni = fmadd(c, zr, fmadd(d, zi, zi));
+        vf nr = fnmadd(c, zi, fmadd(d, zr, zr));
+        vf ni = fmadd(c, zr, fmadd(d, zi, zi));
+        if constexpr (In) {
+            nr = fmadd(load(m.wInRe + i), uu, nr);
+            ni = fmadd(load(m.wInIm + i), uu, ni);
+        }
         store(m.zr + i, nr);
         store(m.zi + i, ni);
         for (int s = 0; s < S; ++s)
@@ -59,18 +77,40 @@ inline void applyForce(const HammerKeyModes& m, const double* force) noexcept {
     }
 }
 
-// Damper loss for one base sample (c_eff = c a commutes with the rotation);
-// returns the new strike-point displacements.
 template <int S>
-inline void applyDamper(const HammerKeyModes& m, double* y) noexcept {
+inline void propagateAny(const HammerKeyModes& m, bool pend, const double* force, bool in, float u,
+                         bool wantOut, float* ySum, float& oSum) noexcept {
+    if (pend) {
+        if (in) propagate<S, true, true>(m, force, u, wantOut, ySum, oSum);
+        else propagate<S, true, false>(m, force, u, wantOut, ySum, oSum);
+    } else {
+        if (in) propagate<S, false, true>(m, force, u, wantOut, ySum, oSum);
+        else propagate<S, false, false>(m, force, u, wantOut, ySum, oSum);
+    }
+}
+
+// Damper loss for one base sample (c_eff = c a commutes with the rotation),
+// after adding a pending force; returns the new strike-point displacements.
+template <int S>
+inline void applyDamper(const HammerKeyModes& m, bool pend, const double* force, double* y) noexcept {
     using namespace simd;
-    vf accY[S];
-    for (int s = 0; s < S; ++s) accY[s] = zero();
+    vf accY[S], f[S];
+    for (int s = 0; s < S; ++s) {
+        accY[s] = zero();
+        f[s] = set1(pend ? static_cast<float>(force[s]) : 0.0f);
+    }
     const vf one = set1(1.0f);
     for (int i = 0; i < m.count; i += kWidth) {
+        vf zr = load(m.zr + i), zi = load(m.zi + i);
+        if (pend) {
+            for (int s = 0; s < S; ++s) {
+                zr = fmadd(load(m.bRe[s] + i), f[s], zr);
+                zi = fmadd(load(m.bIm[s] + i), f[s], zi);
+            }
+        }
         const vf a = add(one, load(m.dampAm1 + i));
-        const vf zr = mul(load(m.zr + i), a);
-        const vf zi = mul(load(m.zi + i), a);
+        zr = mul(zr, a);
+        zi = mul(zi, a);
         store(m.zr + i, zr);
         store(m.zi + i, zi);
         for (int s = 0; s < S; ++s)
@@ -256,18 +296,20 @@ inline void solveContacts(const Felt& felt, const double* dFree, const Felt::Poi
 }
 
 template <int S>
-void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, float* out,
+void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in, float* out,
                 int n) noexcept {
     const Felt felt{p.K, p.p, p.mu, 1.0 / m.h, m.cRes};
     const double invM = 1.0 / p.mass;
     const double Ah = 0.5 * m.h * m.h * invM;
     const int R = m.oversampling;
+    const bool hasIn = in != nullptr && m.wInRe != nullptr;
     Felt::Point q0[S];
     for (int s = 0; s < S; ++s) q0[s] = {h.feltPrev[s], h.xiPrev[s], h.wPrev[s], h.fPrev[s], 1.0, 0.0};
     for (int k = 0; k < n; ++k) {
         if (m.damped) {
             double y[S];
-            applyDamper<S>(m, y);
+            applyDamper<S>(m, h.pending, h.fPend, y);
+            h.pending = false;
             for (int s = 0; s < S; ++s) {
                 q0[s] = felt.fromTotal(q0[s].d + h.yPrev[s] - y[s]);
                 h.yPrev[s] = y[s];
@@ -278,7 +320,9 @@ void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, 
         for (int r = 0; r < R; ++r) {
             const bool last = r == R - 1;
             float yf[S], of;
-            propagate<S>(m, last, yf, of);
+            const bool inNow = last && hasIn && in[k] != 0.0f;
+            propagateAny<S>(m, h.pending, h.fPend, inNow, inNow ? in[k] : 0.0f, last, yf, of);
+            h.pending = false;
             if (last) ofree = of;
             const double xt = h.x + h.v * m.h;
             double dFree[S];
@@ -300,7 +344,10 @@ void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, 
                     solveContacts<S>(felt, dFree, q0, Ah, m.G, guess, q1, F, h.fallbackSolves);
                 }
                 for (int s = 0; s < S; ++s) P += F[s];
-                if (P > 0.0) applyForce<S>(m, F);
+                if (P > 0.0) {
+                    for (int s = 0; s < S; ++s) h.fPend[s] = F[s];
+                    h.pending = true;
+                }
             } else {
                 for (int s = 0; s < S; ++s) {
                     F[s] = 0.0;
@@ -436,6 +483,8 @@ HammerKeyModes ContactTables::view(ModeBank& bank, int s) const noexcept {
         m.gOut[a] = sg.gOut[a];
         for (int b = 0; b < kMaxStrings; ++b) m.G[a][b] = sg.G[a][b];
     }
+    m.wInRe = bank.weightInReData() + m0;
+    m.wInIm = bank.weightInImData() + m0;
     m.cRes = sg.cRes;
     m.oversampling = sg.oversampling;
     m.h = sg.h;
@@ -463,6 +512,7 @@ double modalEnergy(double zr, double zi, double freqHz, double sigma, double mod
 
 void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m,
                   double velocity) noexcept {
+    flushHammer(h, m);
     const int S = std::clamp(m.strings, 1, kMaxStrings);
     double y[kMaxStrings];
     double first = 0.0;
@@ -496,13 +546,29 @@ void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m
     h.fallbackSolves = 0;
 }
 
-void runHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, float* out,
-               int n) noexcept {
+void stepHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in,
+                float* out, int n) noexcept {
     switch (m.strings) {
-        case 3: runHammerT<3>(h, p, m, out, n); break;
-        case 2: runHammerT<2>(h, p, m, out, n); break;
-        default: runHammerT<1>(h, p, m, out, n); break;
+        case 3: runHammerT<3>(h, p, m, in, out, n); break;
+        case 2: runHammerT<2>(h, p, m, in, out, n); break;
+        default: runHammerT<1>(h, p, m, in, out, n); break;
     }
+}
+
+void flushHammer(HammerState& h, const HammerKeyModes& m) noexcept {
+    if (!h.pending) return;
+    switch (m.strings) {
+        case 3: applyForce<3>(m, h.fPend); break;
+        case 2: applyForce<2>(m, h.fPend); break;
+        default: applyForce<1>(m, h.fPend); break;
+    }
+    h.pending = false;
+}
+
+void runHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, float* out, int n,
+               const float* in) noexcept {
+    stepHammer(h, p, m, in, out, n);
+    flushHammer(h, m);
 }
 
 bool hammerFinished(const HammerState& h, const HammerKeyModes& m) noexcept {

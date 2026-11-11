@@ -26,4 +26,14 @@ void runModesScalar(const BankView& b, const int* groups, int nGroups, const flo
 void runModesSimd(const BankView& b, const int* groups, int nGroups, const float* in,
                   float* out, int n, float* scratch) noexcept;
 
+// One sample of coupled processing (soundboard loop). Runs are contiguous
+// mode ranges [m0, m1) (whole groups) of one segment each; run r takes the
+// input in[seg[r]] and ADDS its output to out[seg[r]]. Same per-mode
+// operation order as the block kernels, so a mode's state evolves
+// bit-identically to runModes* with the same input.
+void stepRunsScalar(const BankView& b, const int* seg, const int* m0, const int* m1, int nRuns,
+                    const float* in, float* out) noexcept;
+void stepRunsSimd(const BankView& b, const int* seg, const int* m0, const int* m1, int nRuns,
+                  const float* in, float* out) noexcept;
+
 }  // namespace pm::detail

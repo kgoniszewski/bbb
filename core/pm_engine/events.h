@@ -14,6 +14,7 @@ enum class EventType : std::uint8_t {
     Panic = 5,        // keys and pedals up, hammers stopped, all strings damped hard for 300 ms
     Sostenuto = 6,    // value = pedal position 0..65535 (CC66), on/off at half travel
     UnaCorda = 7,     // value = pedal position 0..65535 (CC67), continuous
+    KeyDownSilent = 8, // note: key pressed down without sounding (damper lifted, no hammer); NoteOff releases it
 };
 
 enum class TimeBase : std::uint8_t {

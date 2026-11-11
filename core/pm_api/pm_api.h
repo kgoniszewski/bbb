@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 3
+#define PM_API_VERSION_MINOR 4
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -27,7 +27,8 @@ enum pm_event_type {
     PM_EVENT_ALL_NOTES_OFF = 4,
     PM_EVENT_PANIC = 5,
     PM_EVENT_SOSTENUTO = 6,     /* value = 16-bit pedal position (CC66), on at half travel */
-    PM_EVENT_UNA_CORDA = 7      /* value = 16-bit pedal position (CC67), continuous */
+    PM_EVENT_UNA_CORDA = 7,     /* value = 16-bit pedal position (CC67), continuous */
+    PM_EVENT_KEY_DOWN_SILENT = 8 /* note: key held down without sounding (damper up); NOTE_OFF releases */
 };
 
 enum pm_time_base {
@@ -64,7 +65,18 @@ enum pm_param {
     PM_PARAM_A4_HZ = 9,                   /* default 440 */
     PM_PARAM_TUNING_STRETCH = 10,         /* 0 .. 1.5 of the computed stretch, default 1 */
     PM_PARAM_EQUAL_TEMPERAMENT = 11,      /* 0 / 1: plain 12-TET, default 0 */
-    PM_PARAM_UNISON_WIDTH = 12            /* scales the unison detuning, default 1 */
+    PM_PARAM_UNISON_WIDTH = 12,           /* scales the unison detuning, default 1 */
+    /* Soundboard (M4): take effect at the next pm_engine_prepare (the bake depends on them). */
+    PM_PARAM_SOUNDBOARD_ENABLED = 13,     /* 0 / 1, default 1; 0 = no board, M3 output (A/B) */
+    PM_PARAM_SYMPATHETIC = 14,            /* 0 .. 1.5, loop gain of the sympathetic return, default 1 */
+    /* Real-time (any thread): */
+    PM_PARAM_KNOCK_LEVEL = 15,            /* hammer knock, N per m/s of hammer speed, default 0.02; 0 = off */
+    PM_PARAM_DAMPER_NOISE_LEVEL = 16,     /* damper-lift noise, N per pedal travel/s, default 0.004; 0 = off */
+    PM_PARAM_HALF_PEDAL_P0_TREBLE = 17,   /* pedal position where the treble dampers start to lift, 0.30 */
+    PM_PARAM_HALF_PEDAL_P0_BASS = 18,     /* the same for the bass, default 0.40 */
+    PM_PARAM_HALF_PEDAL_WIDTH = 19,       /* width of the transition zone, default 0.25 */
+    PM_PARAM_DAMPED_CULL_OFFSET_DB = 20   /* seated dampers woken by the bridge only this far above the
+                                             culling threshold, default 120 (never) */
 };
 
 typedef struct pm_stats {

@@ -328,6 +328,8 @@ for (int n = 0; n < nFrames; ++n) {
 
 In the real implementation steps 1–3 are interleaved per sample only for the feedback signal; everything else is block-vectorized.
 
+**Implementation note (M4): corrections to this section.** (1) The figures above are inconsistent: one mode per 20–30 Hz above 1 kHz gives about 170–250 modes below 5 kHz, not 300–600; the v0 board has 191. (2) The rule "the run-time loop carries only the transfer part" cannot be implemented with zones (a zone's velocity contains the key's own contribution); the implemented rule is that each key's bake excludes the loop's exact self-term, so bake plus loop equals the driving point. (3) The coupling is not benign without a correction: driven by a bridge displacement, every string partial responds quasi-statically with the same stiffness 2T/L, so the truncated modal sum acts on the board as a large negative stiffness and the loop diverges at 0 Hz once a few keys share a zone; each key's static response must be subtracted (mode-acceleration form). (4) The feedback delay must be one sample: a delay of a sub-block (or anything over about one sample) makes the loop non-passive, so the coupled string modes are stepped per sample, not block-vectorized. See `core/pm_voicing/soundboard_model.h`.
+
 ### 1.7 Cabinet, radiation, microphones, room
 
 - **Radiation from the board.** For each virtual microphone and each soundboard mode, precompute a complex gain (magnitude and delay) by a Rayleigh-integral over the mode shape for a baffled plate, including a mirror source for the open lid at its angle (full, half, closed) and a first-order rim/cavity resonance. Moving a microphone triggers a background recompute and a 50 ms crossfade of gain tables. Up to 5 microphones mixed to stereo.
@@ -654,7 +656,7 @@ void Engine::render(float** out, int nFrames, uint64_t bufferStartHostTime) noex
     hammers_.process(strings_, n);              // fills per-key hammer force (2× inside)
     strings_.process(hammerForce_, zoneVel_, bridgeForce_, n);   // modal bank, culled
     longitudinal_.process(strings_, bridgeForce_, n);
-    soundboard_.process(bridgeForce_, noise_, zoneVel_, n);       // feedback: 1-sample delay
+    soundboard_.process(bridgeForce_, noise_, zoneVel_, n);       // feedback: 1-sample delay (M4: stepped per sample, see §1.6 note)
     radiation_.process(soundboard_, bridgeForce_, micBus_, n);
     room_.process(micBus_, out, pos, n);
     pos += n;

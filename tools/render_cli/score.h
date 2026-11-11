@@ -2,6 +2,7 @@
 //
 //   <time s> note_on  <key> <velocity 1..127>
 //   <time s> note_off <key> [release velocity 1..127]
+//   <time s> key_down <key>             key pressed silently (damper lifted, no strike)
 //   <time s> cc64     <value 0..127>      sustain
 //   <time s> cc66     <value 0..127>      sostenuto
 //   <time s> cc67     <value 0..127>      una corda (continuous)
@@ -81,7 +82,13 @@ inline bool readScore(const char* path, double fs, std::vector<ScoreEvent>& out)
             e.time = static_cast<std::uint64_t>(std::llround(t * fs));
             std::string a;
             int b = -1;
-            if (kind == "note_on" || kind == "note_off") {
+            if (kind == "key_down") {
+                if (!(ls >> a)) goto bad;
+                const int note = parseNote(a);
+                if (note < 0) goto bad;
+                e.note = static_cast<std::uint8_t>(note);
+                e.type = pm::EventType::KeyDownSilent;
+            } else if (kind == "note_on" || kind == "note_off") {
                 if (!(ls >> a)) goto bad;
                 const int note = parseNote(a);
                 if (note < 0) goto bad;

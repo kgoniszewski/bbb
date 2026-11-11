@@ -1,0 +1,16 @@
+# Silently held keys (plan §1.6): C3 held down without sounding, C4 struck
+# staccato - after C4's damper falls, C3 rings on at the partials the two
+# share. Then the same with Db3 (C#3) held (nothing shared at low partials), and
+# with no key held.
+0.00  key_down C3
+0.50  note_on C4 90
+0.70  note_off C4
+3.50  note_off C3
+
+5.00  key_down Db3
+5.50  note_on C4 90
+5.70  note_off C4
+8.50  note_off Db3
+
+10.50 note_on C4 90
+10.70 note_off C4

@@ -39,6 +39,16 @@ int main(void) {
     EXPECT(pm_engine_set_param(eng, PM_PARAM_A4_HZ, 10.0) == 0);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_EQUAL_TEMPERAMENT, 1.0) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_EQUAL_TEMPERAMENT, &v) == 1 && v == 1.0);
+    /* Soundboard (prepare-time) and real-time M4 parameters. */
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_SYMPATHETIC, 0.7) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_SYMPATHETIC, &v) == 1 && fabs(v - 0.7) < 1e-12);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_SOUNDBOARD_ENABLED, 1.0) == 1);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_KNOCK_LEVEL, 0.0) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_KNOCK_LEVEL, &v) == 1 && v == 0.0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_DAMPER_NOISE_LEVEL, 0.01) == 1);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_HALF_PEDAL_WIDTH, 0.3) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_HALF_PEDAL_WIDTH, &v) == 1 && fabs(v - 0.3) < 1e-6);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_HALF_PEDAL_P0_BASS, 2.0) == 0);
     EXPECT(pm_engine_prepare(eng, 48000.0, 256) == 1);
 
     e.type = PM_EVENT_NOTE_ON;
@@ -53,6 +63,14 @@ int main(void) {
     EXPECT(pm_engine_push_event(eng, &e) == 1);
     e.type = PM_EVENT_SOSTENUTO;
     e.time = 200;
+    EXPECT(pm_engine_push_event(eng, &e) == 1);
+    e.type = PM_EVENT_KEY_DOWN_SILENT;
+    e.note = 48;
+    e.time = 10;
+    EXPECT(pm_engine_push_event(eng, &e) == 1);
+    e.type = PM_EVENT_SUSTAIN;
+    e.time = 300;
+    e.value = 30000; /* half pedal */
     EXPECT(pm_engine_push_event(eng, &e) == 1);
     for (b = 0; b < 40; ++b) {
         pm_engine_render(eng, left, right, 256, NULL);

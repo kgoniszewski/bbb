@@ -45,8 +45,12 @@ double maxStep(const std::vector<float>& y, int from, int to) {
 
 }  // namespace
 
+// Damper logic on the string sound (soundboard off: the board's low modes
+// keep ringing after the strings are damped; release decay with the board
+// is measured per partial in test_half_pedal).
 TEST(note_off_decays_without_click) {
     pm::Engine eng;
+    noBoard(eng);
     const int off = 48000 + 13;
     for (int note : {36, 48, 60, 72, 84}) {
         eng.prepare(kFs, 64);
@@ -67,6 +71,7 @@ TEST(note_off_decays_without_click) {
 // With the pedal down the note keeps ringing exactly as if the key were held.
 TEST(pedal_keeps_ringing) {
     pm::Engine eng;
+    noBoard(eng);
     const int n = 3 * 48000;
     eng.prepare(kFs, 64);
     const Stereo held = renderEngine(eng, {noteOn(0, 60, 80)}, n);
@@ -90,6 +95,7 @@ TEST(pedal_keeps_ringing) {
 // Keys from 69 up have no dampers: note-off changes nothing.
 TEST(top_keys_have_no_dampers) {
     pm::Engine eng;
+    noBoard(eng);
     for (int note : {89, 96, 108}) {
         eng.prepare(kFs, 64);
         const Stereo held = renderEngine(eng, {noteOn(0, note, 100)}, 48000);

@@ -16,7 +16,12 @@ set(PM_TESTS
   test_damper
   test_scheduling
   test_engine_stress
-  test_rt_alloc)
+  test_rt_alloc
+  test_soundboard_model
+  test_soundboard_coupling
+  test_passivity
+  test_sympathetic
+  test_half_pedal)
 
 find_package(Threads REQUIRED)
 foreach(t IN LISTS PM_TESTS)

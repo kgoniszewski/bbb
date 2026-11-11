@@ -32,6 +32,10 @@ TEST(event_offset_shifts_output) {
         pm::Engine a, b;
         a.setCulling(cull, -100.0f);
         b.setCulling(cull, -100.0f);
+        // Damper-lift noise is a random signal whose realisation depends on
+        // where the pedal event falls on the control grid.
+        a.setNoiseLevels(a.knockLevel(), 0.0f);
+        b.setNoiseLevels(b.knockLevel(), 0.0f);
         a.prepare(kFs, 64);
         const Stereo ref = renderEngine(a, scene(0), n);
         const double peak = peakAbs(ref.l);

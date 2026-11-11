@@ -5,6 +5,7 @@
 #include <numbers>
 
 #include "pm_string/string_modes.h"
+#include "pm_voicing/soundboard_model.h"
 
 namespace pm {
 
@@ -36,8 +37,50 @@ UnisonPartialSpec partialSpec(const KeyParams& k, double f0, int n, const Bridge
     s.modalMass = 0.5 * k.linearDensity * k.length;
     const double sign = (n & 1) ? 1.0 : -1.0;
     s.outV = k.outputGain * k.tension * n * kPi / k.length * stiff * sign;
-    s.outH = std::abs(s.Y.vv) > 0.0 ? s.outV * s.Y.vh / s.Y.vv : cd(0.0);
+    s.outH = k.bridgeCoupling ? s.outV * bridge.crossRatio(k.key, s.freqHz) : cd(0.0);
     return s;
+}
+
+// The admittance the strings see in total (bake plus run-time loop).
+class TotalAdmittance final : public BridgeAdmittance {
+public:
+    explicit TotalAdmittance(const BridgeAdmittance& b) : b_(b) {}
+    Admittance2 at(int key, double f) const noexcept override { return b_.total(key, f); }
+    Admittance2 atLambda(int key, std::complex<double> l) const noexcept override { return b_.totalLambda(key, l); }
+    std::complex<double> crossRatio(int key, double f) const noexcept override { return b_.crossRatio(key, f); }
+
+private:
+    const BridgeAdmittance& b_;
+};
+
+// Evaluates any admittance at the real frequency only.
+class RealFrequency final : public BridgeAdmittance {
+public:
+    explicit RealFrequency(const BridgeAdmittance& b) : b_(b) {}
+    Admittance2 at(int key, double f) const noexcept override { return b_.at(key, f); }
+    std::complex<double> crossRatio(int key, double f) const noexcept override { return b_.crossRatio(key, f); }
+
+private:
+    const BridgeAdmittance& b_;
+};
+
+// The partial solved with the admittance evaluated at the complex frequency
+// of its dominant normal mode (one fixed-point step against the total
+// admittance), not at the uncoupled real frequency: where the board's
+// admittance varies on the scale of the mode's frequency shift or decay
+// rate, the two differ by several % in Re Y, and a run-time loop acts at
+// the mode's actual (complex) frequency.
+UnisonPartial solveCoupled(const KeyParams& k, double f0, int n, const BridgeAdmittance& bridge,
+                           const BridgeAdmittance& total) {
+    UnisonPartialSpec spec = partialSpec(k, f0, n, bridge);
+    if (k.bridgeCoupling) {
+        const UnisonPartial pre = solveUnisonPartial(partialSpec(k, f0, n, total));
+        int best = 0;
+        for (int j = 1; j < pre.oscillators; ++j)
+            if (pre.mode[j].score > pre.mode[best].score) best = j;
+        spec.Y = bridge.atLambda(k.key, pre.mode[best].lambda);
+    }
+    return solveUnisonPartial(spec);
 }
 
 // Excitation x output weighted mean frequency of the partial's modes.
@@ -64,8 +107,18 @@ StringParams stringParams(const KeyParams& k) {
 int keyPartialCount(const KeyParams& k, double fs) { return countStringModes(stringParams(k), fs); }
 
 const BridgeAdmittance& defaultBridge() noexcept {
-    static const PlaceholderBridgeAdmittance placeholder;
-    return placeholder;
+    static const SoundboardBridge board(defaultBoard(), 48000.0, 0.0);
+    return board;
+}
+
+int keyCoupledGroups(const KeyModeSet& m) noexcept {
+    return (m.coupledModes + ModeBank::kGroupSize - 1) / ModeBank::kGroupSize;
+}
+int keyBankModes(const KeyModeSet& m) noexcept {
+    return keyCoupledGroups(m) * ModeBank::kGroupSize + (m.count - m.coupledModes);
+}
+int bankIndex(const KeyModeSet& m, int i) noexcept {
+    return i < m.coupledModes ? i : keyCoupledGroups(m) * ModeBank::kGroupSize + (i - m.coupledModes);
 }
 
 KeyModeSet computeKeyModes(const KeyParams& k, double fs) {
@@ -81,23 +134,31 @@ KeyModeSet computeKeyModes(const KeyParams& k, double fs, const BridgeAdmittance
     const int nPartials = keyPartialCount(k, fs);
 
     // Pitch compensation of partial 1 (two fixed-point steps suffice: the
-    // shift is a fraction of a cent).
+    // shift is a fraction of a cent), against the total admittance, so that
+    // a bake that leaves part of the bridge to a run-time loop is tuned like
+    // the full bake.
     double f0 = k.f0;
     if (k.bridgeCoupling && nPartials > 0) {
+        const TotalAdmittance total(bridge);
         for (int it = 0; it < 3; ++it) {
-            const UnisonPartial u = solveUnisonPartial(partialSpec(k, f0, 1, bridge));
+            // Real-frequency evaluation here: at a partial sitting on a board
+            // resonance the complex-frequency fixed point is not robust.
+            const RealFrequency real(total);
+            const UnisonPartial u = solveCoupled(k, f0, 1, real, real);
             f0 *= k.f1 / soundingFrequency(u);
         }
     }
     s.pitchRatio = f0 / k.f0;
 
     const double a = k.damperPos - 0.5 * k.damperWidth, b = k.damperPos + 0.5 * k.damperWidth;
+    const double cutoff = k.bridgeCoupling ? bridge.loopCutoffHz() : 0.0;
+    const double gain = k.outputGain != 0.0 ? k.outputGain : 1.0;
     s.partials.reserve(static_cast<std::size_t>(nPartials));
     for (int n = 1; n <= nPartials; ++n) {
         KeyPartial kp;
         kp.n = n;
         kp.firstMode = s.count;
-        kp.unison = solveUnisonPartial(partialSpec(k, f0, n, bridge));
+        kp.unison = solveCoupled(k, f0, n, bridge, TotalAdmittance(bridge));
         const UnisonPartial& u = kp.unison;
         if (u.status == UnisonStatus::Perturbed) ++s.perturbedPartials;
         if (u.status == UnisonStatus::Uncoupled) ++s.uncoupledPartials;
@@ -130,8 +191,23 @@ KeyModeSet computeKeyModes(const KeyParams& k, double fs, const BridgeAdmittance
         kp.kept = kept;
 
         const double w = k.damperFloor + (1.0 - k.damperFloor) * 2.0 * meanSin2(n, a, b);
+        const UnisonPartialSpec spec = partialSpec(k, f0, n, bridge);
+        const int no = u.oscillators;
+        // Partials rise with n, so the coupled ones are the leading ones.
+        const bool coupled = spec.freqHz < cutoff && s.coupledModes == s.count;
+        const double phiD = std::fabs(std::sin(n * kPi * k.damperPos));
         for (int r = 0; r < kept; ++r) {
-            const UnisonMode& m = u.mode[kp.keptIndex[r]];
+            const int j = kp.keptIndex[r];
+            const UnisonMode& m = u.mode[j];
+            cd sIn = 0.0;
+            double vmax = 0.0;
+            for (int q = 0; q < no; ++q) {
+                const cd o = q < S ? spec.outV : spec.outH;
+                sIn += u.Vinv[j * no + q] * (o / gain) / (s.modalMass * 2.0 * kPi * spec.freqHz);
+                if (q < S) vmax = std::max(vmax, std::abs(u.V[q * no + j]));
+            }
+            s.sympIn.push_back(sIn);
+            s.damperShape.push_back(phiD * vmax);
             s.partial.push_back(n);
             s.freq.push_back(m.lambda.imag() / (2.0 * kPi));
             s.sigma.push_back(-m.lambda.real());
@@ -146,6 +222,7 @@ KeyModeSet computeKeyModes(const KeyParams& k, double fs, const BridgeAdmittance
             s.damperSigma.push_back(k.damperSigma * w);
         }
         s.count += kept;
+        if (coupled) s.coupledModes = s.count;
         s.partials.push_back(kp);
     }
 
@@ -189,14 +266,20 @@ void loadKeyModes(ModeBank& bank, ContactTables& contact, int seg, const KeyPara
     const int m0 = bank.segmentFirstMode(seg);
     const int R = k.contactOversampling;
     for (int i = 0; i < m.count; ++i) {
+        const int b = m0 + bankIndex(m, i);
         cd wIn = 0.0;
-        for (int st = 0; st < m.strings; ++st) wIn += m.input[i][st];
-        wIn /= fs;
-        bank.setMode(m0 + i, m.freq[i], m.sigma[i], fs);
-        bank.setWeights(m0 + i, static_cast<float>(wIn.real()), static_cast<float>(wIn.imag()),
+        if (i < m.coupledModes) {
+            const cd lambda(-m.sigma[i], 2.0 * kPi * m.freq[i]);
+            // (c - 1) without cancellation, as in ModeBank::setMode.
+            const double th = lambda.imag() / fs, rm1 = std::expm1(lambda.real() / fs), h = std::sin(0.5 * th);
+            const cd cm1(rm1 * std::cos(th) - 2.0 * h * h, (1.0 + rm1) * std::sin(th));
+            wIn = m.sympIn[i] * cm1 / lambda;
+        }
+        bank.setMode(b, m.freq[i], m.sigma[i], fs);
+        bank.setWeights(b, static_cast<float>(wIn.real()), static_cast<float>(wIn.imag()),
                         static_cast<float>(m.wOut[i]));
-        bank.setDamperRate(m0 + i, m.damperSigma[i], fs);
-        contact.setMode(m0 + i, cd(-m.sigma[i], 2.0 * kPi * m.freq[i]), m.strings, m.proj[i].data(),
+        bank.setDamperRate(b, m.damperSigma[i], fs);
+        contact.setMode(b, cd(-m.sigma[i], 2.0 * kPi * m.freq[i]), m.strings, m.proj[i].data(),
                         m.input[i].data(), fs, R);
     }
     // Multiple contacts (plan §1.4): the hammer is followed until it has been
@@ -217,7 +300,7 @@ double keyStringEnergy(const KeyModeSet& m, const float* zr, const float* zi) {
         for (int k = 0; k < n; ++k) {
             cd z = 0.0;
             for (int r = 0; r < p.kept; ++r) {
-                const int i = p.firstMode + r;
+                const int i = bankIndex(m, p.firstMode + r);
                 z += u.V[k * n + p.keptIndex[r]] * cd(zr[i], zi[i]);
             }
             e += modalEnergy(z.real(), z.imag(), u.oscFreqHz[k], u.oscSigma[k], m.modalMass);

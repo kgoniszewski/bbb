@@ -11,9 +11,12 @@ sample-accurate engine with an event queue, a C API, a piano mode in
 `render_cli`) and M3: coupled-mode unisons of 1-3 strings in two
 polarizations (double decay and beating), one hammer on all strings of a
 unison with una corda, sostenuto, stretch tuning by a virtual tuner, and an
-offline finite-difference reference. There is no soundboard (the bridge
-admittance is a placeholder), no sympathetic coupling between keys, no
-longitudinal modes and no Apple code yet.
+offline finite-difference reference, and M4: a modal soundboard (v0 mode
+set from an orthotropic plate) coupled to every string through the bridge
+by a one-sample run-time loop (sympathetic resonance, pedal bloom),
+continuous half-pedalling, hammer-knock and damper-lift noise hooks, and a
+placeholder two-pickup output. There is no radiation or microphone model,
+no room, no longitudinal modes or duplex and no Apple code yet.
 
 ## Layout
 
@@ -22,13 +25,14 @@ longitudinal modes and no Apple code yet.
 | `core/pm_base/` | Header-only: 64-byte aligned arrays, SIMD wrapper (NEON / AVX2+FMA / SSE2 / scalar), flush-denormals guard (x86 MXCSR, ARM FPCR), SPSC queue, fast `pow` for the felt law |
 | `core/pm_string/` | `ModeBank` (complex one-pole resonators, structure of arrays, group culling, per-key segments with their own I/O and damper loss, complex input weights, free-running kernel), string parameters to modal coefficients, pluck |
 | `core/pm_hammer/` | Hunt-Crossley felt hammer and the contact solver for one hammer on 1-3 strings, on normal modes |
-| `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface and placeholder, unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
-| `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals, render loop, stereo output stage |
+| `core/pm_board/` | Real-time soundboard modal bank (zone ports in and out, pickup read-outs, sleep) and the key/zone mixing of the coupling loop |
+| `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface (smooth placeholder kept for unit tests), soundboard mode set v0 and its admittances (`soundboard_model.h`), unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
+| `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python |
 | `tools/render_cli/` | Offline renderer: one plucked string to a mono WAV, or a text score through the engine to a stereo WAV |
 | `tools/reference_fdtd/` | Offline finite-difference stiff string + hammer (library and CLI), the reference for the real-time model |
 | `tools/bench/` | Modal kernel benchmark and engine benchmark |
-| `tools/analysis/` | Python (numpy): partial frequencies and T60 of a string; attack centroid and partial levels; two-stage decay and beating of piano notes |
+| `tools/analysis/` | Python (numpy): partial frequencies and T60 of a string; attack centroid and partial levels; two-stage decay and beating of piano notes; third-octave band levels and band decay (bloom, sympathetic, half-pedal) |
 | `tests/` | Self-contained C++ unit tests (and one C test of the API), run by CTest |
 
 ## Engine
@@ -51,16 +55,64 @@ longitudinal modes and no Apple code yet.
   higher ones the 3 with the largest excitation x output (configurable):
   17,034 modes for the default table at 48 kHz. The first-partial pitch
   shift caused by the bridge reactance is compensated per key.
-- **Bridge (placeholder until M4).** `PlaceholderBridgeAdmittance`
-  (`core/pm_voicing/bridge_admittance.h`): Re Yvv = G(key) (f / f_key)^0.3
-  with G = 2.5-5e-4 s/kg at each key's fundamental (impedance 2,000-4,000
-  kg/s), a reactive part from +0.3 (spring-like, low f) to -0.2 (mass-like,
-  high f), Yhh = Yvv / 12, Yvh = 0.25 Yvv / sqrt(12). Behind the
-  `BridgeAdmittance` interface so that M4 can supply the soundboard's
-  driving-point admittance. Internal losses b1, b3 were reduced so that the
-  bridge supplies the prompt-sound loss: aftersound (internal) T60 of the
-  fundamental about 60, 45, 20, 7, 3.5, 1.5 s and prompt T60 about 25, 14,
-  3.5, 1.2, 0.6, 0.3 s at A0, C2, C4, C6, C7, C8.
+- **Soundboard (plan §1.6, `core/pm_voicing/soundboard_model.h`).** v0
+  mode set from a simply supported orthotropic plate, 1.93 x 1.25 m, ribs
+  and bridges folded into equivalent stiffnesses (Dx 2,430, Dy 20,000,
+  Dxy 2,090 N m) and 6.6 kg/m^2 (15.9 kg); loss factor 3 %. 191 modes below
+  5 kHz (configurable cap and mode count), first mode 58.3 Hz, one mode per
+  24-26 Hz above 1 kHz; mean driving-point impedance at the bridge 1,400-
+  1,900 kg/s (0.2-8 kHz). Treble bridge (keys 21-88) and bass bridge (1-20)
+  are Bezier curves on the plate; every key has its own bridge point (shape
+  values averaged over a 5 cm contact) and reaches the run-time board
+  through 18 zones (4 bass, 14 treble) by hat-function weights. Above 5 kHz
+  a mean-value continuum of modes continues the admittance (real part ->
+  n / 4M). The data structure (frequencies, damping, shapes at keys, zones
+  and pickups) is what a measured or finite-element set would fill.
+- **Bridge admittance seen by a key.** Vertical: the board's driving point
+  (modes + continuation). Horizontal and cross terms remain parametric: the
+  bridge rocks with the vertical motion (r = 0.25 / sqrt(12)) plus an
+  independent horizontal compliance (mean conductance / 12). The real part
+  is positive semi-definite.
+- **Baked versus fed back (no double counting).** The run-time loop feeds
+  the board modes back to the strings of every key whose partials lie in the
+  modal range. Its exact self-term at key k (the one-sample discrete loop
+  with the zone-interpolated shape, the sympathetic gain g and the string's
+  residual end stiffness) is removed from that key's bake, so bake + loop =
+  driving point (real part of the remainder clamped at 0 where interpolated
+  shapes exceed the true point: 1.6 % of frequency points). Partials above
+  the modal range bake the full admittance and only drive the board. The
+  admittance is evaluated at the complex frequency of each partial's
+  dominant mode. `test_soundboard_coupling` measures a key alone on the
+  board with the real loop: 20 partials of C2, C4, C6 decay as predicted,
+  median deviation 0.23 %, worst 3.5 % (C2's fundamental, next to the
+  board's two lowest modes).
+- **Loop (one sample, `core/pm_board/soundboard.h`).** Per sample: hammers
+  and the coupled string modes advance with the input computed at the
+  previous sample, each key's bridge force (minus its static correction,
+  below) goes into the zone forces, the board advances and returns zone
+  displacements, which become each key's input. With this alignment every
+  board mode's loop transfer is positive real, so the zone-port loop is
+  passive (`test_passivity`: 10^4 random reduced systems, no energy growth).
+  Static correction: driven by a bridge displacement, each string mode
+  responds quasi-statically with 2T/L (1 + B n^2) u, the same for every
+  partial, so the truncated modal sum is a large negative stiffness on the
+  board (uncorrected, a few keys in a zone diverge at 0 Hz); each key
+  subtracts its exact static response, K0 u[n] + K1 u[n-1] matched to the
+  discrete bank's static gain and slope, leaving the convergent, passive
+  end stiffness of the string. A latency longer than one sample was ruled
+  out: block-delayed loops are not passive (see the plan note in §1.6).
+- **Output (PLACEHOLDER until the radiation model).** Board velocity at two
+  pickup points (bass side left, treble side right) plus a direct path for
+  partials above the modal range (panned bridge forces, high-passed at
+  4.5 kHz, scaled by the board's mean transfer admittance near 5 kHz).
+  Level, with mf = MIDI 80 and ff = 112: mf mid-range peaks -19 to -17
+  dBFS, 12-note ff clusters at or below -1.3 dBFS (below the limiter).
+  `SoundboardConfig::enabled = false` gives the M3 output (A/B).
+- **Decay times.** The bake now follows the board, so decay varies note to
+  note and partial to partial. Fundamentals, eigen-predicted prompt /
+  aftersound T60 (M3 placeholder in brackets): C2 14.3 / 45 s (10.5 / 40),
+  C4 3.6 / 17-19 s (2.6 / 20), C6 1.4 / 5.8 s (0.75 / 6.0); C3 lies in a gap
+  between board modes (21.8 / 28 s), C5 on a peak (0.6 / 11 s).
 - **Unison detuning.** Per-string cents offsets from a deterministic seed
   (a spread pattern, randomly permuted, +-30 % jitter, zero mean; about
   +-0.5 cent), times a global unison width; horizontal modes 0.2 cent sharp.
@@ -70,10 +122,6 @@ longitudinal modes and no Apple code yet.
   double octave above C7, and to 6:3 (C3-D2) and towards 10:5 at A0. Result:
   -24 cents at A0, -3.5 at C2, -1.5 at C4, 0 at A4, +4.2 at C6, +34 at C8.
   Stretch amount 0-150 %, A4 and plain equal temperament are options.
-- **Output.** The vertical bridge force of each key (plus the vertical
-  bridge motion caused by horizontal string force, Yvh / Yvv), summed
-  through a fixed stereo spread, a 5 Hz DC blocker, master gain and a soft
-  clipper (transparent below -1 dBFS, never reaches full scale).
 - **Hammer contact.** One hammer (whole hammer mass) meets the S strings of
   its key at small per-string offsets (hammer-string mating, +-15 um), one
   Hunt-Crossley felt contact per string. While active it owns its key's
@@ -85,15 +133,38 @@ longitudinal modes and no Apple code yet.
   scheme is energy-exact for lossless felt and strings and passive for any
   felt stiffness. Felt `x^p` uses a table-driven `fastPow` (3e-14 relative
   error). The static compliance of the partials above the bank's limit acts
-  as a spring in series with each felt. See `core/pm_hammer/hammer.h`.
-- **Pedals.** Sustain (CC64, on/off at half travel). Sostenuto (CC66): the
-  keys whose dampers are held up by their keys when it goes down stay
-  undamped until it comes up. Una corda (CC67, continuous, latched per
-  strike): on trichords string 0 is reached u^2 x 2.5 mm later (grazed,
-  then missed), and the felt K falls by 35 % x u on every key.
+  as a spring in series with each felt. Each substep's force is applied in
+  the next substep's propagation pass (one pass over the modes per substep
+  instead of two); the hammer also takes the key's sympathetic input. See
+  `core/pm_hammer/hammer.h`.
+- **Pedals (plan §1.9).** Sustain (CC64) is continuous: the position is
+  smoothed (10 ms, from the exact event time) and mapped per register
+  (bass dampers lift later: transition zone from 0.40 in the bass and 0.30
+  in the treble, 0.25 wide) to a felt position: pressed into the string
+  (full damping), light contact (damping falls to 15 %), then a gap: a
+  vibration of amplitude A reaches the felt for acos(gap / A) / pi of each
+  cycle (amplitude-dependent damping), clear 3 mm at full pedal. Only decay
+  rates change, so pedal moves never click and re-pedalling keeps what is
+  left in the strings. Bloom and sympathetic resonance come from the loop
+  alone. Sostenuto (CC66): the keys whose dampers are held up by their keys
+  when it goes down stay undamped until it comes up. Una corda (CC67,
+  continuous, latched per strike): on trichords string 0 is reached
+  u^2 x 2.5 mm later (grazed, then missed), and the felt K falls by
+  35 % x u on every key. A silent key-down event lifts a damper without a
+  strike.
 - **Dampers.** Extra loss per mode, weighted by the mode shape under the
   felt; landing follows a raised-cosine curve over 20-80 ms (faster with
   higher release velocity). Keys 69-88 have no damper.
+- **Mechanical noises (plan §1.8, switchable, modest by default).** Hammer
+  knock: a 1.5 ms raised-cosine force into the key's zones, 0.02 N per m/s
+  of hammer speed. Damper-lift noise: low-passed noise into every zone,
+  proportional to pedal speed and to the share of dampers the pedal moves.
+- **Culling.** Groups sleep when their output bound (through the board's
+  peak gain, +26 dB) is below the threshold; a sleeping coupled group wakes
+  when its input could have moved it above. Keys with a seated damper are
+  not woken by bridge input (plan §1.5: with the pedal up only held notes
+  and the undamped top section stay awake); their release tails decay
+  normally.
 - **Events.** `pm::Event` through a wait-free SPSC queue (one producer).
   Times are host-clock ticks (mapped per render call by a `ClockMapping`)
   or absolute engine sample indices. Lowest-latency mode puts due events at
@@ -131,9 +202,10 @@ Single string:
 ```
 
 Piano, from a text score (`time note_on KEY VEL`, `time note_off KEY`,
-`time cc64 VALUE` (sustain), `time cc66 VALUE` (sostenuto), `time cc67 VALUE`
-(una corda), `time all_notes_off`, `time panic`; KEY is a MIDI note number or
-a name such as C4 or F#3):
+`time key_down KEY` (silent key press), `time cc64 VALUE` (sustain,
+continuous), `time cc66 VALUE` (sostenuto), `time cc67 VALUE` (una corda),
+`time all_notes_off`, `time panic`; KEY is a MIDI note number or a name such
+as C4 or Bb3 (`#` starts a comment, so write sharps as flats)):
 
 ```sh
 ./build/tools/render_cli/render_cli --score tools/render_cli/scores/single_notes.txt --out notes.wav
@@ -144,8 +216,13 @@ contacts and una corda amount. Example scores: `single_notes.txt` (C2, C4,
 C7 at five velocities), `chord_pedal.txt` (a chord with and without pedal),
 `repeated_note.txt` (A4 at 12 strikes per second), `double_decay.txt` (one
 25 s mf C4), `una_corda.txt` (C4 with the una corda up, half and fully
-down). Tuning options: `--a4 HZ`, `--stretch X` (0-1.5),
-`--equal-temperament`, `--unison-width X`. `--help` lists all options.
+down), `pedal_bloom.txt` (a staccato chord with the pedal down and up),
+`half_pedal.txt` (C3 releases over fixed pedal positions, then a pedal
+sweep over a ringing note), `sympathetic.txt` (C3 held silently while C4
+is struck staccato, then Db3 held, then nothing held). Tuning options:
+`--a4 HZ`, `--stretch X` (0-1.5), `--equal-temperament`, `--unison-width X`;
+soundboard: `--no-board` (A/B), `--sympathetic G`, `--knock N`,
+`--damper-noise N`. `--help` lists all options.
 
 ## Analyse
 
@@ -172,6 +249,15 @@ python3 tools/analysis/analyze_decay.py una_corda.wav --note 60 --at 0,8,16 --se
 Per partial: frequency, level, a two-stage decay fit (prompt and aftersound
 T60, break time, crossover level) and the beat rate (two-component
 linear-prediction fit of the partial's baseband).
+
+```sh
+python3 tools/analysis/analyze_bands.py pedal_bloom.wav --at 0.4,5.2 --labels "pedal down,pedal up"
+python3 tools/analysis/analyze_bands.py sympathetic.wav --at 0.7,5.7,10.7 --window 1 --labels "C3,Db3,none"
+```
+
+Third-octave band levels some time after each given instant (a release)
+and the band decay time from the following window, each segment also
+relative to the first.
 
 ## Offline FDTD reference
 
@@ -209,6 +295,22 @@ input and free-running (the engine's case: no input).
 Engine cost in % of one core: all 88 keys struck and held with the pedal
 down (with culling, and with culling off so every mode runs), a typical
 case (a four-note chord re-struck twice a second, pedal up), a 12-note ff
-cluster struck every 100 ms, and the cost of one hammer per buffer for
-eight keys. Numbers from x86 machines are only indicative for the Apple
-silicon target.
+cluster struck every 100 ms, a pedal-down sympathetic case (staccato chords
+every 0.5 s, every string free), the worst and cluster cases with the board
+off (A/B), and the cost of one hammer per buffer for eight keys. Numbers
+from x86 machines are only indicative for the Apple silicon target. The
+coupled string modes are stepped one sample at a time (the loop requires
+it), which costs about twice the block kernel per mode.
+
+## Tests
+
+`ctest` runs 25 suites. The M4 ones: `test_soundboard_model` (board
+targets, positive-real loop, admittance against a time-domain drive of the
+run-time bank, bake + loop = driving point), `test_soundboard_coupling`
+(no double counting), `test_passivity` (10^4 random reduced systems with
+the production components), `test_sympathetic` (silently held key, pedal
+bloom per third octave, monotonic in the sympathetic gain) and
+`test_half_pedal` (graded T60 against pedal position, no click on pedal
+moves, re-pedalling keeps energy). Unit tests of the unison solver and the
+M3 double-decay tests use the smooth placeholder admittance, which the
+soundboard replaced in the engine.

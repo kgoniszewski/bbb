@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <numbers>
 
 #include "pm_base/simd.h"
@@ -20,13 +21,23 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
                     dampRate_.allocate(padded) && dampAm1_.allocate(padded) &&
                     groupInOut_.allocate(ng) && active_.allocate(ng) &&
                     activeList_.allocate(ng) && segGroups_.allocate(ns + 1) &&
+                    segCoupled_.allocate(ns) && segSkip_.allocate(ns) && segSleeping_.allocate(ns) && segHasRuns_.allocate(ns) &&
+                    segWakeGain_.allocate(ns) && runSeg_.allocate(ng) && runM0_.allocate(ng) &&
+                    runM1_.allocate(ng) && runSegList_.allocate(ns) && wakeList_.allocate(ns) &&
+                    groupK0_.allocate(ng) && groupK1_.allocate(ng) &&
+                    segK0_.allocate(ns) && segK1_.allocate(ns) && segInPrev_.allocate(ns) &&
+                    segCullScale_.allocate(ns) && segInputScale_.allocate(ns) &&
                     segDamp_.allocate(ns) && segInput_.allocate(ns) &&
                     scratch_.allocate(static_cast<std::size_t>(kCullInterval) * simd::kWidth);
     capacity_ = ok ? static_cast<int>(padded) : 0;
+    if (ok)
+        for (std::size_t i = 0; i < ns; ++i) segCullScale_[i] = segInputScale_[i] = 1.0f;
     size_ = 0;
     nSeg_ = ok ? segments : 0;
     sinceCull_ = 0;
     groupBlocks_ = 0;
+    nRuns_ = 0;
+    runsDirty_ = true;
     return ok;
 }
 
@@ -125,6 +136,7 @@ void ModeBank::setSegmentDamper(int s, float amount) noexcept {
 
 void ModeBank::wakeSegment(int s) noexcept {
     for (int g = segFirstGroup(s); g < segFirstGroup(s + 1); ++g) active_[g] = 1;
+    runsDirty_ = true;
 }
 
 void ModeBank::setWeights(int i, float wInRe, float wInIm, float wOut) noexcept {
@@ -132,17 +144,20 @@ void ModeBank::setWeights(int i, float wInRe, float wInIm, float wOut) noexcept 
     wInIm_[i] = wInIm;
     wOut_[i] = wOut;
     updateGroupGain(i / kGroupSize);
+    runsDirty_ = true;
 }
 
 void ModeBank::setState(int i, float re, float im) noexcept {
     zr_[i] = re;
     zi_[i] = im;
     if (re != 0.0f || im != 0.0f) active_[i / kGroupSize] = 1;
+    runsDirty_ = true;
 }
 
 void ModeBank::clearState() noexcept {
     for (int i = 0; i < capacity_; ++i) zr_[i] = zi_[i] = 0.0f;
     for (int g = 0; g < groupCount(); ++g) active_[g] = cullEnabled_ ? 0 : 1;
+    runsDirty_ = true;
 }
 
 void ModeBank::setCulling(bool enabled, float thresholdDb) noexcept {
@@ -154,6 +169,16 @@ void ModeBank::setCulling(bool enabled, float thresholdDb) noexcept {
             any = zr_[m] != 0.0f || zi_[m] != 0.0f;
         active_[g] = any ? 1 : 0;
     }
+    runsDirty_ = true;
+}
+
+void ModeBank::setSegmentCullOffset(int s, float stateDb, float inputDb) noexcept {
+    const float c = std::pow(10.0f, std::max(stateDb, 0.0f) / 20.0f);
+    const float i = std::pow(10.0f, std::max(inputDb, 0.0f) / 20.0f);
+    if (c == segCullScale_[s] && i == segInputScale_[s]) return;
+    segCullScale_[s] = c;
+    segInputScale_[s] = i;
+    runsDirty_ = true;  // the wake list depends on the input threshold
 }
 
 int ModeBank::activeGroups() const noexcept {
@@ -162,10 +187,12 @@ int ModeBank::activeGroups() const noexcept {
     return n;
 }
 
+// Bound on the group's output gained per unit of summed |input|: each mode's
+// |z| grows by at most |wIn| sum|u|, so the output by sum |wIn| |wOut|.
 void ModeBank::updateGroupGain(int g) noexcept {
     float m = 0.0f;
     for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i)
-        m = std::max(m, std::hypot(wIn_[i], wInIm_[i]) * std::abs(wOut_[i]));
+        m += std::hypot(wIn_[i], wInIm_[i]) * std::abs(wOut_[i]);
     groupInOut_[g] = m;
 }
 
@@ -179,16 +206,19 @@ void ModeBank::cullPass(const SegmentIO* io) noexcept {
     for (int s = 0; s < nSeg_; ++s) {
         if (io && io[s].skip) continue;
         const float input = segInput_[s];
+        const float threshold = cullThreshold_ * segCullScale_[s];
+        const float inThreshold = cullThreshold_ * segInputScale_[s];
         for (int g = segFirstGroup(s); g < segFirstGroup(s + 1); ++g) {
             if (!active_[g]) continue;
-            if (input * groupInOut_[g] > cullThreshold_) continue;
+            if (input * groupInOut_[g] > inThreshold) continue;
             float bound = 0.0f;
             const int m0 = g * kGroupSize;
             for (int m = m0; m < m0 + kGroupSize; ++m)
                 bound += std::abs(wOut_[m]) * std::sqrt(zr_[m] * zr_[m] + zi_[m] * zi_[m]);
-            if (bound < cullThreshold_) {
+            if (bound < threshold) {
                 for (int m = m0; m < m0 + kGroupSize; ++m) zr_[m] = zi_[m] = 0.0f;
                 active_[g] = 0;
+                runsDirty_ = true;
             }
         }
     }
@@ -214,7 +244,7 @@ void ModeBank::run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) no
                 segInput_[s] += l1;
                 if (l1 > 0.0f)
                     for (int g = g0; g < g1; ++g)
-                        if (!active_[g] && l1 * groupInOut_[g] > cullThreshold_) active_[g] = 1;
+                        if (!active_[g] && l1 * groupInOut_[g] > cullThreshold_ * segInputScale_[s]) active_[g] = 1;
             }
 
             int nActive = 0;
@@ -253,6 +283,193 @@ void ModeBank::process(const float* in, float* out, int nFrames, Kernel kernel) 
 
 void ModeBank::processSegments(SegmentIO* io, int nFrames, Kernel kernel) noexcept {
     run(io, nFrames, kernel, true);
+}
+
+// ---------------------------------------------------------------- coupled
+
+void ModeBank::setSegmentCoupledGroups(int s, int groups) noexcept {
+    segCoupled_[s] = std::clamp(groups, 0, segFirstGroup(s + 1) - segFirstGroup(s));
+    float m = 0.0f;
+    for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) m = std::max(m, groupInOut_[g]);
+    segWakeGain_[s] = m;
+    runsDirty_ = true;
+}
+
+void ModeBank::computeStaticCorrection(int s) noexcept {
+    for (int g = segFirstGroup(s); g < segFirstGroup(s + 1); ++g) {
+        double K = 0.0, D1 = 0.0;
+        if (g < segFirstGroup(s) + segCoupled_[s]) {
+            for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i) {
+                const std::complex<double> w(wIn_[i], wInIm_[i]);
+                if (w == 0.0) continue;
+                const std::complex<double> c(1.0 + double(dr0_[i]), double(ci0_[i]));
+                K += wOut_[i] * std::imag(w / (1.0 - c));
+                D1 += wOut_[i] * std::imag(-w * c / ((1.0 - c) * (1.0 - c)));
+            }
+        }
+        groupK0_[g] = static_cast<float>(K + D1);
+        groupK1_[g] = static_cast<float>(-D1);
+    }
+    runsDirty_ = true;
+}
+
+float ModeBank::staticCorrection0(int s) const noexcept {
+    float k = 0.0f;
+    for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) k += groupK0_[g];
+    return k;
+}
+float ModeBank::staticCorrection1(int s) const noexcept {
+    float k = 0.0f;
+    for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) k += groupK1_[g];
+    return k;
+}
+
+void ModeBank::processSegmentsUncoupled(SegmentIO* io, int nFrames, Kernel kernel) noexcept {
+    const detail::BankView view{zr_.data(), zi_.data(), dr_.data(),  ci_.data(),
+                                wIn_.data(), wInIm_.data(), wOut_.data()};
+    for (int s = 0; s < nSeg_; ++s) {
+        SegmentIO& sio = io[s];
+        sio.wrote = false;
+        if (sio.skip) continue;
+        int nActive = 0;
+        for (int g = segFirstGroup(s) + segCoupled_[s]; g < segFirstGroup(s + 1); ++g)
+            if (active_[g]) activeList_[nActive++] = g;
+        if (nActive == 0) continue;
+        std::fill(sio.out, sio.out + nFrames, 0.0f);
+        sio.wrote = true;
+        if (kernel == Kernel::Simd)
+            detail::runModesSimd(view, activeList_.data(), nActive, nullptr, sio.out, nFrames, scratch_.data());
+        else
+            detail::runModesScalar(view, activeList_.data(), nActive, nullptr, sio.out, nFrames);
+        groupBlocks_ += static_cast<std::uint64_t>(nActive);
+    }
+}
+
+void ModeBank::beginCoupled(const SegmentIO* io) noexcept {
+    for (int s = 0; s < nSeg_; ++s) {
+        const std::uint8_t k = io[s].skip ? 1 : 0;
+        if (segSkip_[s] != k) runsDirty_ = true;
+        segSkip_[s] = k;
+    }
+}
+
+void ModeBank::rebuildRuns() noexcept {
+    nRuns_ = nRunSegs_ = nWake_ = 0;
+    for (int s = 0; s < nSeg_; ++s) {
+        segSleeping_[s] = 0;
+        segHasRuns_[s] = 0;
+        segK0_[s] = segK1_[s] = 0.0f;
+        if (segSkip_[s]) continue;
+        const int g0 = segFirstGroup(s), g1 = g0 + segCoupled_[s];
+        const int runsBefore = nRuns_;
+        int g = g0;
+        while (g < g1) {
+            if (!active_[g]) {
+                segSleeping_[s] = 1;
+                ++g;
+                continue;
+            }
+            const int start = g;
+            while (g < g1 && active_[g]) {
+                segK0_[s] += groupK0_[g];
+                segK1_[s] += groupK1_[g];
+                ++g;
+            }
+            runSeg_[nRuns_] = s;
+            runM0_[nRuns_] = start * kGroupSize;
+            runM1_[nRuns_] = g * kGroupSize;
+            ++nRuns_;
+        }
+        if (nRuns_ > runsBefore) {
+            runSegList_[nRunSegs_++] = s;
+            segHasRuns_[s] = 1;
+        }
+        // A sleeping group that no input could wake (a seated damper with
+        // the default offset) need not be watched.
+        if (segSleeping_[s] && segInputScale_[s] < 1e5f) wakeList_[nWake_++] = s;
+    }
+    runsDirty_ = false;
+}
+
+int ModeBank::coupledSegments(const int*& list) noexcept {
+    if (runsDirty_) rebuildRuns();
+    list = runSegList_.data();
+    return nRunSegs_;
+}
+
+int ModeBank::wakeableSegments(const int*& list) noexcept {
+    if (runsDirty_) rebuildRuns();
+    list = wakeList_.data();
+    return nWake_;
+}
+
+// A woken group starts from its quasi-static deflection under the current
+// input u, z = wIn u / (1 - c), not from rest: its static correction (which
+// joins at the same time) then cancels exactly, and no force step reaches
+// the board.
+void ModeBank::wakeCoupled(int s, float u) noexcept {
+    const float input = segInput_[s];
+    bool sleeping = false;
+    for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) {
+        if (active_[g]) continue;
+        if (input * groupInOut_[g] > cullThreshold_ * segInputScale_[s]) {
+            for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i) {
+                const std::complex<double> w(wIn_[i], wInIm_[i]);
+                const std::complex<double> c(1.0 + double(dr_[i]), double(ci_[i]));
+                const std::complex<double> z = w == 0.0 ? 0.0 : w * double(u) / (1.0 - c);
+                zr_[i] = static_cast<float>(z.real());
+                zi_[i] = static_cast<float>(z.imag());
+            }
+            active_[g] = 1;
+            runsDirty_ = true;
+        } else {
+            sleeping = true;
+        }
+    }
+    segSleeping_[s] = sleeping ? 1 : 0;
+}
+
+void ModeBank::stepCoupled(const float* in, float* out, Kernel kernel) noexcept {
+    if (runsDirty_) rebuildRuns();
+    for (int i = 0; i < nRunSegs_; ++i) out[runSegList_[i]] = 0.0f;
+    const detail::BankView view{zr_.data(), zi_.data(), dr_.data(),  ci_.data(),
+                                wIn_.data(), wInIm_.data(), wOut_.data()};
+    if (kernel == Kernel::Simd)
+        detail::stepRunsSimd(view, runSeg_.data(), runM0_.data(), runM1_.data(), nRuns_, in, out);
+    else
+        detail::stepRunsScalar(view, runSeg_.data(), runM0_.data(), runM1_.data(), nRuns_, in, out);
+    for (int i = 0; i < nRunSegs_; ++i) {
+        const int s = runSegList_[i];
+        out[s] -= segK0_[s] * in[s] + segK1_[s] * segInPrev_[s];
+        segInPrev_[s] = in[s];
+        if (cullEnabled_) segInput_[s] += std::fabs(in[s]);
+    }
+    if (!cullEnabled_) return;
+    bool woke = false;
+    for (int i = 0; i < nWake_; ++i) {
+        const int s = wakeList_[i];
+        if (!segHasRuns_[s]) {  // segments with awake runs were handled above
+            segInPrev_[s] = in[s];
+            segInput_[s] += std::fabs(in[s]);
+        }
+        if (segInput_[s] * segWakeGain_[s] > cullThreshold_ * segInputScale_[s]) woke = true;
+    }
+    if (woke)
+        for (int i = 0; i < nWake_; ++i) {
+            const int s = wakeList_[i];
+            if (segInput_[s] * segWakeGain_[s] > cullThreshold_ * segInputScale_[s]) wakeCoupled(s, in[s]);
+        }
+}
+
+void ModeBank::endCoupled(const SegmentIO* io, int nFrames) noexcept {
+    for (int r = 0; r < nRuns_; ++r)
+        groupBlocks_ += static_cast<std::uint64_t>((runM1_[r] - runM0_[r]) / kGroupSize);
+    sinceCull_ += nFrames;
+    if (sinceCull_ >= kCullInterval) {
+        if (cullEnabled_) cullPass(io);
+        sinceCull_ = 0;
+        for (int s = 0; s < nSeg_; ++s) segInput_[s] = 0.0f;
+    }
 }
 
 }  // namespace pm

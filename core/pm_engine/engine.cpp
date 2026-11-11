@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <complex>
 #include <numbers>
 #include <vector>
 
@@ -42,11 +43,20 @@ bool Engine::prepare(double sampleRate, int maxFrames) noexcept {
 }
 
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept {
-    return prepare(sampleRate, maxFrames, table, defaultBridge());
+    if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
+    boardModel_ = buildPlateBoard(boardCfg_.plate);
+    const double g = boardCfg_.enabled ? std::clamp(boardCfg_.sympathetic, 0.0, 1.5) : 0.0;
+    const SoundboardBridge bridge(boardModel_, sampleRate, g, &table);
+    return prepareImpl(sampleRate, maxFrames, table, bridge, boardCfg_.enabled);
 }
 
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table,
                      const BridgeAdmittance& bridge) noexcept {
+    return prepareImpl(sampleRate, maxFrames, table, bridge, false);
+}
+
+bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& table,
+                         const BridgeAdmittance& bridge, bool board) noexcept {
     prepared_ = false;
     if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
     fs_ = sampleRate;
@@ -54,15 +64,18 @@ bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table,
     table_ = table;
 
     // Normal modes of every key (non-real-time; the per-partial eigen-solves
-    // take a few milliseconds in total).
+    // and admittance sums take a fraction of a second in total).
     static const RigidBridge rigid;
     std::vector<KeyModeSet> sets(kNumKeys);
+    int bankModes[kNumKeys];
     totalModes_ = 0;
     perturbedPartials_ = uncoupledPartials_ = 0;
     for (int k = 0; k < kNumKeys; ++k) {
         const KeyParams& kp = table_.keys[k];
         sets[k] = computeKeyModes(kp, fs_, kp.bridgeCoupling ? bridge : static_cast<const BridgeAdmittance&>(rigid));
         keyModes_[k] = sets[k].count;
+        keyCoupled_[k] = sets[k].coupledModes;
+        bankModes[k] = keyBankModes(sets[k]);
         totalModes_ += keyModes_[k];
         perturbedPartials_ += sets[k].perturbedPartials;
         uncoupledPartials_ += sets[k].uncoupledPartials;
@@ -75,23 +88,91 @@ bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table,
         const double minSigma = kp.damperSigma * kp.damperFloor;
         panicAmount_[k] = static_cast<float>(minSigma > 0.0 ? std::max(1.0, kPanicSigma / minSigma) : 1.0);
     }
-    if (!bank_.allocateSegments(keyModes_, kNumKeys)) return false;
+    if (!bank_.allocateSegments(bankModes, kNumKeys)) return false;
     if (!contact_.allocate(bank_.capacity(), kNumKeys)) return false;
     if (!io_.allocate(kNumKeys) || !keyBuf_.allocate(std::size_t{kNumKeys} * kSubBlock) ||
-        !mixL_.allocate(kSubBlock) || !mixR_.allocate(kSubBlock) ||
+        !mixL_.allocate(kSubBlock) || !mixR_.allocate(kSubBlock) || !hfL_.allocate(kSubBlock) ||
+        !hfR_.allocate(kSubBlock) || !dampShape_.allocate(static_cast<std::size_t>(bank_.capacity())) ||
         !groupModes_.allocate(static_cast<std::size_t>(bank_.groupCount())))
         return false;
     for (int k = 0; k < kNumKeys; ++k) {
         loadKeyModes(bank_, contact_, k, table_.keys[k], sets[k], fs_);
+        bank_.setSegmentCoupledGroups(k, keyCoupledGroups(sets[k]));
         io_[k].out = keyBuf_.data() + std::size_t(k) * kSubBlock;
-        const int g0 = bank_.segmentFirstMode(k) / ModeBank::kGroupSize;
-        for (int g = 0; g < bank_.segmentModeCount(k) / ModeBank::kGroupSize; ++g)
-            groupModes_[g0 + g] = static_cast<std::uint8_t>(
-                std::clamp(keyModes_[k] - g * ModeBank::kGroupSize, 0, ModeBank::kGroupSize));
+        const int m0 = bank_.segmentFirstMode(k);
+        for (int i = 0; i < sets[k].count; ++i)
+            dampShape_[static_cast<std::size_t>(m0 + bankIndex(sets[k], i))] = static_cast<float>(sets[k].damperShape[i]);
+        const int g0 = m0 / ModeBank::kGroupSize;
+        const int cg = keyCoupledGroups(sets[k]);
+        for (int g = 0; g < bank_.segmentModeCount(k) / ModeBank::kGroupSize; ++g) {
+            const int used = g < cg ? sets[k].coupledModes - g * ModeBank::kGroupSize
+                                    : (sets[k].count - sets[k].coupledModes) - (g - cg) * ModeBank::kGroupSize;
+            groupModes_[g0 + g] = static_cast<std::uint8_t>(std::clamp(used, 0, ModeBank::kGroupSize));
+        }
     }
+
+    // Soundboard and coupling.
+    boardOn_ = board;
+    symGain_ = 0.0f;
+    cullOffsetDb_ = 0.0f;
+    if (board) {
+        if (!loadSoundboard(board_, boardModel_, fs_)) return false;
+        symGain_ = static_cast<float>(std::clamp(boardCfg_.sympathetic, 0.0, 1.5));
+        for (int k = 0; k < kNumKeys; ++k) {
+            keyZone_[k] = boardModel_.keyZone[k];
+            const double gk = table_.keys[k].outputGain;
+            keyZone_[k].forceScale = static_cast<float>(gk != 0.0 ? 1.0 / gk : 0.0);
+        }
+        // Static correction (soundboard_model.h): the bank applies it to its
+        // awake coupled groups; a hammer owns all of its key's modes, so the
+        // key's full taps apply while it does.
+        for (int k = 0; k < kNumKeys; ++k) {
+            bank_.computeStaticCorrection(k);
+            statK0_[k] = bank_.staticCorrection0(k);
+            statK1_[k] = bank_.staticCorrection1(k);
+        }
+        // Peak gain from a key's bank output to the output, over every key,
+        // pickup and board resonance (the modal sum evaluated at each mode's
+        // frequency), for the culling threshold.
+        double peak = 0.0;
+        for (int k = 1; k <= kNumKeys; ++k)
+            for (int p = 0; p < 2; ++p)
+                for (int m = 0; m < boardModel_.modes; ++m) {
+                    const double y = std::abs(boardModalAdmittance(
+                        boardModel_, boardModel_.shapeOfKey(k),
+                        boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, boardModel_.freq[m]));
+                    peak = std::max(peak, y * keyZone_[k - 1].forceScale * kBoardOutputGain);
+                }
+        cullOffsetDb_ = peak > 1.0 ? static_cast<float>(20.0 * std::log10(peak)) : 0.0f;
+        // Direct path gain: mean |transfer admittance| from the bridge points
+        // to the pickups over the top fifth of the modal range.
+        const double fMax = boardModel_.params.maxFreqHz;
+        double acc = 0.0;
+        int cnt = 0;
+        for (int k = 1; k <= kNumKeys; k += 3)
+            for (double f = 0.75 * fMax; f < 0.95 * fMax; f *= 1.002)
+                for (int p = 0; p < 2; ++p) {
+                    acc += std::abs(boardModalAdmittance(boardModel_, boardModel_.shapeOfKey(k),
+                                                         boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, f));
+                    ++cnt;
+                }
+        hfGain_ = static_cast<float>(cnt > 0 ? acc / cnt : 0.0);
+        // Second-order Butterworth high-pass at 0.9 fMax (bilinear).
+        const double wc = std::tan(kPi * std::min(0.9 * fMax, 0.45 * fs_) / fs_);
+        const double k2 = wc * wc, q = std::sqrt(2.0), a0 = 1.0 + q * wc + k2;
+        hpB_[0] = static_cast<float>(1.0 / a0);
+        hpB_[1] = static_cast<float>(-2.0 / a0);
+        hpB_[2] = static_cast<float>(1.0 / a0);
+        hpA_[0] = static_cast<float>(2.0 * (k2 - 1.0) / a0);
+        hpA_[1] = static_cast<float>((1.0 - q * wc + k2) / a0);
+    }
+    knockLen_ = std::max(2, static_cast<int>(0.0015 * fs_));
+    noiseCoef_ = static_cast<float>(1.0 - std::exp(-2.0 * kPi * 2000.0 / fs_));
+    pedalTau_ = 0.010 * fs_;
+
     appliedCullOn_ = cullOn_.load(std::memory_order_relaxed);
     appliedCullDb_ = cullDb_.load(std::memory_order_relaxed);
-    bank_.setCulling(appliedCullOn_, appliedCullDb_);
+    bank_.setCulling(appliedCullOn_, appliedCullDb_ - cullOffsetDb_);
     dcCoef_ = static_cast<float>(1.0 - 2.0 * kPi * 5.0 / fs_);  // 5 Hz DC blocker
     if (latency_.load(std::memory_order_relaxed) == 0)
         latency_.store(maxFrames, std::memory_order_relaxed);
@@ -111,9 +192,26 @@ void Engine::resetState() noexcept {
         hammerOfKey_[k] = -1;
         const float d = hasDamper_[k] ? 1.0f : 0.0f;
         damp_[k] = Damper{d, d, d, 0, 0, false, false};
+        applied_[k] = d;
         bank_.setSegmentDamper(k, d);
+        cullOffsetApplied_[k] = 0.0f;
+        bank_.setSegmentCullOffset(k, 0.0f, 0.0f);
         io_[k].skip = false;
+        u_[k] = uPrev_[k] = fKey_[k] = fCoupled_[k] = 0.0f;
     }
+    board_.clearState();
+    for (int z = 0; z < Soundboard::kMaxZones; ++z) zoneF_[z] = zoneD_[z] = noiseLp_[z] = 0.0f;
+    for (float& h : hpX_[0]) h = 0.0f;
+    for (float& h : hpX_[1]) h = 0.0f;
+    for (float& h : hpY_[0]) h = 0.0f;
+    for (float& h : hpY_[1]) h = 0.0f;
+    nKnocks_ = 0;
+    rng_ = 0x9E3779B9u;
+    noiseAmp_ = 0.0f;
+    pedal_ = pedalPrev_ = pedalFrom_ = 0.0f;
+    pedalStart_ = 0;
+    for (int k = 0; k < kNumKeys; ++k) keyActive_[k] = false;
+    nActiveKeys_ = nOutZones_ = 0;
     sustain_ = 0.0f;
     sostenuto_ = false;
     for (int k = 0; k < kNumKeys; ++k) sostLatched_[k] = false;
@@ -227,6 +325,12 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
                 noteOn(k, e.value, now);
             }
             break;
+        case static_cast<std::uint8_t>(EventType::KeyDownSilent):
+            if (!validKey) break;
+            keyDown_[k] = true;
+            joinLoop(k);
+            if (now >= panicUntil_) retargetDamper(k, now, static_cast<float>(kDefaultReleaseVelocity));
+            break;
         case static_cast<std::uint8_t>(EventType::NoteOff):
             if (!validKey) break;
             keyDown_[k] = false;
@@ -234,11 +338,14 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
                            e.value ? e.value / 65535.0f : static_cast<float>(kDefaultReleaseVelocity));
             break;
         case static_cast<std::uint8_t>(EventType::Sustain): {
-            const bool wasDown = sustain_ >= 0.5f;
-            sustain_ = e.value / 65535.0f;
-            if ((sustain_ >= 0.5f) != wasDown)
-                for (int i = 0; i < kNumKeys; ++i)
-                    retargetDamper(i, now, static_cast<float>(kDefaultReleaseVelocity));
+            // Continuous: the smoothed position restarts from its value at the
+            // event's exact time (sampled on the control grid by controlTick).
+            pedalFrom_ = pedalAt(now);
+            pedalStart_ = now;
+            const float next = e.value / 65535.0f;
+            if (next > sustain_)
+                for (int i = 0; i < kNumKeys; ++i) joinLoop(i);
+            sustain_ = next;
             break;
         }
         case static_cast<std::uint8_t>(EventType::Sostenuto): {
@@ -273,7 +380,8 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
                 if (static_cast<std::uint8_t>(pending_[i].e.type) != kStrikeOnly)
                     pending_[j++] = pending_[i];
             pendingCount_ = j;
-            sustain_ = 0.0f;
+            pedalFrom_ = pedalStart_ = 0;
+            pedal_ = pedalPrev_ = sustain_ = 0.0f;
             sostenuto_ = false;
             for (int i = 0; i < kNumKeys; ++i) sostLatched_[i] = false;
             unaCorda_ = 0.0f;
@@ -300,7 +408,9 @@ void Engine::noteOn(int k, std::uint16_t vel, std::int64_t now) noexcept {
     // click-free since only the decay rate changes.
     if (now >= panicUntil_) {
         damp_[k] = Damper{0.0f, 0.0f, 0.0f, now, 0, false, false};
+        applied_[k] = 0.0f;
         bank_.setSegmentDamper(k, 0.0f);
+        joinLoop(k);
     }
     const double v = hammerVelocityFor(vel / 65535.0);
     if (!strike(k, v, now)) {
@@ -349,6 +459,9 @@ bool Engine::strike(int k, double velocity, std::int64_t now) noexcept {
     const HammerKeyModes m = contact_.view(bank_, k);
     launchHammer(h.state, h.params, m, velocity);
     bank_.wakeSegment(k);
+    const float knock = knockLevel_.load(std::memory_order_relaxed);
+    if (boardOn_ && knock > 0.0f && nKnocks_ < kMaxKnocks)
+        knocks_[nKnocks_++] = Knock{k, knock * static_cast<float>(velocity), 0};
     return true;
 }
 
@@ -373,6 +486,7 @@ void Engine::releaseHammer(int a, bool report) noexcept {
             info.feltLossFraction = static_cast<float>(h.state.feltLoss / h.state.kineticEnergy0);
         strikeLog_.push(info);
     }
+    flushHammer(h.state, contact_.view(bank_, h.key));
     hammerOfKey_[h.key] = -1;
     io_[h.key].skip = false;
     bank_.wakeSegment(h.key);
@@ -384,7 +498,7 @@ void Engine::releaseHammer(int a, bool report) noexcept {
 
 float Engine::damperTarget(int k, std::int64_t now) const noexcept {
     if (now < panicUntil_) return panicAmount_[k];
-    if (!hasDamper_[k] || keyDown_[k] || sustain_ >= 0.5f || sostLatched_[k]) return 0.0f;
+    if (!hasDamper_[k] || keyDown_[k] || sostLatched_[k]) return 0.0f;
     return 1.0f;
 }
 
@@ -405,6 +519,59 @@ void Engine::retargetDamper(int k, std::int64_t now, float releaseVelocity) noex
     d.landing = landing;
 }
 
+// Displacement amplitude of key k's strings at the damper (peak estimate
+// from the normal modes' magnitudes).
+float Engine::keyAmplitude(int k) const noexcept {
+    const int m0 = bank_.segmentFirstMode(k), m1 = m0 + bank_.segmentModeCount(k);
+    double s = 0.0;
+    for (int i = m0; i < m1; ++i) {
+        const double a = std::hypot(double(bank_.stateRe(i)), double(bank_.stateIm(i))) * dampShape_[i];
+        s += a * a;
+    }
+    return static_cast<float>(std::sqrt(2.0 * s));
+}
+
+// Sustain-pedal factor of key k's damper amount (plan §1.9): felt offset e
+// from pressed (-kFeltPress, full damping) through light contact (e = 0,
+// kLightContact) to clear (+kFeltZone at the end of the transition zone,
+// +kFeltGap at full pedal). With a gap e > 0 a vibration of amplitude A
+// reaches the felt for acos(e / A) / pi of each cycle.
+float Engine::pedalFactor(int k) noexcept {
+    const float bass = 1.0f - k / float(kNumKeys - 1);
+    const float p0T = hpP0T_.load(std::memory_order_relaxed), p0B = hpP0B_.load(std::memory_order_relaxed);
+    const float w = hpW_.load(std::memory_order_relaxed);
+    const float p0 = p0T + (p0B - p0T) * bass;
+    const float t = (pedal_ - p0) / w;
+    float e;
+    if (t <= 1.0f) {
+        float x = std::clamp(t, 0.0f, 1.0f);
+        x = x * x * (3.0f - 2.0f * x);
+        e = -kFeltPress + x * (kFeltPress + kFeltZone);
+    } else {
+        const float tMax = std::max((1.0f - p0) / w, 1.0001f);
+        e = kFeltZone + (kFeltGap - kFeltZone) * std::min((t - 1.0f) / (tMax - 1.0f), 1.0f);
+    }
+    if (e <= 0.0f) return std::min(1.0f, kLightContact + (1.0f - kLightContact) * (-e / kFeltPress));
+    if (damp_[k].cur <= 0.0f) return 0.0f;  // the key holds its damper up anyway
+    const float a = keyAmplitude(k);
+    if (a <= e) return 0.0f;
+    return kLightContact * (2.0f / static_cast<float>(kPi)) * std::acos(e / a);
+}
+
+// A key whose damper starts to lift takes bridge input from this sample on.
+void Engine::joinLoop(int k) noexcept {
+    if (cullOffsetApplied_[k] != 0.0f) {
+        cullOffsetApplied_[k] = 0.0f;
+        bank_.setSegmentCullOffset(k, 0.0f, 0.0f);
+    }
+}
+
+float Engine::pedalAt(std::int64_t t) const noexcept {
+    const double x = double(t - pedalStart_) / pedalTau_;
+    if (x > 40.0) return sustain_;
+    return static_cast<float>(sustain_ + (pedalFrom_ - sustain_) * std::exp(-x));
+}
+
 // Runs on the absolute kSubBlock grid. Landing follows a raised-cosine felt
 // contact curve; lifting is linear.
 void Engine::controlTick(std::int64_t now) noexcept {
@@ -412,18 +579,50 @@ void Engine::controlTick(std::int64_t now) noexcept {
         panicUntil_ = -1;
         for (int k = 0; k < kNumKeys; ++k) retargetDamper(k, now, 1.0f);
     }
+    // Panic also damps the board (its low modes ring for seconds).
+    if (now < panicUntil_ && boardOn_)
+        board_.scaleState(static_cast<float>(std::exp(-kPanicSigma * kSubBlock / fs_)));
+    pedal_ = pedalAt(now);
+    const float speed = std::fabs(pedal_ - pedalPrev_) * static_cast<float>(fs_ / kSubBlock);
+    pedalPrev_ = pedal_;
+    int moved = 0, withDamper = 0;
+    const float dampedCull = dampedCullDb_.load(std::memory_order_relaxed);
     for (int k = 0; k < kNumKeys; ++k) {
         Damper& d = damp_[k];
-        if (!d.ramping) continue;
-        const double t = std::clamp(double(now - d.start) / d.len, 0.0, 1.0);
-        const double s = d.landing ? 0.5 - 0.5 * std::cos(kPi * t) : t;
-        d.cur = static_cast<float>(d.from + (d.to - d.from) * s);
-        if (t >= 1.0) {
-            d.cur = d.to;
-            d.ramping = false;
+        if (d.ramping) {
+            const double t = std::clamp(double(now - d.start) / d.len, 0.0, 1.0);
+            const double s = d.landing ? 0.5 - 0.5 * std::cos(kPi * t) : t;
+            d.cur = static_cast<float>(d.from + (d.to - d.from) * s);
+            if (t >= 1.0) {
+                d.cur = d.to;
+                d.ramping = false;
+            }
         }
-        bank_.setSegmentDamper(k, d.cur);
+        float a;
+        if (now < panicUntil_) a = d.cur;
+        else if (!hasDamper_[k] || d.cur <= 0.0f) a = 0.0f;
+        else a = d.cur * pedalFactor(k);
+        if (hasDamper_[k]) {
+            ++withDamper;
+            moved += d.cur > 0.0f ? 1 : 0;
+        }
+        if (a != applied_[k]) {
+            applied_[k] = a;
+            bank_.setSegmentDamper(k, a);
+        }
+        // Out of the loop only once the damper is fully seated and still (a
+        // string just being damped keeps listening while it rings down);
+        // back in at the exact time of the event that lifts it.
+        const float off = boardOn_ && a >= 1.0f && !d.ramping ? dampedCull : 0.0f;
+        if (off != cullOffsetApplied_[k]) {
+            cullOffsetApplied_[k] = off;
+            bank_.setSegmentCullOffset(k, 0.0f, off);
+        }
     }
+    // Damper-lift noise: proportional to pedal speed and to the share of
+    // dampers the pedal moves (those not already held up by their keys).
+    const float level = liftNoiseLevel_.load(std::memory_order_relaxed);
+    noiseAmp_ = boardOn_ && level > 0.0f && withDamper > 0 ? level * speed * float(moved) / float(withDamper) : 0.0f;
 }
 
 // ---------------------------------------------------------------- render
@@ -447,31 +646,163 @@ void Engine::readParams() noexcept {
     if (on != appliedCullOn_ || db != appliedCullDb_) {
         appliedCullOn_ = on;
         appliedCullDb_ = db;
-        bank_.setCulling(on, db);
+        bank_.setCulling(on, db - cullOffsetDb_);
         for (int a = 0; a < activeCount_; ++a) bank_.wakeSegment(hammers_[active_[a]].key);
     }
 }
 
-void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept {
+// One sub-block with the soundboard loop (see the header): uncoupled string
+// modes as a block, then hammers, coupled modes, board and the key inputs
+// sample by sample. Output into mixL_/mixR_ (board) and hfL_/hfR_ (direct).
+void Engine::processBoard(int n) noexcept {
     for (int a = 0; a < activeCount_; ++a) {
-        Hammer& h = hammers_[active_[a]];
-        const HammerKeyModes m = contact_.view(bank_, h.key);
-        runHammer(h.state, h.params, m, io_[h.key].out, n);
-        io_[h.key].skip = true;
+        const int k = hammers_[active_[a]].key;
+        hView_[a] = contact_.view(bank_, k);
+        io_[k].skip = true;
     }
-    bank_.processSegments(io_.data(), n);
+    bank_.processSegmentsUncoupled(io_.data(), n);
+    bank_.beginCoupled(io_.data());
 
+    // Keys that can carry a force or need an input during this sub-block.
+    // A key that wakes during it is in the wakeable list already.
+    bool want[kNumKeys] = {};
+    for (int a = 0; a < activeCount_; ++a) want[hammers_[active_[a]].key] = true;
+    const int* list = nullptr;
+    for (int i = 0, c = bank_.coupledSegments(list); i < c; ++i) want[list[i]] = true;
+    for (int i = 0, c = bank_.wakeableSegments(list); i < c; ++i) want[list[i]] = true;
+    nActiveKeys_ = 0;
+    bool zoneUsed[Soundboard::kMaxZones] = {};
+    for (int k = 0; k < kNumKeys; ++k) {
+        if (want[k] || io_[k].wrote) {
+            activeKeys_[nActiveKeys_++] = k;
+            zoneUsed[keyZone_[k].z0] = true;
+            if (keyZone_[k].w1 != 0.0f) zoneUsed[keyZone_[k].z0 + 1] = true;
+            keyActive_[k] = true;
+        } else if (keyActive_[k]) {
+            keyActive_[k] = false;
+            u_[k] = uPrev_[k] = fKey_[k] = 0.0f;
+            bank_.setCoupledInputHistory(k, 0.0f);  // its static correction restarts from rest
+        }
+    }
+    nOutZones_ = 0;
+    if (symGain_ > 0.0f)
+        for (int z = 0; z < board_.zoneCount(); ++z)
+            if (zoneUsed[z]) outZones_[nOutZones_++] = z;
+
+    const int zones = board_.zoneCount();
+    const float pi2 = 2.0f * static_cast<float>(kPi);
+    for (int i = 0; i < n; ++i) {
+        for (int a = 0; a < activeCount_; ++a) {
+            Hammer& h = hammers_[active_[a]];
+            stepHammer(h.state, h.params, hView_[a], &u_[h.key], &fKey_[h.key], 1);
+        }
+        bank_.stepCoupled(u_, fCoupled_);
+        float hl = 0.0f, hr = 0.0f;
+        for (int z = 0; z < zones; ++z) zoneF_[z] = 0.0f;
+        for (int j = 0; j < nActiveKeys_; ++j) {
+            const int k = activeKeys_[j];
+            float f;
+            if (!io_[k].skip) {
+                // The bank wrote fCoupled_ only for keys with awake coupled
+                // groups; a key without (uncoupled groups only, or asleep)
+                // has no coupled output.
+                f = (bank_.segmentHasAwakeCoupled(k) ? fCoupled_[k] : 0.0f) + (io_[k].wrote ? io_[k].out[i] : 0.0f);
+            } else {
+                f = fKey_[k] - (statK0_[k] * u_[k] + statK1_[k] * uPrev_[k]);
+            }
+            fKey_[k] = f;
+            uPrev_[k] = u_[k];
+            if (f == 0.0f) continue;
+            const KeyZone& kz = keyZone_[k];
+            const float fn = f * kz.forceScale;
+            hl += gainL_[k] * fn;
+            hr += gainR_[k] * fn;
+            zoneF_[kz.z0] += kz.w0 * fn;
+            if (kz.w1 != 0.0f) zoneF_[kz.z0 + 1] += kz.w1 * fn;
+        }
+        hfL_[i] = hl;
+        hfR_[i] = hr;
+
+        if (noiseAmp_ > 0.0f) {
+            for (int z = 0; z < zones; ++z) {
+                rng_ ^= rng_ << 13;
+                rng_ ^= rng_ >> 17;
+                rng_ ^= rng_ << 5;
+                // Uniform in [-1, 1): rms 1/sqrt(3).
+                const float w = static_cast<float>(static_cast<std::int32_t>(rng_)) * (1.0f / 2147483648.0f);
+                noiseLp_[z] += noiseCoef_ * (1.7320508f * w - noiseLp_[z]);
+                zoneF_[z] += noiseAmp_ * noiseLp_[z];
+            }
+        }
+        for (int j = 0; j < nKnocks_;) {
+            Knock& kn = knocks_[j];
+            const float f = kn.amp * 0.5f * (1.0f - std::cos(pi2 * (kn.age + 0.5f) / knockLen_));
+            const KeyZone& kz = keyZone_[kn.key];
+            zoneF_[kz.z0] += kz.w0 * f;
+            if (kz.w1 != 0.0f) zoneF_[kz.z0 + 1] += kz.w1 * f;
+            if (++kn.age >= knockLen_) knocks_[j] = knocks_[--nKnocks_];
+            else ++j;
+        }
+        board_.step(zoneF_, zoneD_, pick_, Kernel::Simd, outZones_, nOutZones_);
+        if (symGain_ > 0.0f)
+            for (int j = 0; j < nActiveKeys_; ++j) {
+                const int k = activeKeys_[j];
+                const KeyZone& kz = keyZone_[k];
+                float u = kz.w0 * zoneD_[kz.z0];
+                if (kz.w1 != 0.0f) u += kz.w1 * zoneD_[kz.z0 + 1];
+                u_[k] = symGain_ * u;
+            }
+        mixL_[i] = kBoardOutputGain * pick_[0];
+        mixR_[i] = kBoardOutputGain * pick_[1];
+    }
+    bank_.endCoupled(io_.data(), n);
+}
+
+void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept {
     float* mL = mixL_.data();
     float* mR = mixR_.data();
-    std::fill(mL, mL + n, 0.0f);
-    std::fill(mR, mR + n, 0.0f);
-    for (int k = 0; k < kNumKeys; ++k) {
-        if (!io_[k].skip && !io_[k].wrote) continue;
-        const float* y = io_[k].out;
-        const float gl = gainL_[k], gr = gainR_[k];
+    if (boardOn_) {
+        processBoard(n);
+        // Direct path, high-passed.
+        const float g = kBoardOutputGain * hfGain_;
+        float* bus[2] = {hfL_.data(), hfR_.data()};
+        float* mix[2] = {mL, mR};
+        for (int c = 0; c < 2; ++c)
+            for (int i = 0; i < n; ++i) {
+                const float x = bus[c][i];
+                const float y = hpB_[0] * x + hpB_[1] * hpX_[c][0] + hpB_[2] * hpX_[c][1] - hpA_[0] * hpY_[c][0] -
+                                hpA_[1] * hpY_[c][1];
+                hpX_[c][1] = hpX_[c][0];
+                hpX_[c][0] = x;
+                hpY_[c][1] = hpY_[c][0];
+                hpY_[c][0] = y;
+                mix[c][i] += g * y;
+            }
+        // Stereo width scales the side signal (1 at the default 0.35).
+        const float side = appliedWidth_ / 0.35f;
         for (int i = 0; i < n; ++i) {
-            mL[i] += gl * y[i];
-            mR[i] += gr * y[i];
+            const float mid = 0.5f * (mL[i] + mR[i]), sd = 0.5f * (mL[i] - mR[i]) * side;
+            mL[i] = mid + sd;
+            mR[i] = mid - sd;
+        }
+    } else {
+        for (int a = 0; a < activeCount_; ++a) {
+            Hammer& h = hammers_[active_[a]];
+            const HammerKeyModes m = contact_.view(bank_, h.key);
+            runHammer(h.state, h.params, m, io_[h.key].out, n);
+            io_[h.key].skip = true;
+        }
+        bank_.processSegments(io_.data(), n);
+        std::fill(mL, mL + n, 0.0f);
+        std::fill(mR, mR + n, 0.0f);
+        for (int k = 0; k < kNumKeys; ++k) {
+            if (!io_[k].skip && !io_[k].wrote) continue;
+            const float* y = io_[k].out;
+            const float gl = gainL_[k], gr = gainR_[k];
+            for (int i = 0; i < n; ++i) {
+                mL[i] += gl * y[i];
+                mR[i] += gr * y[i];
+            }
         }
     }
 

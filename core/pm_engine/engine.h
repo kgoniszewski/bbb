@@ -1,14 +1,50 @@
-// Piano engine, M3 (plan §4.2): 88 keys of coupled unisons (1-3 strings in
-// two polarizations, as normal modes), a hammer pool, dampers, sustain,
-// sostenuto and una corda pedals, sample-accurate event scheduling and a
-// fixed stereo output stage (no soundboard yet).
+// Piano engine, M4 (plan §4.2): 88 keys of coupled unisons (1-3 strings in
+// two polarizations, as normal modes), a hammer pool, dampers, continuous
+// sustain (half-pedal), sostenuto and una corda pedals, a modal soundboard
+// coupled to every string through the bridge, sample-accurate event
+// scheduling and a placeholder output stage.
 //
-// Pedals. Sustain (CC64) lifts every damper at half travel. Sostenuto (CC66,
-// plan §1.9): when it goes down (half travel), the keys whose dampers are
-// lifted by their own keys at that moment are latched and stay undamped
-// until it comes up. Una corda (CC67) is continuous; it is latched per
-// strike when the hammer is launched (offsets and felt of that strike), so
-// moving it never changes a sounding note or a contact in progress.
+// Soundboard loop (plan §1.6, pm_board/soundboard.h, soundboard_model.h).
+// Per sample: the hammers and the coupled string modes (partials inside the
+// board's modal range) advance with the bridge displacement computed at the
+// previous sample; every key's bridge force goes to the zone forces; the
+// board advances and returns zone displacements, mixed into each key's
+// input for the next sample (times the sympathetic gain). String modes
+// above the modal range are advanced a sub-block at a time and only drive
+// the board. The bake of every key excludes exactly what the loop feeds
+// back (no double counting). Sustain-pedal bloom, sympathetic resonance and
+// string-board hybridisation all come out of this loop; there is no special
+// case for any of them.
+//
+// Output (PLACEHOLDER until the radiation model, M5/M8): the board velocity
+// at two pickup points (bass side -> left, treble side -> right), plus a
+// high-frequency direct path for partials above the board's modal range:
+// the panned bridge forces, high-passed at 0.9 times the modal range and
+// scaled by the board's mean transfer admittance to the pickups near the
+// top of that range. Stereo width scales the side signal. Level (with the
+// MIDI dynamics mf = 80, ff = 112): mf mid-range peaks at -19 to -17 dBFS;
+// a 12-note ff cluster (all hammers at once) peaks at or below -1.3 dBFS,
+// below the limiter; fff clusters (127) touch it.
+//
+// Pedals. Sustain (CC64) is continuous (plan §1.9). The pedal position is
+// smoothed (pedal and lever inertia, 10 ms) and mapped per register to a
+// felt position: from pressed on the string (full damping) through light
+// contact, where the felt damps a vibration only for the part of the cycle
+// it reaches the felt (amplitude-dependent, 2/pi acos(gap / amplitude) of
+// the contact damping), to clear. Bass dampers lift later than treble ones.
+// The key's own damper motion (lift on note-on, landing curve on note-off)
+// multiplies the pedal's factor. Nothing is ever reset: only decay rates
+// change. Sostenuto (CC66): when it goes down (half travel), the keys whose
+// dampers are lifted by their own keys at that moment are latched and stay
+// undamped until it comes up. Una corda (CC67) is continuous; it is latched
+// per strike when the hammer is launched (offsets and felt of that strike),
+// so moving it never changes a sounding note or a contact in progress.
+//
+// Mechanical noises (plan §1.8, synthesized, switchable): a hammer-knock
+// force pulse into the key's bridge zones (1.5 ms raised cosine, peak
+// proportional to hammer velocity), and low-passed noise into every zone
+// while the sustain pedal moves the dampers (proportional to pedal speed
+// and to the share of dampers it moves).
 //
 // Threads. prepare() and the velocity-curve setter are non-real-time.
 // pushEvent() may be called from ONE producer thread concurrently with
@@ -26,11 +62,13 @@
 // culling, whose 64-sample grid is absolute, to within the culling
 // threshold).
 //
-// Output level. The output is the sum of the keys' (vertical) bridge forces
-// (times outputGain from the table) through a fixed stereo spread and a 5 Hz
-// DC blocker. Dense pedalled ff chords can exceed full scale, so the output
-// passes a soft clipper that is transparent below -1 dBFS (0.89) and never
-// reaches 1.0.
+// Soundboard off (SoundboardConfig::enabled = false, for A/B, or prepare()
+// with an explicit bridge): the M3 output, the sum of the keys' bridge
+// forces (times outputGain) through a fixed stereo spread, with the board's
+// full driving-point admittance baked and no loop.
+//
+// Both outputs pass a 5 Hz DC blocker and a soft clipper that is transparent
+// below -1 dBFS (0.89) and never reaches 1.0.
 #pragma once
 
 #include <atomic>
@@ -38,11 +76,13 @@
 
 #include "pm_base/aligned.h"
 #include "pm_base/spsc_queue.h"
+#include "pm_board/soundboard.h"
 #include "pm_engine/events.h"
 #include "pm_hammer/hammer.h"
 #include "pm_string/mode_bank.h"
 #include "pm_voicing/bridge_admittance.h"
 #include "pm_voicing/piano_table.h"
+#include "pm_voicing/soundboard_model.h"
 
 namespace pm {
 
@@ -80,6 +120,22 @@ struct StrikeInfo {
     int fallbackSolves = 0;        // contact substeps solved by the fallback
 };
 
+// Prepare-time soundboard settings (table class: they need prepare(), i.e.
+// a rebuild on a worker thread in an app, because the bake depends on them).
+struct SoundboardConfig {
+    bool enabled = true;       // false: no board, M3 output (A/B)
+    double sympathetic = 1.0;  // loop gain g, 0..1.5: 0 = the board listens, nothing is fed back
+    PlateParams plate{};
+};
+
+// Half-pedal lift curve (plan §1.9). Pedal position P in 0..1; the key's
+// felt starts to move at p0 (p0Bass for key 1, p0Treble for key 88, linear
+// in between), passes through light contact up to p0 + width (smoothstep
+// in between) and lifts clear above.
+struct HalfPedalCurve {
+    float p0Treble = 0.30f, p0Bass = 0.40f, width = 0.25f;
+};
+
 class Engine {
 public:
     static constexpr int kHammerPool = 32;
@@ -88,6 +144,16 @@ public:
     static constexpr int kMaxPending = 1024;
     static constexpr double kPanicSigma = 70.0;  // 1/s: every partial T60 <= 0.1 s
     static constexpr double kPanicSeconds = 0.3;
+    // Felt geometry of the half-pedal model (m) and the damping fraction at
+    // the point of light contact.
+    // Through the transition zone the felt rises from kFeltPress into the
+    // string to kFeltZone above it (comparable to the strings' vibration,
+    // so that contact is partial across the zone); above the zone it lifts
+    // on to kFeltGap at full pedal.
+    static constexpr float kFeltPress = 0.15e-3f, kFeltZone = 0.1e-3f, kFeltGap = 3.0e-3f, kLightContact = 0.15f;
+    static constexpr int kMaxKnocks = 32;
+    // Output scale of the board path, per m/s of pickup velocity.
+    static constexpr float kBoardOutputGain = 5.0f;
 
     Engine() = default;
     Engine(const Engine&) = delete;
@@ -100,8 +166,12 @@ public:
     // buffer the host will render (used as the default constant latency).
     bool prepare(double sampleRate, int maxFrames) noexcept;
     bool prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept;
+    // Soundboard off, with the given bridge admittance baked (tests, A/B).
     bool prepare(double sampleRate, int maxFrames, const PianoTable& table,
                  const BridgeAdmittance& bridge) noexcept;
+    // Non-real-time, before prepare().
+    void setSoundboardConfig(const SoundboardConfig& c) noexcept { boardCfg_ = c; }
+    const SoundboardConfig& soundboardConfig() const noexcept { return boardCfg_; }
     bool prepared() const noexcept { return prepared_; }
 
     // Producer thread. Returns false (and counts a drop) when the queue is full.
@@ -120,6 +190,36 @@ public:
     void setConstantLatencyFrames(int frames) noexcept {
         latency_.store(frames < 0 ? 0 : frames, std::memory_order_relaxed);
     }
+    // Mechanical noises: hammer knock (N of peak force per m/s of hammer
+    // velocity) and damper-lift noise (N rms per unit of pedal travel per
+    // second, at full share of dampers moved); 0 switches a noise off.
+    void setNoiseLevels(float knock, float damperLift) noexcept {
+        knockLevel_.store(knock < 0.0f ? 0.0f : knock, std::memory_order_relaxed);
+        liftNoiseLevel_.store(damperLift < 0.0f ? 0.0f : damperLift, std::memory_order_relaxed);
+    }
+    float knockLevel() const noexcept { return knockLevel_.load(std::memory_order_relaxed); }
+    float damperNoiseLevel() const noexcept { return liftNoiseLevel_.load(std::memory_order_relaxed); }
+    void setHalfPedalCurve(const HalfPedalCurve& c) noexcept {
+        hpP0T_.store(c.p0Treble, std::memory_order_relaxed);
+        hpP0B_.store(c.p0Bass, std::memory_order_relaxed);
+        hpW_.store(c.width < 0.01f ? 0.01f : c.width, std::memory_order_relaxed);
+    }
+    HalfPedalCurve halfPedalCurve() const noexcept {
+        return {hpP0T_.load(std::memory_order_relaxed), hpP0B_.load(std::memory_order_relaxed),
+                hpW_.load(std::memory_order_relaxed)};
+    }
+    // Keys whose damper is seated are woken (or kept awake) by sympathetic
+    // input only above the culling threshold plus this many dB (plan §1.5:
+    // with the pedal up only held notes and the undamped top section stay
+    // awake). The bank's input bound is frequency-blind, so it cannot tell
+    // that a damped string hardly responds away from its partials; the
+    // default 120 dB means a seated damper's strings are never woken by the
+    // bridge (they drop out of the loop until struck or lifted). Their own
+    // decay (a release tail) is culled at the normal threshold.
+    void setDampedCullOffsetDb(float db) noexcept {
+        dampedCullDb_.store(db < 0.0f ? 0.0f : db, std::memory_order_relaxed);
+    }
+    float dampedCullOffsetDb() const noexcept { return dampedCullDb_.load(std::memory_order_relaxed); }
     void setCulling(bool enabled, float thresholdDb) noexcept {
         cullOn_.store(enabled, std::memory_order_relaxed);
         cullDb_.store(thresholdDb, std::memory_order_relaxed);
@@ -152,7 +252,14 @@ public:
     const ModeBank& bank() const noexcept { return bank_; }
     int keyModeCount(int key) const noexcept { return keyModes_[key]; }
     int freeHammers() const noexcept { return freeCount_; }
-    float sustain() const noexcept { return sustain_; }
+    float sustain() const noexcept { return sustain_; }        // pedal target 0..1
+    float pedalPosition() const noexcept { return pedal_; }    // smoothed
+    bool soundboardActive() const noexcept { return boardOn_; }
+    const Soundboard& soundboard() const noexcept { return board_; }
+    const BoardModel& boardModel() const noexcept { return boardModel_; }
+    float sympatheticGain() const noexcept { return symGain_; }
+    // Key segment layout (bank modes incl. padding) and the key's coupled modes.
+    int keyCoupledModes(int key) const noexcept { return keyCoupled_[key]; }
     bool sostenutoDown() const noexcept { return sostenuto_; }
     bool sostenutoLatched(int key) const noexcept { return sostLatched_[key]; }
     float unaCorda() const noexcept { return unaCorda_; }
@@ -160,7 +267,8 @@ public:
     // uncoupled oscillators, over all keys (from prepare).
     int perturbedPartials() const noexcept { return perturbedPartials_; }
     int uncoupledPartials() const noexcept { return uncoupledPartials_; }
-    float damperAmount(int key) const noexcept { return damp_[key].cur; }
+    // Damper amount applied to the key's modes (0 lifted, 1 seated).
+    float damperAmount(int key) const noexcept { return applied_[key]; }
 
 private:
     struct Pending {
@@ -195,6 +303,12 @@ private:
     void retargetDamper(int k, std::int64_t now, float releaseVelocity) noexcept;
     void controlTick(std::int64_t now) noexcept;
     void processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept;
+    void processBoard(int n) noexcept;
+    bool prepareImpl(double sampleRate, int maxFrames, const PianoTable& table, const BridgeAdmittance& bridge,
+                     bool board) noexcept;
+    float pedalFactor(int k) noexcept;
+    void joinLoop(int k) noexcept;
+    float keyAmplitude(int k) const noexcept;
 
     bool prepared_ = false;
     double fs_ = 48000.0;
@@ -211,6 +325,53 @@ private:
     AlignedArray<std::uint8_t> groupModes_;  // modes in use per bank group
     AlignedArray<float> keyBuf_;   // kNumKeys x kSubBlock
     AlignedArray<float> mixL_, mixR_;
+    AlignedArray<float> hfL_, hfR_;       // high-frequency direct bus, kSubBlock
+    AlignedArray<float> dampShape_;       // per bank mode: displacement at the damper per |z|
+
+    // Soundboard.
+    SoundboardConfig boardCfg_{};
+    BoardModel boardModel_{};
+    Soundboard board_;
+    bool boardOn_ = false;
+    float symGain_ = 0.0f;
+    KeyZone keyZone_[kNumKeys]{};
+    int keyCoupled_[kNumKeys]{};
+    float u_[kNumKeys]{}, uPrev_[kNumKeys]{}, fKey_[kNumKeys]{}, fCoupled_[kNumKeys]{};
+    float statK0_[kNumKeys]{}, statK1_[kNumKeys]{};  // static correction taps (soundboard_model.h)
+    // Keys taking part in the loop during the current sub-block (a hammer,
+    // awake groups, or wakeable by input) and the zones they read.
+    int activeKeys_[kNumKeys]{};
+    int nActiveKeys_ = 0;
+    bool keyActive_[kNumKeys]{};
+    int outZones_[Soundboard::kMaxZones]{};
+    int nOutZones_ = 0;
+    float zoneF_[Soundboard::kMaxZones]{}, zoneD_[Soundboard::kMaxZones]{}, pick_[Soundboard::kMaxPickups]{};
+    float hfGain_ = 0.0f;
+    // The culling threshold refers to the output; through the board a bank
+    // output unit can reach the output amplified by up to this (dB).
+    float cullOffsetDb_ = 0.0f;
+    float hpB_[3]{}, hpA_[2]{};           // high-pass biquad (direct form I)
+    float hpX_[2][2]{}, hpY_[2][2]{};
+    HammerKeyModes hView_[kHammerPool]{};
+    struct Knock {
+        int key;
+        float amp;
+        int age;
+    };
+    Knock knocks_[kMaxKnocks]{};
+    int nKnocks_ = 0;
+    int knockLen_ = 72;
+    std::uint32_t rng_ = 0x9E3779B9u;
+    float noiseLp_[Soundboard::kMaxZones]{};
+    float noiseCoef_ = 0.2f;
+    float noiseAmp_ = 0.0f;
+    // Smoothed pedal: an exponential from pedalFrom_ at the exact time of the
+    // last pedal event towards sustain_, sampled on the control grid.
+    float pedal_ = 0.0f, pedalPrev_ = 0.0f, pedalFrom_ = 0.0f;
+    std::int64_t pedalStart_ = 0;
+    double pedalTau_ = 480.0;  // samples
+    float pedalAt(std::int64_t t) const noexcept;
+    float applied_[kNumKeys]{};
 
     // Keys, dampers, pedal.
     bool keyDown_[kNumKeys]{};
@@ -262,6 +423,11 @@ private:
     std::atomic<int> latency_{0};
     std::atomic<bool> cullOn_{true};
     std::atomic<float> cullDb_{-100.0f};
+    std::atomic<float> dampedCullDb_{120.0f};
+    float cullOffsetApplied_[kNumKeys]{};
+    std::atomic<float> knockLevel_{0.02f};
+    std::atomic<float> liftNoiseLevel_{0.004f};
+    std::atomic<float> hpP0T_{0.30f}, hpP0B_{0.40f}, hpW_{0.25f};
 
     // Statistics.
     SpscQueue<StrikeInfo, 256> strikeLog_;
