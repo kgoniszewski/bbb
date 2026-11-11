@@ -9,6 +9,22 @@
 #include "pm_base/denormals.h"
 #include "pm_voicing/key_loader.h"
 
+// Per-phase timers (EngineProfile, engine.h): only in the profiling build
+// pm_engine_profile; in the real-time library these expand to nothing.
+#if defined(PM_PROFILE)
+#include <chrono>
+#define PM_PROF_START(t) auto t = std::chrono::steady_clock::now()
+#define PM_PROF_LAP(phase, t)                                                                       \
+    do {                                                                                          \
+        const auto pmNow = std::chrono::steady_clock::now();                                      \
+        prof_.us[EngineProfile::phase] += std::chrono::duration<double, std::micro>(pmNow - t).count(); \
+        t = pmNow;                                                                                \
+    } while (0)
+#else
+#define PM_PROF_START(t) ((void)0)
+#define PM_PROF_LAP(phase, t) ((void)0)
+#endif
+
 namespace pm {
 
 namespace {
@@ -687,6 +703,7 @@ void Engine::readParams() noexcept {
 // to the strings' state (CouplingLoop, pm_board/soundboard.h). Output into
 // mixL_/mixR_ (board) and hfL_/hfR_ (direct).
 void Engine::processBoard(int n) noexcept {
+    PM_PROF_START(tp);
     for (int a = 0; a < activeCount_; ++a) {
         const int k = hammers_[active_[a]].key;
         hView_[a] = contact_.view(bank_, k);
@@ -697,7 +714,9 @@ void Engine::processBoard(int n) noexcept {
         const int k = hammers_[active_[a]].key;
         uPrev_[k] = bank_.coupledInputHistory(k);
     }
+    PM_PROF_LAP(Events, tp);
     bank_.processSegmentsFree(io_.data(), n);
+    PM_PROF_LAP(FreePass, tp);
     loop_.collect(bank_, io_.data(), n);
     const int* outZones = nullptr;
     const int nOut = loop_.outZones(outZones);
@@ -707,6 +726,7 @@ void Engine::processBoard(int n) noexcept {
     for (int i = 0; i < n; ++i) {
         for (int z = 0; z < zones; ++z) zoneF_[z] = 0.0f;
         hfL_[i] = hfR_[i] = 0.0f;
+        PM_PROF_LAP(Board, tp);
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
             const int k = h.key;
@@ -724,6 +744,7 @@ void Engine::processBoard(int n) noexcept {
             zoneF_[kz.z0] += kz.w0 * fn;
             if (kz.w1 != 0.0f) zoneF_[kz.z0 + 1] += kz.w1 * fn;
         }
+        PM_PROF_LAP(Hammers, tp);
         float tap[2] = {0.0f, 0.0f};
         loop_.forces(i, zoneF_, tap);
         hfL_[i] += tap[0];
@@ -754,7 +775,9 @@ void Engine::processBoard(int n) noexcept {
         mixL_[i] = kBoardOutputGain * pick_[0];
         mixR_[i] = kBoardOutputGain * pick_[1];
     }
+    PM_PROF_LAP(Board, tp);
     loop_.end(bank_, io_.data(), n);
+    PM_PROF_LAP(ForcedPass, tp);
     bank_.endCoupled(io_.data(), n);
 }
 
@@ -786,13 +809,16 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
             mR[i] = mid - sd;
         }
     } else {
+        PM_PROF_START(tp);
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
             const HammerKeyModes m = contact_.view(bank_, h.key);
             runHammer(h.state, h.params, m, io_[h.key].out, n);
             io_[h.key].skip = true;
         }
+        PM_PROF_LAP(Hammers, tp);
         bank_.processSegments(io_.data(), n);
+        PM_PROF_LAP(FreePass, tp);
         std::fill(mL, mL + n, 0.0f);
         std::fill(mR, mR + n, 0.0f);
         for (int k = 0; k < kNumKeys; ++k) {
@@ -851,12 +877,19 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
         return;
     }
     ScopedFlushDenormals ftz;
+#if defined(PM_PROFILE)
+    prof_ = EngineProfile{};
+    const auto tRender = std::chrono::steady_clock::now();
+#endif
+    PM_PROF_START(te);
     readParams();
     drainQueue(clock);
+    PM_PROF_LAP(Events, te);
 
     int pos = 0;
     while (pos < nFrames) {
         const std::int64_t now = static_cast<std::int64_t>(sampleTime_) + pos;
+        PM_PROF_START(tev);
         while (pendingCount_ > 0 && pending_[0].when <= now) {
             const Event e = pending_[0].e;
             --pendingCount_;
@@ -864,6 +897,7 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             applyEvent(e, now);
         }
         if (now % kSubBlock == 0) controlTick(now);
+        PM_PROF_LAP(Events, tev);
         std::int64_t len = std::min<std::int64_t>(nFrames - pos, kSubBlock - now % kSubBlock);
         if (pendingCount_ > 0) len = std::min<std::int64_t>(len, pending_[0].when - now);
         for (int a = 0; a < activeCount_; ++a) {
@@ -890,6 +924,9 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     pub_.limited.store(limited_, std::memory_order_relaxed);
     pub_.nonFinite.store(nonFinite_, std::memory_order_relaxed);
     pub_.peakPre.store(peakPre_, std::memory_order_relaxed);
+#if defined(PM_PROFILE)
+    prof_.totalUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tRender).count();
+#endif
 }
 
 }  // namespace pm

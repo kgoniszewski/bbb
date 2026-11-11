@@ -112,6 +112,26 @@ struct EngineStats {
     float peakPreLimiter = 0.0f;
 };
 
+#if defined(PM_PROFILE)
+// Per-phase wall time of the last render() call, in microseconds. Only in
+// the profiling build of the engine (pm_engine_profile, which bench_engine
+// links); the real-time library has no timers. Everything not listed
+// (output mixing and filters, limiter, cull passes, hammer release,
+// statistics) is totalUs minus the sum of the phases.
+struct EngineProfile {
+    enum Phase : int {
+        Events = 0,  // event handling, control tick (dampers, pedal), loop begin: wake-ups, impulse-response cache, kernel rebuild
+        Hammers,     // hammer contact solves (board on: per sample, inside the loop)
+        FreePass,    // bank block pass (board on: free responses; board off: the whole bank)
+        ForcedPass,  // loop end: input added to the coupled modes (forced kernel), sub-block wake-ups
+        Board,       // zone kernel (free forces, convolution), noise, knocks, board step
+        kPhases
+    };
+    double us[kPhases] = {};
+    double totalUs = 0.0;
+};
+#endif
+
 // Reported once per strike, when its hammer has left the string for good.
 struct StrikeInfo {
     std::uint64_t sampleTime = 0;  // launch
@@ -266,6 +286,10 @@ public:
 
     // Safe to read from another thread (relaxed snapshot).
     EngineStats stats() const noexcept;
+#if defined(PM_PROFILE)
+    // Profiling build only: the phases of the last render() (same thread).
+    const EngineProfile& profile() const noexcept { return prof_; }
+#endif
 
     // Inspection, for tools and tests (not thread-safe against render()).
     double sampleRate() const noexcept { return fs_; }
@@ -457,6 +481,9 @@ private:
         std::atomic<std::uint64_t> deferred{0}, late{0}, limited{0}, nonFinite{0};
         std::atomic<float> peakPre{0.0f};
     } pub_;
+#if defined(PM_PROFILE)
+    EngineProfile prof_;
+#endif
 };
 
 }  // namespace pm

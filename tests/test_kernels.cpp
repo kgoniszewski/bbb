@@ -1,9 +1,12 @@
 // Scalar reference kernel versus SIMD kernel (plan §4.2, §5.4).
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <random>
+#include <utility>
 #include <vector>
 
+#include "pm_base/aligned.h"
 #include "signal_utils.h"
 #include "test_harness.h"
 
@@ -201,4 +204,32 @@ TEST(block_coupled_matches_per_sample_input) {
         CHECK_LE(worstState, 1e-5);
         CHECK_LE(worstOut, 1e-4 * peak);
     }
+}
+
+// Large arrays allocated together start at distinct cache-line offsets
+// modulo 4 KiB and 16 KiB (aligned.h), so kernels that stream them in
+// lockstep at equal indices never map them all to one cache set.
+TEST(large_arrays_are_staggered_across_cache_sets) {
+    constexpr int kArrays = 20;
+    constexpr std::size_t kCount = 18336;  // a full-piano bank's capacity
+    AlignedArray<float> a[kArrays];
+    bool seen4k[64] = {}, seen16k[256] = {};
+    for (int j = 0; j < kArrays; ++j) {
+        CHECK(a[j].allocate(kCount));
+        const auto addr = reinterpret_cast<std::uintptr_t>(a[j].data());
+        CHECK(addr % kCacheLine == 0);
+        const std::size_t l4 = (addr % 4096) / kCacheLine, l16 = (addr % 16384) / kCacheLine;
+        CHECK(!seen4k[l4]);
+        CHECK(!seen16k[l16]);
+        seen4k[l4] = seen16k[l16] = true;
+        bool zero = true;
+        for (std::size_t i = 0; i < kCount; ++i) zero = zero && a[j][i] == 0.0f;
+        CHECK(zero);
+        a[j][kCount - 1] = 1.0f;
+    }
+    AlignedArray<float> moved(std::move(a[0]));
+    CHECK(moved.size() == kCount && moved[kCount - 1] == 1.0f && a[0].data() == nullptr);
+    AlignedArray<float> small;
+    CHECK(small.allocate(100));
+    CHECK(reinterpret_cast<std::uintptr_t>(small.data()) % kCacheLine == 0);
 }
