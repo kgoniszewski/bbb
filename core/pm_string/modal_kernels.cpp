@@ -28,8 +28,10 @@ void runModesScalar(const BankView& b, const int* groups, int nGroups, const flo
     }
 }
 
-void impulseScalar(const BankView& b, const int* groups, int nGroups, float* out, int n) noexcept {
+void impulseScalar(const BankView& b, const int* groups, int nGroups, float* out, int stride, int n) noexcept {
     for (int gi = 0; gi < nGroups; ++gi) {
+        float* o = out + gi * stride;
+        for (int k = 0; k < n; ++k) o[k] = 0.0f;
         const int m0 = groups[gi] * ModeBank::kGroupSize;
         for (int m = m0; m < m0 + ModeBank::kGroupSize; ++m) {
             const float dr = b.dr[m], ci = b.ci[m], wo = b.wOut[m];
@@ -39,7 +41,7 @@ void impulseScalar(const BankView& b, const int* groups, int nGroups, float* out
                 const float ni = (zi + dr * zi) + ci * zr;
                 zr = nr;
                 zi = ni;
-                out[k] += wo * zi;
+                o[k] += wo * zi;
             }
         }
     }
@@ -49,11 +51,20 @@ void forcedScalar(const BankView& b, const int* groups, int nGroups, const float
     for (int gi = 0; gi < nGroups; ++gi) {
         const int m0 = groups[gi] * ModeBank::kGroupSize;
         for (int m = m0; m < m0 + ModeBank::kGroupSize; ++m) {
-            const float dr = b.dr[m], ci = b.ci[m];
+            // Same evaluation order as the SIMD kernel.
+            const float cr = 1.0f + b.dr[m], ci = b.ci[m];
+            const float qr = cr * cr - ci * ci, qi = cr * ci + cr * ci;
             float ar = 0.0f, ai = 0.0f;
-            for (int k = 0; k < n; ++k) {
-                const float nr = ((ar + u[k]) + dr * ar) - ci * ai;
-                const float ni = (ai + dr * ai) + ci * ar;
+            int k = 0;
+            for (; k + 2 <= n; k += 2) {
+                const float nr = qr * ar + (((cr * u[k]) + u[k + 1]) - qi * ai);
+                const float ni = qr * ai + (qi * ar + ci * u[k]);
+                ar = nr;
+                ai = ni;
+            }
+            if (k < n) {
+                const float nr = cr * ar + (u[k] - ci * ai);
+                const float ni = cr * ai + ci * ar;
                 ar = nr;
                 ai = ni;
             }
@@ -81,6 +92,20 @@ static_assert(ModeBank::kGroupSize % kWidth == 0, "group must be a whole number 
 //   AVX2: 4 groups = 8 vectors of 8 (measured best on x86: 1/2/4 groups gave
 //         0.27/0.13/0.115 ns per mode-sample).
 //   SSE2: 2 groups (1/2/4 measured within 15 %; no FMA, throughput-bound).
+// Mode vectors per step of the forced pass (six registers each). Measured
+// on x86 (forced pass alone, ns per mode and sample for 1 / 2 / 4 vectors):
+//   SSE2: 0.27 / 0.20 / 0.18 -> 4 (the free pass: 0.31)
+//   AVX2: 0.09 / 0.13 / 0.11 -> 1 (the free pass: 0.19)
+//   NEON (32 registers): 4. NOT yet measured on Apple silicon; tune with
+//   -DPM_FORCED_VECTORS_PER_STEP=N (1, 2 or a multiple of the group).
+#if defined(PM_FORCED_VECTORS_PER_STEP)
+constexpr int kForcedVectorsPerStep = PM_FORCED_VECTORS_PER_STEP;
+#elif defined(PM_SIMD_AVX2)
+constexpr int kForcedVectorsPerStep = 1;
+#else
+constexpr int kForcedVectorsPerStep = 4;
+#endif
+
 #if defined(PM_GROUPS_PER_STEP)
 constexpr int kGroupsPerStep = PM_GROUPS_PER_STEP;
 #elif defined(PM_SIMD_AVX2)
@@ -92,9 +117,7 @@ constexpr int kGroupsPerStep = 2;
 // HasInput = false is the free-running case (every key in the engine: the
 // hammer solver drives its modes itself): four FMAs and one output FMA per
 // mode and sample. With an input the complex input weight adds two.
-// Impulse = true: start from the input weight instead of the state and do
-// not store the state (impulse response, see modal_kernels.h).
-template <int NG, bool HasInput, bool Impulse = false>
+template <int NG, bool HasInput>
 inline void step(const BankView& b, const int* groups, const float* in, float* scratch,
                  int n) noexcept {
     constexpr int NV = NG * kVecPerGroup;
@@ -104,8 +127,8 @@ inline void step(const BankView& b, const int* groups, const float* in, float* s
     int base[NV];
     for (int v = 0; v < NV; ++v) {
         base[v] = groups[v / kVecPerGroup] * ModeBank::kGroupSize + (v % kVecPerGroup) * kWidth;
-        zr[v] = load((Impulse ? b.wInRe : b.zr) + base[v]);
-        zi[v] = load((Impulse ? b.wInIm : b.zi) + base[v]);
+        zr[v] = load(b.zr + base[v]);
+        zi[v] = load(b.zi + base[v]);
         dr[v] = load(b.dr + base[v]);
         ci[v] = load(b.ci + base[v]);
         wo[v] = load(b.wOut + base[v]);
@@ -137,31 +160,77 @@ inline void step(const BankView& b, const int* groups, const float* in, float* s
         }
         store(scratch + k * kWidth, add(acc0, acc1));
     }
-    if constexpr (!Impulse)
-        for (int v = 0; v < NV; ++v) {
-            store(b.zr + base[v], zr[v]);
-            store(b.zi + base[v], zi[v]);
-        }
+    for (int v = 0; v < NV; ++v) {
+        store(b.zr + base[v], zr[v]);
+        store(b.zi + base[v], zi[v]);
+    }
 }
 
-// Horner accumulation of the input in c for NG groups at once (in registers).
+// Impulse responses of NG groups at once, one output row per group (same
+// per-mode operation order as step()).
 template <int NG>
-inline void forcedStep(const BankView& b, const int* groups, const float* u, int n) noexcept {
+inline void impulseStep(const BankView& b, const int* groups, float* out, int stride, int n) noexcept {
     constexpr int NV = NG * kVecPerGroup;
-    vf ar[NV], ai[NV], dr[NV], ci[NV];
+    vf zr[NV], zi[NV], dr[NV], ci[NV], wo[NV];
     int base[NV];
     for (int v = 0; v < NV; ++v) {
         base[v] = groups[v / kVecPerGroup] * ModeBank::kGroupSize + (v % kVecPerGroup) * kWidth;
+        zr[v] = load(b.wInRe + base[v]);
+        zi[v] = load(b.wInIm + base[v]);
         dr[v] = load(b.dr + base[v]);
         ci[v] = load(b.ci + base[v]);
+        wo[v] = load(b.wOut + base[v]);
+    }
+    for (int k = 0; k < n; ++k) {
+        for (int q = 0; q < NG; ++q) {
+            vf acc = zero();
+            for (int v = q * kVecPerGroup; v < (q + 1) * kVecPerGroup; ++v) {
+                const vf nr = fnmadd(ci[v], zi[v], fmadd(dr[v], zr[v], zr[v]));
+                const vf ni = fmadd(ci[v], zr[v], fmadd(dr[v], zi[v], zi[v]));
+                zr[v] = nr;
+                zi[v] = ni;
+                acc = fmadd(wo[v], ni, acc);
+            }
+            out[q * stride + k] = hsum(acc);
+        }
+    }
+}
+
+// Horner accumulation of the input for NV mode vectors at once (in
+// registers), two samples per step:
+//   acc <- c^2 acc + (c u[k] + u[k+1])
+// which needs three operations per component and sample pair against four
+// per sample, with a dependent chain of two operations per pair. It uses c
+// itself rather than the d = c - 1 form of the state recursion: the sum runs
+// over one sub-block only, where |c| resolved to 6e-8 changes the result by
+// about 1e-6 relative.
+template <int NV>
+inline void forcedStep(const BankView& b, const int* base, const float* u, int n) noexcept {
+    vf ar[NV], ai[NV], cr[NV], ci[NV], qr[NV], qi[NV];
+    const vf one = set1(1.0f);
+    for (int v = 0; v < NV; ++v) {
+        cr[v] = add(one, load(b.dr + base[v]));
+        ci[v] = load(b.ci + base[v]);
+        qr[v] = fnmadd(ci[v], ci[v], mul(cr[v], cr[v]));  // c^2
+        qi[v] = add(mul(cr[v], ci[v]), mul(cr[v], ci[v]));
         ar[v] = zero();
         ai[v] = zero();
     }
-    for (int k = 0; k < n; ++k) {
+    int k = 0;
+    for (; k + 2 <= n; k += 2) {
+        const vf x0 = set1(u[k]), x1 = set1(u[k + 1]);
+        for (int v = 0; v < NV; ++v) {
+            const vf nr = fmadd(qr[v], ar[v], fnmadd(qi[v], ai[v], fmadd(cr[v], x0, x1)));
+            const vf ni = fmadd(qr[v], ai[v], fmadd(qi[v], ar[v], mul(ci[v], x0)));
+            ar[v] = nr;
+            ai[v] = ni;
+        }
+    }
+    if (k < n) {
         const vf x = set1(u[k]);
         for (int v = 0; v < NV; ++v) {
-            const vf nr = fnmadd(ci[v], ai[v], fmadd(dr[v], ar[v], add(ar[v], x)));
-            const vf ni = fmadd(ci[v], ar[v], fmadd(dr[v], ai[v], ai[v]));
+            const vf nr = fmadd(cr[v], ar[v], fnmadd(ci[v], ai[v], x));
+            const vf ni = fmadd(cr[v], ai[v], mul(ci[v], ar[v]));
             ar[v] = nr;
             ai[v] = ni;
         }
@@ -184,23 +253,38 @@ void runAll(const BankView& b, const int* groups, int nGroups, const float* in, 
 
 }  // namespace
 
-void impulseSimd(const BankView& b, const int* groups, int nGroups, float* out, int n,
-                 float* scratch) noexcept {
-    for (int k = 0; k < n; ++k) store(scratch + k * kWidth, zero());
+void impulseSimd(const BankView& b, const int* groups, int nGroups, float* out, int stride, int n) noexcept {
     int gi = 0;
     for (; gi + kGroupsPerStep <= nGroups; gi += kGroupsPerStep)
-        step<kGroupsPerStep, false, true>(b, groups + gi, nullptr, scratch, n);
-    for (; gi < nGroups; ++gi) step<1, false, true>(b, groups + gi, nullptr, scratch, n);
-    for (int k = 0; k < n; ++k) out[k] += hsum(load(scratch + k * kWidth));
+        impulseStep<kGroupsPerStep>(b, groups + gi, out + gi * stride, stride, n);
+    for (; gi < nGroups; ++gi) impulseStep<1>(b, groups + gi, out + gi * stride, stride, n);
 }
 
-// No output and no input weights in the loop: four FMAs and an add per mode
-// and sample, so more groups fit in registers than in step().
+// Six vectors live per mode vector (ar, ai, c, c^2), so the register block
+// is counted in vectors, not groups.
 void forcedSimd(const BankView& b, const int* groups, int nGroups, const float* u, int n) noexcept {
-    constexpr int G = kGroupsPerStep;
-    int gi = 0;
-    for (; gi + G <= nGroups; gi += G) forcedStep<G>(b, groups + gi, u, n);
-    for (; gi < nGroups; ++gi) forcedStep<1>(b, groups + gi, u, n);
+    constexpr int NV = kForcedVectorsPerStep;
+    static_assert(kVecPerGroup % NV == 0 || NV % kVecPerGroup == 0, "register block must tile groups");
+    int base[NV];
+    if constexpr (NV <= kVecPerGroup) {
+        for (int gi = 0; gi < nGroups; ++gi)
+            for (int v0 = 0; v0 < kVecPerGroup; v0 += NV) {
+                for (int v = 0; v < NV; ++v) base[v] = groups[gi] * ModeBank::kGroupSize + (v0 + v) * kWidth;
+                forcedStep<NV>(b, base, u, n);
+            }
+    } else {
+        constexpr int G = NV / kVecPerGroup;
+        int gi = 0;
+        for (; gi + G <= nGroups; gi += G) {
+            for (int v = 0; v < NV; ++v)
+                base[v] = groups[gi + v / kVecPerGroup] * ModeBank::kGroupSize + (v % kVecPerGroup) * kWidth;
+            forcedStep<NV>(b, base, u, n);
+        }
+        for (; gi < nGroups; ++gi) {
+            for (int v = 0; v < kVecPerGroup; ++v) base[v] = groups[gi] * ModeBank::kGroupSize + v * kWidth;
+            forcedStep<kVecPerGroup>(b, base, u, n);
+        }
+    }
 }
 
 void runModesSimd(const BankView& b, const int* groups, int nGroups, const float* in,

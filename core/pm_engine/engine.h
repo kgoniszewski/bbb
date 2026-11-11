@@ -23,9 +23,10 @@
 // the panned bridge forces, high-passed at 0.9 times the modal range and
 // scaled by the board's mean transfer admittance to the pickups near the
 // top of that range. Stereo width scales the side signal. Level (with the
-// MIDI dynamics mf = 80, ff = 112): mf mid-range peaks at -19 to -17 dBFS;
-// a 12-note ff cluster (all hammers at once) peaks at or below -1.3 dBFS,
-// below the limiter; fff clusters (127) touch it.
+// MIDI dynamics mf = 80, ff = 112): mf single notes C3-C5 peak at -33 to
+// -22 dBFS, velocity 127 at -17 dBFS at most; 12-note clusters every 100 ms
+// at -7 (ff) to -5 dBFS (127, pedal down); all 88 keys at velocity 127 at
+// once -1.4 dBFS, just below the limiter.
 //
 // Pedals. Sustain (CC64) is continuous (plan §1.9). The pedal position is
 // smoothed (pedal and lever inertia, 10 ms) and mapped per register to a
@@ -56,12 +57,16 @@
 //
 // Determinism. The buffer is split at event times, on an absolute grid of
 // kSubBlock frames (control-rate state: damper envelopes) and on a grid
-// relative to each active hammer's launch (hammer release). Output therefore
-// does not depend on how the host cuts the stream into buffers (bit-exact),
-// and an event lands on its exact sample: a note-on moved by k samples gives
-// the same output moved by k samples, bit-exact without culling (with
-// culling, whose 64-sample grid is absolute, to within the culling
-// threshold).
+// relative to each active hammer's launch (hammer release), and every
+// decision with a lasting effect (wake-ups, hammer release, damper motion)
+// is taken at a sample fixed relative to those. Output therefore does not
+// depend on how the host cuts the stream into buffers, and an event lands
+// on its exact sample: a note-on moved by k samples gives the same output
+// moved by k samples. Both hold to rounding (-100 to -110 dB re peak), not
+// bit-exactly: the soundboard loop sums its forced response per sub-block,
+// so where a buffer boundary or an event cuts a sub-block changes the
+// rounding. (With culling, whose 64-sample grid is absolute, a moved note
+// also differs to within the culling threshold.)
 //
 // Soundboard off (SoundboardConfig::enabled = false, for A/B, or prepare()
 // with an explicit bridge): the M3 output, the sum of the keys' bridge
@@ -121,11 +126,24 @@ struct StrikeInfo {
     int fallbackSolves = 0;        // contact substeps solved by the fallback
 };
 
+// Quality tiers of the string-board loop (plan §4.1): which partials are
+// fed back by the loop (sympathetic exchange, bloom, hybridisation with
+// board modes) and which bake the full driving-point admittance and only
+// drive the board. The cost of the loop is proportional to the fed-back
+// partials. Bands: Full 5 kHz (the board's modal range), Balanced 2 kHz
+// (half the fed-back modes; pedal bloom within 0.7 dB per third octave of
+// Full), Eco 1 kHz (a quarter; within 1.3 dB, 2.8 dB one second later).
+enum class QualityTier : int { Full = 0, Balanced = 1, Eco = 2 };
+// Loop band of a tier (Hz; Full: the board's whole modal range).
+double loopCutoffForTier(QualityTier t, const PlateParams& plate) noexcept;
+
 // Prepare-time soundboard settings (table class: they need prepare(), i.e.
 // a rebuild on a worker thread in an app, because the bake depends on them).
 struct SoundboardConfig {
     bool enabled = true;       // false: no board, M3 output (A/B)
     double sympathetic = 1.0;  // loop gain g, 0..1.5: 0 = the board listens, nothing is fed back
+    QualityTier tier = QualityTier::Full;
+    double loopCutoffHz = 0.0;  // > 0: overrides the tier's loop band
     PlateParams plate{};
 };
 
@@ -155,14 +173,16 @@ public:
     static constexpr float kFeltPress = 0.15e-3f, kFeltZone = 0.1e-3f, kFeltGap = 3.0e-3f, kLightContact = 0.15f;
     static constexpr int kMaxKnocks = 32;
     // Output scale of the board path, per m/s of pickup velocity.
-    static constexpr float kBoardOutputGain = 5.0f;
+    static constexpr float kBoardOutputGain = 2.4f;
 
     Engine() = default;
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
     // Non-real-time. Builds the default table (A4 = 440 Hz, default stretch
-    // and unison width) or uses 'table', computes every key's normal modes
+    // and unison width) or uses 'table' (with the soundboard, its stretch
+    // tuning is redone on the sounding partials, key_loader.h
+    // tuneToSoundingPartials; table() holds the result), computes every key's normal modes
     // (with the placeholder bridge admittance unless 'bridge' is given),
     // allocates everything and resets all state. maxFrames is the largest
     // buffer the host will render (used as the default constant latency).

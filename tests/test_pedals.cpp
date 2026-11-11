@@ -83,8 +83,11 @@ TEST(sostenuto_latches_held_keys) {
 }
 
 // Moving the una corda pedal between notes never changes a sounding note
-// (it is latched per strike): the output is bit-identical until the next
-// strike, which then differs.
+// (it is latched per strike): the output is the same until the next strike
+// (to rounding: the pedal event cuts a sub-block of the block-wise
+// soundboard loop, about -110 dB re peak, asserted at -90 dB; bit-identical
+// before that loop),
+// which then differs.
 TEST(una_corda_change_is_click_free) {
     const int n = 2 * 48000;
     pm::Engine a, b;
@@ -92,13 +95,14 @@ TEST(una_corda_change_is_click_free) {
     const Stereo s = run(b, {noteOn(0, 60, 90), pedal(24000 + 7, pm::EventType::UnaCorda, 1.0),
                              pedal(30000, pm::EventType::UnaCorda, 0.4), noteOn(48000, 64, 90)},
                          n);
-    bool same = true;
-    for (int i = 0; i < 48000; ++i) same = same && s.l[i] == ref.l[i] && s.r[i] == ref.r[i];
+    double before = 0.0;
+    for (int i = 0; i < 48000; ++i)
+        before = std::max(before, std::max(double(std::fabs(s.l[i] - ref.l[i])), double(std::fabs(s.r[i] - ref.r[i]))));
     double diff = 0.0;
     for (int i = 48000; i < n; ++i) diff = std::max(diff, double(std::fabs(s.l[i] - ref.l[i])));
-    std::printf("  before the next strike: %s; after it max difference %.3g\n",
-                same ? "bit-identical" : "DIFFERENT", diff);
-    CHECK(same);
+    const double beforeDb = 20.0 * std::log10(before / peakAbs(ref.l) + 1e-30);
+    std::printf("  before the next strike: max difference %.1f dB re peak; after it max difference %.3g\n", beforeDb, diff);
+    CHECK_LE(beforeDb, -90.0);
     CHECK(diff > 1e-4);
     CHECK(std::fabs(b.unaCorda() - 0.4f) < 1e-4f);
 }

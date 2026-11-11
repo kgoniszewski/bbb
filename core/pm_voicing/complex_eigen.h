@@ -21,7 +21,7 @@
 
 namespace pm {
 
-inline constexpr int kMaxEigenN = 8;
+inline constexpr int kMaxEigenN = 16;
 
 using cplx = std::complex<double>;
 

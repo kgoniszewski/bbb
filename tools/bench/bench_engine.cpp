@@ -12,7 +12,10 @@
 //             in contact and averaged over its life (contact plus release
 //             wait), measured on the solver alone
 //
-//   bench_engine [--seconds 3] [--block 64] [--fs 48000]
+// Board-on cases run at the quality tier given by --tier (default full);
+// --tiers runs the pedal-down and cluster cases at every tier.
+//
+//   bench_engine [--seconds 3] [--block 64] [--fs 48000] [--tier full|balanced|eco] [--tiers]
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -88,9 +91,28 @@ Result run(pm::Engine& eng, double fs, int block, double warm, double seconds, E
 int main(int argc, char** argv) {
     double seconds = 3.0, fs = 48000.0;
     int block = 64;
-    for (int i = 1; i + 1 < argc; i += 2) {
+    pm::QualityTier tier = pm::QualityTier::Full;
+    bool allTiers = false;
+    for (int i = 1; i < argc; i += 2) {
+        if (!std::strcmp(argv[i], "--tiers")) {
+            allTiers = true;
+            --i;
+            continue;
+        }
+        if (i + 1 >= argc) {
+            std::fprintf(stderr, "missing value for %s\n", argv[i]);
+            return 2;
+        }
         const double v = std::atof(argv[i + 1]);
-        if (!std::strcmp(argv[i], "--seconds")) seconds = v;
+        if (!std::strcmp(argv[i], "--tier")) {
+            if (!std::strcmp(argv[i + 1], "full")) tier = pm::QualityTier::Full;
+            else if (!std::strcmp(argv[i + 1], "balanced")) tier = pm::QualityTier::Balanced;
+            else if (!std::strcmp(argv[i + 1], "eco")) tier = pm::QualityTier::Eco;
+            else {
+                std::fprintf(stderr, "unknown tier %s\n", argv[i + 1]);
+                return 2;
+            }
+        } else if (!std::strcmp(argv[i], "--seconds")) seconds = v;
         else if (!std::strcmp(argv[i], "--block")) block = static_cast<int>(v);
         else if (!std::strcmp(argv[i], "--fs")) fs = v;
         else {
@@ -159,17 +181,29 @@ int main(int argc, char** argv) {
         bool cull;
         int scene;  // 0 worst, 1 typical, 2 cluster, 3 bloom
         bool board;
+        pm::QualityTier tier;
     };
-    for (const Case& c : {Case{"worst (88 keys held, pedal)", true, 0, true},
-                          Case{"worst, culling off", false, 0, true},
-                          Case{"typical (4-note chord, pedal up)", true, 1, true},
-                          Case{"cluster (12 notes ff every 100 ms)", true, 2, true},
-                          Case{"bloom (pedal down, staccato chords)", true, 3, true},
-                          Case{"worst, board off (A/B)", true, 0, false},
-                          Case{"cluster, board off (A/B)", true, 2, false}}) {
+    std::vector<Case> cases = {Case{"worst (88 keys held, pedal)", true, 0, true, tier},
+                               Case{"worst, culling off", false, 0, true, tier},
+                               Case{"typical (4-note chord, pedal up)", true, 1, true, tier},
+                               Case{"cluster (12 notes ff every 100 ms)", true, 2, true, tier},
+                               Case{"bloom (pedal down, staccato chords)", true, 3, true, tier},
+                               Case{"worst, board off (A/B)", true, 0, false, tier},
+                               Case{"cluster, board off (A/B)", true, 2, false, tier}};
+    if (allTiers)
+        for (pm::QualityTier t : {pm::QualityTier::Balanced, pm::QualityTier::Eco}) {
+            const bool b = t == pm::QualityTier::Balanced;
+            cases.push_back(Case{b ? "worst, balanced" : "worst, eco", true, 0, true, t});
+            cases.push_back(Case{b ? "cluster, balanced" : "cluster, eco", true, 2, true, t});
+            cases.push_back(Case{b ? "bloom, balanced" : "bloom, eco", true, 3, true, t});
+        }
+    const char* tierName[3] = {"full", "balanced", "eco"};
+    std::printf("  board-on cases at tier %s unless named\n", tierName[static_cast<int>(tier)]);
+    for (const Case& c : cases) {
         eng.setCulling(c.cull, -100.0f);
         pm::SoundboardConfig bc;
         bc.enabled = c.board;
+        bc.tier = c.tier;
         eng.setSoundboardConfig(bc);
         if (!eng.prepare(fs, block)) return 1;
         // The worst cases are measured from the first strike, so the max

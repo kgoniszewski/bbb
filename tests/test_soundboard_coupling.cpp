@@ -83,8 +83,9 @@ double run(const pm::PianoTable& t, int key, int p, double g, const pm::KeyModeS
     const int n0 = static_cast<int>(0.05 * kFs), n1 = static_cast<int>(0.55 * kFs);
     double a0 = 0.0;
     for (int s = 0; s < n1; s += 32) {
+        loop.begin(bank, sb, &io);
         bank.processSegmentsFree(&io, 32);
-        loop.begin(bank, &io, 32);
+        loop.collect(bank, &io, 32);
         const int* oz = nullptr;
         const int no = loop.outZones(oz);
         for (int i = 0; i < 32; ++i) {

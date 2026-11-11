@@ -68,8 +68,16 @@ struct KeyParams {
     double pan = 0.0;             // -1 (left) .. 1 (right), before the width control
 };
 
+// Stretch tuning (tuning.h).
+struct TuningOptions {
+    double a4Hz = 440.0;
+    double stretch = 1.0;            // 0 .. 1.5 (clamped)
+    bool equalTemperament = false;   // true: ignore B, plain 12-TET
+};
+
 struct PianoTable {
     KeyParams keys[kNumKeys];
+    TuningOptions tuning{};  // as the table was tuned
 };
 
 struct TableOptions {

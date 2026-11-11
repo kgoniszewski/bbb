@@ -8,21 +8,40 @@
 // "H" of the orthotropic plate equation) and into the mass per area. Modes:
 //   f_mn  = (pi / 2) sqrt((Dx (m/a)^4 + 2 Dxy (m/a)^2 (n/b)^2 + Dy (n/b)^4) / rho_h)
 //   phi_mn(x, y) = sin(m pi x / a) sin(n pi y / b) / sqrt(M / 4)   (mass-normalised, M = rho_h a b)
-//   sigma = eta(f) pi f,   eta(f) = etaLow + (etaHigh - etaLow) (f / etaRefHz)^etaExponent, <= etaHigh
-// all modes below maxFreqHz, at most maxModes. The default values are not
-// derived from a measured board: they are chosen so that the mode set meets
-// the plan's targets (first mode about 58 Hz, about one mode per 23 Hz
-// above 1 kHz, loss factor 3 %, mean driving-point impedance about
-// 1,500 kg/s at the bridge), with plausible ingredients (9 mm spruce plus
-// ribs and bridges smeared to 6.6 kg/m^2; bare spruce alone would give
-// Dx ~ 50 and Dy ~ 700 N m, the rib composite and the crown raise both).
-// Plate size, loss factor and bridge placement were then adjusted within
-// plausible ranges (a random search over the bridge curves) so that the
-// fundamentals of C2, C4 and C6 do not fall on an extreme of the strongly
-// fluctuating admittance (Re Y there is 0.86-1.0 times the M3 placeholder's
-// conductance; C3 and C5 land at 0.14 and 3.7 times it: decay varies note
-// to note and partial to partial). The treble bridge must stay off the
-// plate's centre line x = a / 2, a nodal line of every mode with even m.
+//   sigma = eta(f) pi f,
+//   eta(f) = min(etaLow + (etaHigh - etaLow) (f / etaRefHz)^etaExponent, etaHigh)
+//            + etaBass / (1 + (f / etaBassHz)^2)
+// with every frequency scaled by 1 + freqJitter x (x uniform in [-1, 1),
+// a fixed hash of (m, n)); all modes below maxFreqHz, at most maxModes. The
+// default values are not derived from a measured board: they are chosen so
+// that the mode set meets the plan's targets (first mode about 58 Hz, about
+// one mode per 23 Hz above 1 kHz, loss factor 3 % in the mid range, mean
+// driving-point impedance about 1,500 kg/s at the bridge), with plausible
+// ingredients (9 mm spruce plus ribs and bridges smeared to 6.6 kg/m^2;
+// bare spruce alone would give Dx ~ 50 and Dy ~ 700 N m, the rib composite
+// and the crown raise both). Plate size and bridge placement were adjusted
+// within plausible ranges (a random search over the bridge curves) so that
+// the fundamentals of C2, C4 and C6 do not fall on an extreme of the
+// fluctuating admittance. The treble bridge must stay off the plate's
+// centre line x = a / 2, a nodal line of every mode with even m.
+//
+// Low modes. A uniform plate with a constant 3 % loss factor dips to 50-70
+// kg/s at its lowest resonances along the bass bridge (Re Y peaks 18-25
+// times the local mean), far below published bridge impedances of grands
+// (of order 1e3 kg/s from 50 to 500 Hz with dips of a few hundred kg/s:
+// Wogram 1980; Giordano 1998 for an upright; Conklin 1996), and bass
+// fundamentals next to those resonances hybridise into string-board
+// doublets. In the instrument the lowest board modes also move the rim and
+// case and radiate into the case, which damps them more than the mid range
+// (loss factors of a few % are typical there; Suzuki 1986, Ege et al.
+// 2013). The defaults add etaBass = 0.08 at a 150 Hz knee (eta about 0.10 at
+// the first mode, 0.07 at 155 Hz, 0.046 at 300 Hz, 0.032 at 1 kHz; an
+// estimate until measured data exist) and a 2 % frequency scatter. Result
+// over keys 1-52, 40-500 Hz: median |Z| 1,130 kg/s, every key's minimum
+// above 150 kg/s, Re Y peaks within 8 times the mean
+// (test_soundboard_model). The sparse region of the plate's low spectrum
+// (no mode between 105 and 155 Hz) remains: filling it needs a non-uniform
+// plate (rib layout, thickness taper), beyond v0.
 //
 // Bridges. Treble bridge (keys 21-88) and bass bridge (keys 1-20) are
 // quadratic Bezier curves in plate coordinates; keys sit at equal arc-length
@@ -108,6 +127,13 @@ struct PlateParams {
     double massPerArea = 6.6;                // kg/m^2
     double Dx = 2430.0, Dy = 20000.0, Dxy = 2090.0;  // N m
     double etaLow = 0.03, etaHigh = 0.03, etaRefHz = 5000.0, etaExponent = 0.6;
+    // Extra loss of the lowest modes (rim and case participation, radiation
+    // into the case): + etaBass / (1 + (f / etaBassHz)^2).
+    double etaBass = 0.08, etaBassHz = 150.0;
+    // Irregularity: every mode frequency is scaled by 1 + freqJitter * x,
+    // x uniform in [-1, 1) from a fixed hash of (m, n, jitterSeed).
+    double freqJitter = 0.02;
+    unsigned jitterSeed = 1;
     double maxFreqHz = 5000.0;
     int maxModes = 600;
     double bridgeHalfLength = 0.025;         // m
@@ -175,6 +201,9 @@ std::complex<double> loopSelfAdmittance(const BoardModel& b, int key, double f, 
                                         double D) noexcept;
 std::complex<double> loopSelfAdmittanceS(const BoardModel& b, int key, std::complex<double> s, double fs, double g,
                                          std::complex<double> D) noexcept;
+// The same with the key's loop shape given (keyLoopShape).
+std::complex<double> loopSelfAdmittanceS(const BoardModel& b, const double* psi, std::complex<double> s, double fs,
+                                         double g, std::complex<double> D) noexcept;
 // Static stiffness (N/m) of the fed-back partials of a key (f_n < cutoff):
 // K = sum K_n, K_n = S (1 + r^2) (T n pi / L (1 + B n^2))^2 / (m w_n^2).
 double stringStaticStiffness(const KeyParams& k, double fs, double cutoffHz, double r) noexcept;
@@ -191,10 +220,14 @@ class SoundboardBridge final : public BridgeAdmittance {
 public:
     // loopGain = sympathetic gain g of the run-time loop (0: no loop). With a
     // table, each key's static correction enters the loop's self term.
-    SoundboardBridge(const BoardModel& board, double fs, double loopGain, const PianoTable* table = nullptr);
+    // loopCutoffHz: partials below it are fed back (0 or above the board's
+    // modal range: the whole modal range); the others bake the full
+    // driving-point admittance and only drive the board.
+    SoundboardBridge(const BoardModel& board, double fs, double loopGain, const PianoTable* table = nullptr,
+                     double loopCutoffHz = 0.0);
     Admittance2 at(int key, double freqHz) const noexcept override;
     std::complex<double> crossRatio(int, double) const noexcept override { return r_; }
-    double loopCutoffHz() const noexcept override { return g_ > 0.0 ? board_.params.maxFreqHz : 0.0; }
+    double loopCutoffHz() const noexcept override { return g_ > 0.0 ? cutoff_ : 0.0; }
     // Driving point plus, with a loop, the first-order loading of the board
     // by the other keys' strings (their non-resonant end stiffness), which
     // the loop produces: the reference for pitch compensation. The bake
@@ -202,6 +235,10 @@ public:
     Admittance2 total(int key, double freqHz) const noexcept override;
     Admittance2 atLambda(int key, std::complex<double> lambda) const noexcept override;
     Admittance2 totalLambda(int key, std::complex<double> lambda) const noexcept override;
+    int loopPoles(int key, double fHz, std::complex<double>* pole, std::complex<double>* residue,
+                  int max) const noexcept override;
+    Admittance2 loopLambda(int key, std::complex<double> lambda) const noexcept override;
+    Admittance2 loopLoading(int key, double fHz) const noexcept override;
     std::complex<double> loadingShift(int key, double freqHz) const noexcept;
     // Vertical board admittance as baked (after removing the loop's share).
     std::complex<double> baked(int key, double freqHz) const noexcept;
@@ -211,9 +248,10 @@ public:
 
 private:
     const BoardModel& board_;
-    double fs_, g_, r_;
+    double fs_, g_, r_, cutoff_;
     KeyParams keys_[kNumKeys]{};
     bool hasKeys_ = false;
+    std::vector<double> psi_;  // loop shapes, kNumKeys x modes
 };
 
 // Configures the run-time bank (allocates; non-real-time). Pickups 0 and 1.

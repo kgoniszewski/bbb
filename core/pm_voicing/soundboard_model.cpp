@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <numbers>
+#include <cstdint>
 #include <tuple>
 
 namespace pm {
@@ -67,6 +68,15 @@ double bridgeShape(const PlateParams& p, int m, int n, Point at, Point tangent) 
     return s / np;
 }
 
+// Uniform in [-1, 1), a fixed function of (m, n, seed).
+double jitter(int m, int n, unsigned seed) {
+    std::uint64_t x = (std::uint64_t(m) << 32) ^ (std::uint64_t(n) << 8) ^ (std::uint64_t(seed) * 0x9E3779B97F4A7C15ull);
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return double(x >> 11) * (2.0 / 9007199254740992.0) - 1.0;
+}
+
 double directionalD(const PlateParams& p, double th) {
     const double c = std::cos(th), s = std::sin(th);
     return p.Dx * c * c * c * c + 2.0 * p.Dxy * c * c * s * s + p.Dy * s * s * s * s;
@@ -77,7 +87,8 @@ double directionalD(const PlateParams& p, double th) {
 double BoardModel::eta(double f) const noexcept {
     const PlateParams& p = params;
     const double e = p.etaLow + (p.etaHigh - p.etaLow) * std::pow(std::max(f, 0.0) / p.etaRefHz, p.etaExponent);
-    return std::min(e, p.etaHigh);
+    const double x = f / p.etaBassHz;
+    return std::min(e, p.etaHigh) + p.etaBass / (1.0 + x * x);
 }
 
 namespace {
@@ -139,12 +150,13 @@ BoardModel buildPlateBoard(const PlateParams& p) {
                              std::sqrt((p.Dx * km * km * km * km + 2.0 * p.Dxy * km * km * kn * kn +
                                         p.Dy * kn * kn * kn * kn) / p.massPerArea);
             if (f >= p.maxFreqHz) break;
-            list.emplace_back(f, m, n);
+            list.emplace_back(f * (1.0 + p.freqJitter * jitter(m, n, p.jitterSeed)), m, n);
             any = true;
         }
         if (!any) break;
     }
     std::sort(list.begin(), list.end());
+    while (!list.empty() && std::get<0>(list.back()) >= p.maxFreqHz) list.pop_back();
     if (static_cast<int>(list.size()) > p.maxModes) list.resize(static_cast<std::size_t>(p.maxModes));
     b.modes = static_cast<int>(list.size());
     const double norm = 1.0 / std::sqrt(0.25 * b.mass);
@@ -307,6 +319,10 @@ cd loopModeAdmittanceS(double freqHz, double sigma, cd s, double fs) noexcept {
 cd loopSelfAdmittanceS(const BoardModel& b, int key, cd s, double fs, double g, cd D) noexcept {
     std::vector<double> psi(static_cast<std::size_t>(b.modes));
     keyLoopShape(b, key, psi.data());
+    return loopSelfAdmittanceS(b, psi.data(), s, fs, g, D);
+}
+
+cd loopSelfAdmittanceS(const BoardModel& b, const double* psi, cd s, double fs, double g, cd D) noexcept {
     cd y = 0.0;
     for (int i = 0; i < b.modes; ++i) y += psi[i] * psi[i] * loopModeAdmittanceS(b.freq[i], b.sigma[i], s, fs);
     const cd z = std::exp(s / fs);
@@ -404,19 +420,23 @@ double stringResidualStiffness(const KeyParams& k, double fs, double cutoffHz, d
     return D;
 }
 
-SoundboardBridge::SoundboardBridge(const BoardModel& board, double fs, double loopGain, const PianoTable* table)
+SoundboardBridge::SoundboardBridge(const BoardModel& board, double fs, double loopGain, const PianoTable* table,
+                                   double loopCutoffHz)
     : board_(board), fs_(fs), g_(std::max(loopGain, 0.0)),
-      r_(board.params.cross / std::sqrt(board.params.horizontalRatio)) {
+      r_(board.params.cross / std::sqrt(board.params.horizontalRatio)),
+      cutoff_(loopCutoffHz > 0.0 ? std::min(loopCutoffHz, board.params.maxFreqHz) : board.params.maxFreqHz) {
     if (table && g_ > 0.0)
         for (int k = 0; k < kNumKeys; ++k) keys_[k] = table->keys[k];
     hasKeys_ = table != nullptr && g_ > 0.0;
+    psi_.resize(std::size_t(kNumKeys) * board_.modes);
+    for (int k = 1; k <= kNumKeys; ++k) keyLoopShape(board_, k, psi_.data() + std::size_t(k - 1) * board_.modes);
 }
 
 cd SoundboardBridge::baked(int key, double f) const noexcept {
     cd y = boardDrivingPoint(board_, key, f);
-    if (g_ > 0.0 && f < board_.params.maxFreqHz) {
+    if (g_ > 0.0 && f < cutoff_) {
         const KeyParams& kp = keys_[key - 1];
-        const double D = hasKeys_ && kp.bridgeCoupling ? stringResidualStiffness(kp, fs_, board_.params.maxFreqHz, r_, f) : 0.0;
+        const double D = hasKeys_ && kp.bridgeCoupling ? stringResidualStiffness(kp, fs_, cutoff_, r_, f) : 0.0;
         y -= loopSelfAdmittance(board_, key, f, fs_, g_, D);
         // Interpolated loop shapes can exceed the true driving point between
         // zones; the bake must stay passive on its own.
@@ -429,7 +449,7 @@ cd SoundboardBridge::baked(int key, double f) const noexcept {
 // non-resonant end stiffness D_k'), as the run-time loop produces it:
 // L_kk += g sum_k' D_k' (b_k'^T Z b_k)^2, Z the zone-port loop transfer.
 cd SoundboardBridge::loadingShift(int key, double f) const noexcept {
-    if (!hasKeys_ || f >= board_.params.maxFreqHz) return 0.0;
+    if (!hasKeys_ || f >= cutoff_) return 0.0;
     const int M = board_.modes, Z = board_.zones;
     std::vector<double> psi(static_cast<std::size_t>(M));
     keyLoopShape(board_, key, psi.data());
@@ -449,17 +469,17 @@ cd SoundboardBridge::loadingShift(int key, double f) const noexcept {
         if (k == key || !keys_[k - 1].bridgeCoupling) continue;
         const KeyZone& kz = board_.keyZone[k - 1];
         const cd t = double(kz.w0) * v[kz.z0] + (kz.w1 != 0.0f ? double(kz.w1) * v[kz.z0 + 1] : cd(0.0));
-        dL += stringLoadStiffness(keys_[k - 1], fs_, board_.params.maxFreqHz, r_, f) * t * t;
+        dL += stringLoadStiffness(keys_[k - 1], fs_, cutoff_, r_, f) * t * t;
     }
     return fs_ * (z - 1.0) * g_ * g_ * dL;
 }
 
 cd SoundboardBridge::bakedS(int key, cd s) const noexcept {
     cd y = boardDrivingPointS(board_, key, s);
-    if (g_ > 0.0 && s.imag() / (2.0 * kPi) < board_.params.maxFreqHz) {
+    if (g_ > 0.0 && s.imag() / (2.0 * kPi) < cutoff_) {
         const KeyParams& kp = keys_[key - 1];
-        const cd D = hasKeys_ && kp.bridgeCoupling ? stringResidualStiffnessS(kp, fs_, board_.params.maxFreqHz, r_, s) : cd(0.0);
-        y -= loopSelfAdmittanceS(board_, key, s, fs_, g_, D);
+        const cd D = hasKeys_ && kp.bridgeCoupling ? stringResidualStiffnessS(kp, fs_, cutoff_, r_, s) : cd(0.0);
+        y -= loopSelfAdmittanceS(board_, psi_.data() + std::size_t(key - 1) * board_.modes, s, fs_, g_, D);
         if (y.real() < 0.0) y = cd(0.0, y.imag());
     }
     return y;
@@ -493,6 +513,49 @@ Admittance2 SoundboardBridge::at(int key, double f) const noexcept {
     y.vh = r_ * yb;
     y.hh = r_ * r_ * yb + yh;
     return y;
+}
+
+// Board modes of the loop near f, strongest first by their admittance at f.
+// Continuous-time approximation of each mode's loop term:
+// g psi^2 s / (s^2 + 2 sigma s + w^2), positive-frequency part a / (s - p),
+// p = -sigma + j w_d, a = g psi^2 p / (2 j w_d).
+int SoundboardBridge::loopPoles(int key, double f, cd* pole, cd* residue, int max) const noexcept {
+    if (g_ <= 0.0 || f >= cutoff_ || max <= 0) return 0;
+    const double* psi = psi_.data() + std::size_t(key - 1) * board_.modes;
+    struct Cand {
+        double weight;
+        int i;
+    };
+    std::vector<Cand> c;
+    const double w = 2.0 * kPi * f;
+    for (int i = 0; i < board_.modes; ++i) {
+        if (std::fabs(board_.freq[i] - f) > 0.25 * f) continue;
+        const double wi = 2.0 * kPi * board_.freq[i];
+        c.push_back({g_ * psi[i] * psi[i] / (std::fabs(wi - w) + board_.sigma[i]), i});
+    }
+    std::sort(c.begin(), c.end(), [](const Cand& a, const Cand& b) { return a.weight > b.weight; });
+    const int n = std::min(max, static_cast<int>(c.size()));
+    for (int q = 0; q < n; ++q) {
+        const int i = c[q].i;
+        const double wm = 2.0 * kPi * board_.freq[i], sg = board_.sigma[i];
+        const double wd = std::sqrt(std::max(wm * wm - sg * sg, 1e-6 * wm * wm));
+        pole[q] = cd(-sg, wd);
+        residue[q] = g_ * psi[i] * psi[i] * pole[q] / cd(0.0, 2.0 * wd);
+    }
+    return n;
+}
+
+Admittance2 SoundboardBridge::loopLambda(int key, cd lambda) const noexcept {
+    if (g_ <= 0.0 || lambda.imag() / (2.0 * kPi) >= cutoff_) return {};
+    const KeyParams& kp = keys_[key - 1];
+    const cd D = hasKeys_ && kp.bridgeCoupling ? stringResidualStiffnessS(kp, fs_, cutoff_, r_, lambda) : cd(0.0);
+    const cd yl = loopSelfAdmittanceS(board_, psi_.data() + std::size_t(key - 1) * board_.modes, lambda, fs_, g_, D);
+    return {yl, r_ * yl, r_ * r_ * yl};
+}
+
+Admittance2 SoundboardBridge::loopLoading(int key, double f) const noexcept {
+    const cd yl = loadingShift(key, f);
+    return {yl, r_ * yl, r_ * r_ * yl};
 }
 
 bool loadSoundboard(Soundboard& sb, const BoardModel& b, double fs) {

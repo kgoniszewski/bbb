@@ -96,6 +96,42 @@ inline PartialFit measurePartial(const std::vector<float>& x, double fs, double 
     return fit;
 }
 
+// Energy-weighted mean frequency of the components near fExpected (the
+// partial as a tuner hears it, key_loader.h soundingPartial): the same
+// windowed projection as measurePartial, frames every nw / 8 samples; each
+// frame-to-frame phase increment is weighted by the product of the two
+// frames' magnitudes, so a beating cluster gives the energy-weighted mean of
+// its components and the phase jumps at beat minima carry no weight.
+inline double measureSoundingPitch(const std::vector<float>& x, double fs, double fExpected, double spacingHz) {
+    constexpr double kPi = std::numbers::pi;
+    const int nw = static_cast<int>(std::ceil(8.0 * fs / spacingHz));
+    const int hop = std::max(1, nw / 8);
+    std::vector<double> w(static_cast<std::size_t>(nw));
+    for (int i = 0; i < nw; ++i) {
+        const double a = 2.0 * kPi * i / (nw - 1);
+        w[i] = 0.35875 - 0.48829 * std::cos(a) + 0.14128 * std::cos(2 * a) - 0.01168 * std::cos(3 * a);
+    }
+    const double cyclesPerSample = fExpected / fs;
+    std::complex<double> prev = 0.0;
+    double num = 0.0, den = 0.0;
+    bool first = true;
+    for (int s = 0; s + nw <= static_cast<int>(x.size()); s += hop) {
+        std::complex<double> acc = 0.0;
+        for (int i = 0; i < nw; ++i) {
+            const double cyc = std::fmod(cyclesPerSample * (s + i), 1.0);
+            acc += w[i] * x[s + i] * std::polar(1.0, -2.0 * kPi * cyc);
+        }
+        if (!first) {
+            const double wt = std::abs(prev) * std::abs(acc);
+            num += wt * std::arg(acc * std::conj(prev));
+            den += wt;
+        }
+        prev = acc;
+        first = false;
+    }
+    return den > 0.0 ? fExpected + num / den * fs / (2.0 * kPi * hop) : 0.0;
+}
+
 inline double cents(double f, double ref) { return 1200.0 * std::log2(f / ref); }
 
 }  // namespace pm_test

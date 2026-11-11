@@ -41,35 +41,40 @@ OctaveWeights octaveWeights(int key) noexcept {
     return w;
 }
 
-void virtualTuner(const double* B, const TuningOptions& opt, double* f1) noexcept {
+void virtualTuner(const double* B, const TuningOptions& opt, double* f1, const PartialRatios* ratios) noexcept {
     const double a4 = opt.a4Hz;
     if (opt.equalTemperament) {
         for (int k = 1; k <= kNumKeys; ++k) f1[k - 1] = etHz(k, a4);
         return;
     }
-    auto b = [&](int k) { return B[k - 1]; };
     auto lf = [&](int k) { return std::log(f1[k - 1]); };
+    auto pr = [&](int k, int n) {
+        const double r = ratios && n <= kTunerPartials ? ratios->r[k - 1][n] : 0.0;
+        return r > 0.0 ? r : partialRatio(B[k - 1], n);
+    };
     f1[48] = a4;
     // A3 from A4, 4:2.
-    f1[36] = a4 * partialRatio(b(49), 2) / partialRatio(b(37), 4);
-    for (int k = 38; k <= 48; ++k)
-        f1[k - 1] = std::exp(lf(37) + (lf(49) - lf(37)) * (k - 37) / 12.0);
+    f1[36] = a4 * pr(49, 2) / pr(37, 4);
+    // Equal division on the second partials: with sounding ratios, a first
+    // partial pulled by a board resonance does not move its neighbours.
+    const double l37 = lf(37) + std::log(pr(37, 2)), l49 = lf(49) + std::log(pr(49, 2));
+    for (int k = 38; k <= 48; ++k) f1[k - 1] = std::exp(l37 + (l49 - l37) * (k - 37) / 12.0) / pr(k, 2);
     for (int k = 50; k <= kNumKeys; ++k) {
         const OctaveWeights w = octaveWeights(k);
         const int lo = k - 12;
         double acc = 0.0;
-        acc += w.w42 * (lf(lo) + std::log(partialRatio(b(lo), 4) / partialRatio(b(k), 2)));
-        acc += w.w21 * (lf(lo) + std::log(partialRatio(b(lo), 2)));
-        if (w.w41 > 0.0) acc += w.w41 * (lf(k - 24) + std::log(partialRatio(b(k - 24), 4)));
+        acc += w.w42 * (lf(lo) + std::log(pr(lo, 4) / pr(k, 2)));
+        acc += w.w21 * (lf(lo) + std::log(pr(lo, 2)));
+        if (w.w41 > 0.0) acc += w.w41 * (lf(k - 24) + std::log(pr(k - 24, 4)));
         f1[k - 1] = std::exp(acc);
     }
     for (int k = 36; k >= 1; --k) {
         const OctaveWeights w = octaveWeights(k);
         const int hi = k + 12;
         double acc = 0.0;
-        acc += w.w42 * (lf(hi) + std::log(partialRatio(b(hi), 2) / partialRatio(b(k), 4)));
-        acc += w.w63 * (lf(hi) + std::log(partialRatio(b(hi), 3) / partialRatio(b(k), 6)));
-        acc += w.w105 * (lf(hi) + std::log(partialRatio(b(hi), 5) / partialRatio(b(k), 10)));
+        acc += w.w42 * (lf(hi) + std::log(pr(hi, 2) / pr(k, 4)));
+        acc += w.w63 * (lf(hi) + std::log(pr(hi, 3) / pr(k, 6)));
+        acc += w.w105 * (lf(hi) + std::log(pr(hi, 5) / pr(k, 10)));
         f1[k - 1] = std::exp(acc);
     }
     const double s = std::clamp(opt.stretch, 0.0, 1.5);

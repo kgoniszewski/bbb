@@ -69,12 +69,14 @@ struct Result {
     bool finite = true;
 };
 
-// delayed = true: the deliberately non-passive variant the exact block
-// solve replaces: the board sees only the strings' free response over each
-// sub-block, and the strings' response to the board's displacement enters
-// their state at the end of the sub-block (a feedback delay of up to one
-// sub-block). The test must flag it.
-Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool delayed = false) {
+// Deliberately broken variant, which the test must flag ('flipped'): the
+// loop feeds back with the opposite sign while the bake still removes the
+// loop's share, so the strings see the driving point minus twice the loop's
+// self admittance, whose real part is negative at some board resonances.
+// (A loop whose strings answer the board one sub-block late, what the exact
+// block solve replaces, grows too slowly at these coupling strengths to be
+// caught within 0.5 s and is not used as the detector.)
+Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool flipped = false) {
     Rng r{seed};
     pm::PlateParams pp;
     pp.lengthX = r.uni(1.6, 2.2);
@@ -176,29 +178,21 @@ Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool 
 
     pm::CouplingLoop loop;
     loop.configure(kz.data(), nk, board.zones);
-    loop.setGain(static_cast<float>(g));
+    loop.setGain(static_cast<float>(flipped ? -g : g));
     float zf[pm::Soundboard::kMaxZones], zd[pm::Soundboard::kMaxZones] = {}, pk[pm::Soundboard::kMaxPickups];
     const double e0 = stringEnergy() + sb.energy();
     double q3 = 0.0, q4 = 0.0;
     int n3 = 0, n4 = 0;
     // The engine's sub-block sequence, production code throughout.
     for (int s = 0; s + 32 <= samples; s += 32) {
+        loop.begin(bank, sb, io.data());
         bank.processSegmentsFree(io.data(), 32);
-        loop.begin(bank, io.data(), 32);
+        loop.collect(bank, io.data(), 32);
         const int* oz = nullptr;
         const int no = loop.outZones(oz);
         for (int i = 0; i < 32; ++i) {
             for (int z = 0; z < board.zones; ++z) zf[z] = 0.0f;
-            if (delayed) {
-                for (int k = 0; k < nk; ++k)
-                    if (io[k].wrote) {
-                        const float f = io[k].out[i] * kz[k].forceScale;
-                        zf[kz[k].z0] += kz[k].w0 * f;
-                        if (kz[k].w1 != 0.0f) zf[kz[k].z0 + 1] += kz[k].w1 * f;
-                    }
-            } else {
-                loop.forces(i, zf, nullptr);
-            }
+            loop.forces(i, zf, nullptr);
             sb.step(zf, zd, pk, pm::Kernel::Simd, oz, no);
             loop.push(i, zd);
         }
@@ -256,18 +250,18 @@ TEST(energy_never_grows_random_sets) {
     CHECK(bad == 0);
 }
 
-// The test detects a loop that is not passive: the block-delayed variant
-// (runSet, delayed) on the same random sets.
-TEST(delayed_loop_is_flagged) {
+// The test detects a loop that is not passive (runSet, flipped) on the same
+// kind of random sets, run for 0.5 s each.
+TEST(broken_loop_is_flagged) {
     pm::ScopedFlushDenormals ftz;
     pm::PianoTable base;
     pm::buildPianoTable(base);
-    const int kSets = 500;
+    const int kSets = 120;
     int bad = 0;
     for (int i = 0; i < kSets; ++i) {
-        const Result r = runSet(base, 1000 + std::uint64_t(i), i % 50 == 0 ? 24000 : 1216, true);
+        const Result r = runSet(base, 1000 + std::uint64_t(i), 24000, true);
         if (!(r.finite && r.peak <= 1.03 && r.final <= 1.0 && r.lateRise <= 1.001)) ++bad;
     }
-    std::printf("  block-delayed loop: %d of %d random sets violate passivity\n", bad, kSets);
+    std::printf("  sign-flipped loop: %d of %d random sets violate passivity\n", bad, kSets);
     CHECK(bad >= kSets / 20);
 }

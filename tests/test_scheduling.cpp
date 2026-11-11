@@ -60,7 +60,10 @@ TEST(event_offset_shifts_output) {
     }
 }
 
-// Note-ons alone (no control-rate state involved) are exactly shift-invariant.
+// Note-ons alone (no control-rate state involved) are shift-invariant to
+// rounding. (Bit-exact before the block-wise soundboard loop: its forced
+// response is summed per sub-block, so where an event cuts a sub-block
+// changes the rounding, -100 to -110 dB re peak; asserted at -90 dB.)
 TEST(note_on_offset_is_exact) {
     pm::Engine a, b;
     a.setCulling(false, -100.0f);
@@ -72,12 +75,15 @@ TEST(note_on_offset_is_exact) {
         const Stereo s = renderEngine(b, {noteOn(k, 40, 90), noteOn(k, 75, 60)}, 24000 + k);
         double d = 0.0;
         for (int i = 0; i < 24000; ++i) d = std::max(d, double(std::fabs(s.l[i + k] - ref.l[i])));
-        std::printf("  offset %d: max difference %.3g\n", k, d);
-        CHECK(d == 0.0);
+        const double db = 20.0 * std::log10(d / peakAbs(ref.l) + 1e-30);
+        std::printf("  offset %d: max difference %.3g (%.1f dB re peak)\n", k, d, db);
+        CHECK_LE(db, -90.0);
     }
 }
 
-// Rendering with different buffer sizes gives bit-identical output.
+// Rendering with different buffer sizes gives the same output to rounding
+// (bit-identical before the block-wise soundboard loop, see above; a host
+// buffer boundary cuts a sub-block like an event does).
 TEST(block_size_invariance) {
     const int n = 30000;
     pm::Engine eng;
@@ -86,10 +92,12 @@ TEST(block_size_invariance) {
     for (int block : {1, 7, 37, 128, 500}) {
         eng.prepare(kFs, 512);
         const Stereo s = renderEngine(eng, scene(100), n, block);
-        bool same = true;
-        for (int i = 0; i < n; ++i) same = same && s.l[i] == ref.l[i] && s.r[i] == ref.r[i];
-        std::printf("  block %3d: %s\n", block, same ? "identical" : "DIFFERENT");
-        CHECK(same);
+        double d = 0.0;
+        for (int i = 0; i < n; ++i)
+            d = std::max(d, std::max(double(std::fabs(s.l[i] - ref.l[i])), double(std::fabs(s.r[i] - ref.r[i]))));
+        const double db = 20.0 * std::log10(d / peakAbs(ref.l) + 1e-30);
+        std::printf("  block %3d: max difference %.1f dB re peak\n", block, db);
+        CHECK_LE(db, -90.0);
     }
 }
 

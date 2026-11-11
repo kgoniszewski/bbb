@@ -29,12 +29,11 @@ void runModesSimd(const BankView& b, const int* groups, int nGroups, const float
 // Block-coupled processing (soundboard loop, mode_bank.h). Both advance the
 // listed groups in registers over n <= ModeBank::kCullInterval samples.
 //
-// Impulse: out[k] += sum wOut Im(c^(k+1) wIn) for k < n (the response of the
-// groups to a unit input at sample 0, from the second tap on); the state is
-// neither read nor written.
-void impulseScalar(const BankView& b, const int* groups, int nGroups, float* out, int n) noexcept;
-void impulseSimd(const BankView& b, const int* groups, int nGroups, float* out, int n,
-                 float* scratch) noexcept;
+// Impulse: for each listed group q, out[q * stride + k] = sum over its modes
+// of wOut Im(c^(k+1) wIn), k < n (its response to a unit input at sample 0,
+// from the second tap on); the state is neither read nor written.
+void impulseScalar(const BankView& b, const int* groups, int nGroups, float* out, int stride, int n) noexcept;
+void impulseSimd(const BankView& b, const int* groups, int nGroups, float* out, int stride, int n) noexcept;
 // Forced update: z += wIn * sum_{m<n} c^(n-1-m) u[m] (Horner in c), the part
 // of the state the input u[0..n) adds on top of the free evolution. A free
 // pass over the same n samples followed by this pass gives the state of

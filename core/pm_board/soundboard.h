@@ -64,6 +64,9 @@ public:
     void step(const float* zoneForce, float* zoneDisp, float* pickupVel, Kernel kernel = Kernel::Simd,
               const int* outZones = nullptr, int nOut = -1) noexcept;
     void clearState() noexcept;
+    // RT. Displacement of zone z from the current state (what step() last
+    // returned for it, also when it was not among the zones read).
+    float zoneDisplacement(int z) const noexcept;
     // RT. Multiplies the state by g (panic damping).
     void scaleState(float g) noexcept;
     bool asleep() const noexcept { return asleep_; }
@@ -149,10 +152,21 @@ inline void zonesToKeys(const KeyZone* kz, const float* zoneDisp, int keys, floa
 // Keys owned by a hammer solver (io[k].skip) are not part of G: the caller
 // steps them per sample with keyInput() and adds their force itself.
 //
+// Culling. A sleeping coupled group that input wakes during a sub-block
+// joins at its end, from the state it would have had had it woken at the
+// sample its bound was crossed (mode_bank.h); its output over the rest of
+// that sub-block is missing from the loop, which is negligible because the
+// bound was only just crossed. A key that starts taking input (its damper
+// lifted by the pedal) has its sleeping coupled groups woken at once, before
+// the sub-block, since its input is then typically far above the bound.
+// Every such decision falls on a sample fixed relative to the music, so the
+// output does not depend on how the stream is cut into sub-blocks (to
+// rounding).
+//
 // configure() is non-real-time; everything else is RT.
 class CouplingLoop {
 public:
-    static constexpr int kMaxBlock = 32;
+    static constexpr int kMaxBlock = ModeBank::kResponseTaps;
     static constexpr int kMaxKeys = 128;
     static constexpr int kMaxEntries = 4 * kMaxKeys;
 
@@ -174,10 +188,16 @@ public:
     float gain() const noexcept { return gain_; }
     void reset() noexcept;
 
-    // Sub-block of n <= kMaxBlock samples, after ModeBank::processSegmentsFree.
+    // Sub-block of n <= kMaxBlock samples, in this order:
+    //   begin(), ModeBank::processSegmentsFree(), collect(),
+    //   per sample forces() / keyInput(), board step, push(), then end().
     // Keys that receive an input: awake or wakeable coupled groups (as the
-    // bank reports them) and skipped keys.
-    void begin(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel = Kernel::Simd) noexcept;
+    // bank reports them) and skipped keys. A key that starts to take input
+    // has its sleeping coupled groups woken here (wakeAllCoupled), so that
+    // they are part of the loop from this sample on. io[k].skip must be set.
+    void begin(ModeBank& bank, const Soundboard& board, const SegmentIO* io, Kernel kernel = Kernel::Simd) noexcept;
+    // The free zone forces, from the outputs of processSegmentsFree.
+    void collect(ModeBank& bank, const SegmentIO* io, int n) noexcept;
     // Zones whose displacement the loop needs (pass to Soundboard::step).
     int outZones(const int*& list) const noexcept {
         list = outZones_;
@@ -214,12 +234,16 @@ private:
     // Destination: a zone, or zones + t for tap t.
     int entDst_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{}, entSrc_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{};
     int tapEnt_[kMaxTaps][Soundboard::kMaxZones]{};
+    // Entries carried by the current members, packed: their destination and
+    // source zones; G_ and dE_ use this packed order (nAct_, padded actPad_).
+    int actDst_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{}, actSrc_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{};
+    int nAct_ = 0, actPad_ = 0;
     int keyEnt_[kMaxKeys][4]{};       // entries of key k: (z0,z0), (z0,z1), (z1,z0), (z1,z1)
     float keyEntW_[kMaxKeys][4]{};    // their weights a_ak a_bk
     AlignedArray<float> h_;           // kMaxKeys x kMaxBlock
     float k1_[kMaxKeys]{};
     std::uint32_t ver_[kMaxKeys]{};
-    bool hasH_[kMaxKeys]{}, member_[kMaxKeys]{}, listen_[kMaxKeys]{};
+    bool hasH_[kMaxKeys]{}, member_[kMaxKeys]{}, listen_[kMaxKeys]{}, newListener_[kMaxKeys]{};
     int members_[kMaxKeys]{}, listenList_[kMaxKeys]{};
     int nMembers_ = 0, nListen_ = 0;
     AlignedArray<float> G_;           // kMaxBlock x entPad

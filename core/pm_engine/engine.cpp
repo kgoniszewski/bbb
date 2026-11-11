@@ -14,6 +14,8 @@ namespace pm {
 namespace {
 
 constexpr double kPi = std::numbers::pi;
+// Loop bands of the Balanced and Eco tiers (see engine.h).
+constexpr double kBalancedLoopHz = 2000.0, kEcoLoopHz = 1000.0;
 
 // Damper landing time (felt-contact curve, plan §1.9): 80 ms for a slow
 // release down to 20 ms for the fastest.
@@ -36,6 +38,14 @@ inline float softClip(float x, bool& limited) noexcept {
 
 }  // namespace
 
+double loopCutoffForTier(QualityTier t, const PlateParams& plate) noexcept {
+    switch (t) {
+        case QualityTier::Balanced: return std::min(kBalancedLoopHz, plate.maxFreqHz);
+        case QualityTier::Eco: return std::min(kEcoLoopHz, plate.maxFreqHz);
+        default: return plate.maxFreqHz;
+    }
+}
+
 bool Engine::prepare(double sampleRate, int maxFrames) noexcept {
     PianoTable t;
     buildPianoTable(t);
@@ -46,8 +56,17 @@ bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) 
     if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
     boardModel_ = buildPlateBoard(boardCfg_.plate);
     const double g = boardCfg_.enabled ? std::clamp(boardCfg_.sympathetic, 0.0, 1.5) : 0.0;
-    const SoundboardBridge bridge(boardModel_, sampleRate, g, &table);
-    return prepareImpl(sampleRate, maxFrames, table, bridge, boardCfg_.enabled);
+    const double cutoff = boardCfg_.loopCutoffHz > 0.0 ? boardCfg_.loopCutoffHz
+                                                      : loopCutoffForTier(boardCfg_.tier, boardCfg_.plate);
+    // The tuner matches octaves on the partials as they sound on this board
+    // (bridge shifts, string-board hybrids); the bake then uses the result.
+    PianoTable tuned = table;
+    {
+        const SoundboardBridge pre(boardModel_, sampleRate, g, &table, cutoff);
+        tuneToSoundingPartials(tuned, pre);
+    }
+    const SoundboardBridge bridge(boardModel_, sampleRate, g, &tuned, cutoff);
+    return prepareImpl(sampleRate, maxFrames, tuned, bridge, boardCfg_.enabled);
 }
 
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table,
@@ -132,6 +151,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
             statK1_[k] = bank_.staticCorrection1(k);
         }
         if (!loop_.configure(keyZone_, kNumKeys, board_.zoneCount(), 2)) return false;
+        bank_.precomputeCoupledResponses();
         loop_.setGain(symGain_);
         // Peak gain from a key's bank output to the output, over every key,
         // pickup and board resonance (the modal sum evaluated at each mode's
@@ -524,13 +544,17 @@ void Engine::retargetDamper(int k, std::int64_t now, float releaseVelocity) noex
 // Displacement amplitude of key k's strings at the damper (peak estimate
 // from the normal modes' magnitudes).
 float Engine::keyAmplitude(int k) const noexcept {
-    const int m0 = bank_.segmentFirstMode(k), m1 = m0 + bank_.segmentModeCount(k);
-    double s = 0.0;
-    for (int i = m0; i < m1; ++i) {
-        const double a = std::hypot(double(bank_.stateRe(i)), double(bank_.stateIm(i))) * dampShape_[i];
-        s += a * a;
-    }
-    return static_cast<float>(std::sqrt(2.0 * s));
+    const int m0 = bank_.segmentFirstMode(k), n = bank_.segmentModeCount(k);
+    const float* zr = bank_.stateReData() + m0;
+    const float* zi = bank_.stateImData() + m0;
+    const float* ds = dampShape_.data() + m0;
+    // Squares only (no hypot): this runs for every key on every control tick
+    // while the pedal holds the dampers off.
+    // (n is a whole number of groups.)
+    float s[4] = {};
+    for (int i = 0; i < n; i += 4)
+        for (int j = 0; j < 4; ++j) s[j] += (zr[i + j] * zr[i + j] + zi[i + j] * zi[i + j]) * (ds[i + j] * ds[i + j]);
+    return std::sqrt(2.0f * ((s[0] + s[1]) + (s[2] + s[3])));
 }
 
 // Sustain-pedal factor of key k's damper amount (plan §1.9): felt offset e
@@ -667,10 +691,14 @@ void Engine::processBoard(int n) noexcept {
         const int k = hammers_[active_[a]].key;
         hView_[a] = contact_.view(bank_, k);
         io_[k].skip = true;
+    }
+    loop_.begin(bank_, board_, io_.data());
+    for (int a = 0; a < activeCount_; ++a) {
+        const int k = hammers_[active_[a]].key;
         uPrev_[k] = bank_.coupledInputHistory(k);
     }
     bank_.processSegmentsFree(io_.data(), n);
-    loop_.begin(bank_, io_.data(), n);
+    loop_.collect(bank_, io_.data(), n);
     const int* outZones = nullptr;
     const int nOut = loop_.outZones(outZones);
 
