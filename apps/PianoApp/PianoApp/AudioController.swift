@@ -3,8 +3,14 @@
 // 48 kHz / 64 frames, interruptions, route changes, media-services reset).
 //
 // The render block captures only the pm_host pointer (an OpaquePointer, a
-// plain value): no Swift object, no allocation, no lock, no I/O. Everything
-// else here runs on the main thread.
+// plain value): no Swift object, no allocation, no lock, no I/O.
+//
+// Everything else (session category, preferences and activation, engine
+// start/stop, graph rebuilds, notification handling) runs on one serial
+// queue, `audioQueue`: AVAudioSession calls can block for a long time and
+// must stay off the main thread, and serialising them means a notification
+// can never interleave with the launch sequence or another reconfigure.
+// Status snapshots are handed to `onStatus` on the main queue.
 import AVFoundation
 import Foundation
 import PianoCore
@@ -34,10 +40,26 @@ final class AudioController {
     private var observers: [NSObjectProtocol] = []
     private var generation = 0  // invalidates completions of superseded prepares
 
-    /// Called on the main thread whenever the status changes.
+    /// Owns every session and engine lifecycle call; all state above (and
+    /// `status`) is touched only on this queue after init.
+    private let audioQueue = DispatchQueue(label: "piano.audio.session", qos: .userInitiated)
+    /// Route-change and configuration-change notifications often arrive in
+    /// bursts during a device switch; they are coalesced into one pass that
+    /// runs once the burst has been quiet for this long.
+    private static let coalesceDelay: DispatchTimeInterval = .milliseconds(250)
+    private var pendingRouteWork: DispatchWorkItem?
+    private var pendingReconfigureReason: String?  // non-nil: the coalesced pass must reconfigure
+
+    /// Called on the main thread whenever the status changes. Set it on the
+    /// main thread before `start()`.
     var onStatus: ((Status) -> Void)?
-    private(set) var status = Status() {
-        didSet { onStatus?(status) }
+    private var status = Status() {
+        didSet {
+            let snapshot = status
+            DispatchQueue.main.async { [weak self] in
+                self?.onStatus?(snapshot)
+            }
+        }
     }
 
     init(host: EngineHost) {
@@ -50,19 +72,34 @@ final class AudioController {
 
     // MARK: - Start / stop
 
+    /// Runs `work` on `audioQueue` unless the controller is gone by then.
+    private func onAudioQueue(_ work: @escaping (AudioController) -> Void) {
+        audioQueue.async { [weak self] in
+            guard let self = self else { return }
+            work(self)
+        }
+    }
+
     func start() {
-        installObservers()
-        configureSession()
-        reconfigure(reason: "Starting")
+        onAudioQueue { me in
+            // Observers first: anything they post is queued behind this block.
+            me.installObservers()
+            me.configureSession()
+            me.reconfigure(reason: "Starting")
+        }
     }
 
     func stop() {
-        engine.stop()
-        status.running = false
-        status.message = "Stopped"
-        #if os(iOS)
-        try? AVAudioSession.sharedInstance().setActive(false, options: [])
-        #endif
+        onAudioQueue { me in
+            me.cancelPendingRouteWork()
+            me.generation += 1  // a prepare still in flight must not restart the engine
+            me.engine.stop()
+            me.status.running = false
+            me.status.message = "Stopped"
+            #if os(iOS)
+            try? AVAudioSession.sharedInstance().setActive(false, options: [])
+            #endif
+        }
     }
 
     // MARK: - Session (iOS)
@@ -107,7 +144,10 @@ final class AudioController {
 
     /// Stops the engine, re-prepares the C++ engine if the hardware sample
     /// rate differs from the prepared one, rebuilds the source node and starts.
-    func reconfigure(reason: String) {
+    /// audioQueue only.
+    private func reconfigure(reason: String) {
+        // This pass supersedes any coalesced route/configuration pass.
+        cancelPendingRouteWork()
         generation += 1
         let myGeneration = generation
         engine.stop()
@@ -119,37 +159,50 @@ final class AudioController {
         readHardwareStatus()
         var rate = status.sampleRate
         if !(rate > 0) {
-            rate = AudioController.preferredSampleRate
+            // The device can report 0 Hz mid-switch; keep the prepared rate
+            // rather than forcing a re-prepare to the preferred one.
+            rate = host.isPrepared && host.preparedSampleRate > 0 ? host.preparedSampleRate : AudioController.preferredSampleRate
         }
-        if host.isPrepared && host.preparedSampleRate == rate {
+        // Same rate (e.g. a route change between outputs at 48 kHz): no
+        // re-prepare, which would cost about a second of silence.
+        if host.isPrepared && abs(host.preparedSampleRate - rate) < 0.5 {
             buildGraphAndStart(sampleRate: rate)
             return
         }
         status.preparing = true
         status.message = "Preparing engine at \(Int(rate)) Hz"
         host.prepare(sampleRate: rate, maxFrames: max(AudioController.preferredFrames, status.ioBufferFrames)) { [weak self] ok in
-            guard let self = self, myGeneration == self.generation else { return }
-            self.status.preparing = false
-            if ok {
-                self.buildGraphAndStart(sampleRate: rate)
-            } else {
-                self.status.message = "Engine prepare failed"
+            // EngineHost calls back on the main thread; hop to audioQueue.
+            self?.onAudioQueue { me in
+                guard myGeneration == me.generation else { return }
+                me.status.preparing = false
+                if ok {
+                    me.buildGraphAndStart(sampleRate: rate)
+                } else {
+                    me.status.message = "Engine prepare failed"
+                }
             }
         }
     }
 
     /// Re-prepares at the current rate (after prepare-time parameter changes).
     /// Audio keeps running and is silent for the duration of the prepare.
+    /// Call from the main thread; completion runs on the main thread.
     func reprepare(completion: @escaping (Bool) -> Void) {
-        let rate = host.preparedSampleRate > 0 ? host.preparedSampleRate : status.sampleRate
-        guard rate > 0 else {
-            completion(false)
-            return
-        }
-        status.preparing = true
-        host.prepare(sampleRate: rate, maxFrames: max(AudioController.preferredFrames, status.ioBufferFrames)) { [weak self] ok in
-            self?.status.preparing = false
-            completion(ok)
+        onAudioQueue { me in
+            let rate = me.host.preparedSampleRate > 0 ? me.host.preparedSampleRate : me.status.sampleRate
+            guard rate > 0 else {
+                DispatchQueue.main.async { completion(false) }
+                return
+            }
+            me.status.preparing = true
+            me.host.prepare(sampleRate: rate, maxFrames: max(AudioController.preferredFrames, me.status.ioBufferFrames)) { [weak me] ok in
+                // Main thread here: clear the flag on audioQueue, report on main.
+                me?.onAudioQueue { inner in
+                    inner.status.preparing = false
+                    DispatchQueue.main.async { completion(ok) }
+                }
+            }
         }
     }
 
@@ -207,41 +260,87 @@ final class AudioController {
 
     // MARK: - Notifications
 
+    /// audioQueue only. Observer blocks run on the posting thread (queue nil)
+    /// and only forward to audioQueue.
     private func installObservers() {
         guard observers.isEmpty else { return }
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main) { [weak self] note in
-            guard let self = self, let changed = note.object as? AVAudioEngine, changed === self.engine else { return }
-            // The engine has stopped itself (output format or device changed).
-            self.reconfigure(reason: "Audio configuration changed")
+        observers.append(center.addObserver(forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) { [weak self] note in
+            let changed = note.object as? AVAudioEngine
+            self?.onAudioQueue { me in
+                guard let changed = changed, changed === me.engine else { return }
+                // The engine has stopped itself (output format or device changed).
+                me.scheduleRouteWork(reconfigureReason: "Audio configuration changed")
+            }
         })
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: session, queue: .main) { [weak self] note in
-            self?.handleInterruption(note)
-        })
-        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: session, queue: .main) { [weak self] _ in
-            guard let self = self else { return }
-            self.readHardwareStatus()
-            // A new route can bring another sample rate; the engine also
-            // posts a configuration change in that case, which reconfigures.
-            if self.status.running && !self.engine.isRunning {
-                self.reconfigure(reason: "Output route changed")
+        observers.append(center.addObserver(forName: AVAudioSession.interruptionNotification, object: session, queue: nil) { [weak self] note in
+            guard let info = note.userInfo,
+                  let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
+                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+            self?.onAudioQueue { me in
+                me.handleInterruption(type)
             }
         })
-        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: session, queue: .main) { [weak self] _ in
-            self?.handleMediaServicesReset()
+        observers.append(center.addObserver(forName: AVAudioSession.routeChangeNotification, object: session, queue: nil) { [weak self] _ in
+            self?.onAudioQueue { me in
+                me.scheduleRouteWork(reconfigureReason: nil)
+            }
+        })
+        observers.append(center.addObserver(forName: AVAudioSession.mediaServicesWereResetNotification, object: session, queue: nil) { [weak self] _ in
+            self?.onAudioQueue { me in
+                me.handleMediaServicesReset()
+            }
         })
         #endif
     }
 
+    // MARK: - Coalescing route / configuration changes (audioQueue only)
+
+    /// (Re)arms one delayed pass; every call within `coalesceDelay` of the
+    /// previous one pushes it back, so a burst ends in a single reconfigure.
+    private func scheduleRouteWork(reconfigureReason: String?) {
+        if let reason = reconfigureReason {
+            pendingReconfigureReason = reason
+        }
+        pendingRouteWork?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.runPendingRouteWork()
+        }
+        pendingRouteWork = item
+        audioQueue.asyncAfter(deadline: .now() + AudioController.coalesceDelay, execute: item)
+    }
+
+    private func cancelPendingRouteWork() {
+        pendingRouteWork?.cancel()
+        pendingRouteWork = nil
+        pendingReconfigureReason = nil
+    }
+
+    private func runPendingRouteWork() {
+        let reason = pendingReconfigureReason
+        pendingRouteWork = nil
+        pendingReconfigureReason = nil
+        if let reason = reason {
+            reconfigure(reason: reason)
+            return
+        }
+        // Route change only. A new route can bring another sample rate; the
+        // engine then also posts a configuration change, which reconfigures
+        // (and re-prepares only if the rate really differs).
+        readHardwareStatus()
+        if status.running && !engine.isRunning {
+            reconfigure(reason: "Output route changed")
+        }
+    }
+
     #if os(iOS)
-    private func handleInterruption(_ note: Notification) {
-        guard let info = note.userInfo,
-              let raw = info[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+    private func handleInterruption(_ type: AVAudioSession.InterruptionType) {
         switch type {
         case .began:
+            // Do not restart into an active interruption.
+            cancelPendingRouteWork()
             status.running = false
             status.message = "Interrupted"
         case .ended:
