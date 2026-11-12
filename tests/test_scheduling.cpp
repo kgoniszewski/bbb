@@ -52,9 +52,12 @@ TEST(event_offset_shifts_output) {
             std::printf("  culling %s, offset %2d: max difference %.3g (%.1f dB re peak)\n",
                         cull ? "on " : "off", k, d, 20 * std::log10(d / peak + 1e-30));
             CHECK(silentBefore);
-            // Damper envelopes update on an absolute 32-sample grid, so a
-            // note-off moved by k changes the damping curve by under one
-            // control period: a tiny, inaudible difference.
+            // Damper envelopes update on an absolute 32-sample grid, and
+            // what the sustain pedal moves on every second tick per key
+            // (engine.cpp, controlTick), so a note-off or pedal event moved
+            // by k changes the damping curve by under two control periods:
+            // a tiny, inaudible difference (about -62 dB re peak here, -73
+            // dB before the two-tick grid for the pedal).
             CHECK_LE(20 * std::log10(d / peak + 1e-30), -60.0);
         }
     }

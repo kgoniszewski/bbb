@@ -145,6 +145,16 @@ final class EngineHost {
     /// Thread CPU time per buffer (two kernel clock reads per buffer; off by default).
     func setCpuTiming(_ on: Bool) { pm_host_set_cpu_timing(raw, on ? 1 : 0) }
 
+    /// Per-phase render time (a few user-space clock reads per sub-block; off by default).
+    func setPhaseTiming(_ on: Bool) { pm_host_set_phase_timing(raw, on ? 1 : 0) }
+
+    /// Phase split (worst buffer, top 1 %, mean) and what the worst buffer did.
+    func phaseDiagnostics() -> pm_host_phase_diagnostics {
+        var d = pm_host_phase_diagnostics()
+        pm_host_get_phase_diagnostics(raw, &d)
+        return d
+    }
+
     /// How the engine was compiled (SIMD kernel, optimisation, NDEBUG, compiler).
     static var buildInfo: String { String(cString: pm_build_info()) }
 

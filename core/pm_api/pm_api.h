@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 7
+#define PM_API_VERSION_MINOR 8
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -292,6 +292,53 @@ void pm_host_get_diagnostics(const pm_host* host, pm_host_diagnostics* diagnosti
  * separates preemption from slow execution. Has no effect where the clock
  * does not exist. Takes effect at the next buffer. */
 void pm_host_set_cpu_timing(pm_host* host, int enabled);
+
+/* ------------------------------------------------------------------------
+ * Phase timing and event detail (API 0.8): where the render time of a slow
+ * buffer went. Off by default. When on, the engine reads a steady clock at
+ * about five points per 32-frame sub-block (16 sub-blocks in a 512-frame
+ * buffer) and twice per sample while a hammer is active, a user-space
+ * counter read (no lock, no allocation, no system call on Apple platforms);
+ * the split is then kept for the worst buffer, as a mean over all timed
+ * buffers and as a mean over the top 1 % by render time. Phases: events
+ * (event handling, control ticks, damper updates, loop set-up including
+ * impulse-response and zone-kernel recomputes), hammers (contact solves),
+ * free (the strings' block pass), forced (bridge input added to the
+ * strings), board (zone kernel and soundboard step), other (output stage,
+ * cull passes, the rest). The event kinds and recompute counts of the worst
+ * buffer are recorded whether or not timing is on. Since the last
+ * pm_host_reset_load. */
+enum pm_phase {
+    PM_PHASE_EVENTS = 0,
+    PM_PHASE_HAMMERS = 1,
+    PM_PHASE_FREE = 2,
+    PM_PHASE_FORCED = 3,
+    PM_PHASE_BOARD = 4,
+    PM_PHASE_OTHER = 5,
+    PM_PHASE_COUNT = 6
+};
+
+typedef struct pm_host_phase_diagnostics {
+    int32_t phase_timing;        /* 1 while phase timing is on */
+    int32_t worst_timed;         /* 1 if the worst buffer was timed (worst_phase_us valid) */
+    uint64_t timed_buffers;
+    uint64_t top_count;          /* buffers in the top-1 % mean (whole render-time bins, about 1.5 % wide) */
+    double worst_phase_us[PM_PHASE_COUNT];
+    double top_phase_us[PM_PHASE_COUNT];
+    double mean_phase_us[PM_PHASE_COUNT];
+    /* The worst buffer of pm_host_diagnostics: */
+    int32_t worst_note_ons;
+    int32_t worst_note_offs;     /* note-offs, including note-ons with velocity 0 */
+    int32_t worst_pedal_events;  /* sustain, sostenuto and una corda changes */
+    int32_t worst_damper_updates;   /* keys whose damper amount was applied to their strings */
+    int32_t worst_response_groups;  /* string mode groups whose loop impulse response was recomputed */
+    int32_t worst_kernel_rebuilds;  /* soundboard-loop zone-kernel rebuilds */
+    int32_t worst_idle_sub_blocks;  /* sub-blocks skipped as silent */
+    int32_t reserved;
+} pm_host_phase_diagnostics;
+
+void pm_host_set_phase_timing(pm_host* host, int enabled);
+void pm_host_get_phase_diagnostics(const pm_host* host, pm_host_phase_diagnostics* diagnostics);
 
 /* ------------------------------------------------------------------------
  * Build information (API 0.7): a static string describing how the engine

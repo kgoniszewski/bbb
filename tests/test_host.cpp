@@ -328,6 +328,60 @@ TEST(no_allocation_on_midi_and_audio_paths) {
     pm_host_destroy(h);
 }
 
+// Phase timing through the C API (0.8): off by default, then the split of
+// real render calls adds up to their render time, and the worst buffer
+// records the events it applied.
+TEST(phase_timing) {
+    pm_host* h = makeHost(true);
+    CHECK(h != nullptr);
+    if (!h) return;
+    std::vector<float> l(kFrames), r(kFrames);
+    pm_host_phase_diagnostics pd;
+    pm_host_get_phase_diagnostics(h, &pd);
+    CHECK(pd.phase_timing == 0 && pd.timed_buffers == 0);
+    for (int buf = 0; buf < 20; ++buf) pm_host_render(h, l.data(), r.data(), kFrames, bufferStart(buf));
+    pm_host_get_phase_diagnostics(h, &pd);
+    CHECK(pd.timed_buffers == 0);
+    pm_host_set_phase_timing(h, 1);
+    pm_host_reset_load(h);
+    gAllocs.store(0);
+    gArmed.store(true);
+    for (int buf = 20; buf < 200; ++buf) {
+        if (buf % 40 == 25) {
+            const std::uint8_t on[] = {0x90, 60, 100, 0x90, 64, 100, 0x90, 67, 100};
+            pm_host_midi_bytes(h, on, 9, 0, 1);
+        }
+        if (buf % 40 == 35) {
+            const std::uint8_t off[] = {0x80, 60, 64, 0x90, 64, 0, 0x80, 67, 64, 0xB0, 64, 127};
+            pm_host_midi_bytes(h, off, 12, 0, 1);
+        }
+        pm_host_render(h, l.data(), r.data(), kFrames, bufferStart(buf));
+        pm_host_get_phase_diagnostics(h, &pd);
+    }
+    gArmed.store(false);
+    pm_host_diagnostics d;
+    pm_host_get_diagnostics(h, &d);
+    pm_host_get_phase_diagnostics(h, &pd);
+    double sumMean = 0.0, sumWorst = 0.0;
+    for (int p = 0; p < PM_PHASE_COUNT; ++p) {
+        sumMean += pd.mean_phase_us[p];
+        sumWorst += pd.worst_phase_us[p];
+    }
+    std::printf("  timed %llu buffers; mean split %.1f us (render mean %.1f us); worst %.1f us of %.1f us, "
+                "%d on / %d off / %d pedal, %d damper updates, %d responses, %d kernels; allocations %ld\n",
+                static_cast<unsigned long long>(pd.timed_buffers), sumMean, d.mean_us, sumWorst, d.worst_render_us,
+                pd.worst_note_ons, pd.worst_note_offs, pd.worst_pedal_events, pd.worst_damper_updates,
+                pd.worst_response_groups, pd.worst_kernel_rebuilds, gAllocs.load());
+    CHECK(pd.phase_timing == 1 && pd.timed_buffers == 180 && pd.worst_timed == 1);
+    CHECK(pd.top_count >= 2);
+    // The engine's phases cover its render; pm_host_render adds the event
+    // forwarding and the meter around it.
+    CHECK(sumMean > 0.0 && sumMean <= d.mean_us * 1.001);
+    CHECK(sumWorst > 0.0 && sumWorst <= d.worst_render_us * 1.001);
+    CHECK(gAllocs.load() == 0);
+    pm_host_destroy(h);
+}
+
 TEST(null_tolerance) {
     pm_event e = sampleEvent(PM_EVENT_NOTE_ON, 0, 60, 1);
     pm_midi_monitor_entry m;
@@ -336,6 +390,8 @@ TEST(null_tolerance) {
     float buf[4];
     pm_host_destroy(nullptr);
     CHECK(pm_host_engine(nullptr) == nullptr);
+    pm_host_set_phase_timing(nullptr, 1);
+    pm_host_get_phase_diagnostics(nullptr, nullptr);
     pm_host_set_timebase(nullptr, 1, 1);
     CHECK(pm_host_prepare(nullptr, kFs, 64) == 0);
     CHECK(pm_host_is_prepared(nullptr) == 0 && pm_host_sample_rate(nullptr) == 0.0);

@@ -21,6 +21,9 @@ struct BenchmarkView: View {
                 Toggle("All tiers", isOn: $model.benchAllTiers)
                     .fixedSize()
                     .disabled(model.benchRunning)
+                Toggle("512 frames at 44.1 kHz", isOn: $model.benchLiveIO)
+                    .fixedSize()
+                    .disabled(model.benchRunning)
                 Button(copied ? "Copied" : "Copy") {
                     MonitorView.copyToClipboard(model.benchmarkExport())
                     copied = true
@@ -31,8 +34,10 @@ struct BenchmarkView: View {
             }
             Text(verbatim: model.benchProgress)
                 .foregroundColor(.secondary)
-            Text(verbatim: "48 kHz, 64-frame buffers, the selected quality tier; audio is paused during the run. "
-                 + "Mean, p99 and max of the render time per buffer, in us and in % of the buffer period; "
+            Text(verbatim: "48 kHz, 64-frame buffers (or 512 frames at 44.1 kHz, as an iPad app on a Mac is granted), "
+                 + "the selected quality tier; audio is paused during the run. "
+                 + "Mean, p99 and max of the render time per buffer, in us and in % of that buffer's period; "
+                 + "the live-playing scenes (legato, pedalling, chord release, idle) come after the others; "
                  + "then one hammer alone per key.")
                 .font(.caption)
                 .foregroundColor(.secondary)

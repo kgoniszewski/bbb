@@ -5,6 +5,7 @@ import SwiftUI
 @main
 struct PianoApp: App {
     @StateObject private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -12,6 +13,10 @@ struct PianoApp: App {
                 .environmentObject(model)
                 .onAppear {
                     model.start()
+                }
+                // Meter and monitor polling only while the app is active.
+                .onChange(of: scenePhase) { _, phase in
+                    model.setAppActive(phase == .active)
                 }
         }
     }
@@ -23,7 +28,7 @@ struct ContentView: View {
 
     var body: some View {
         TabView {
-            PlayView()
+            PlayView(model: model)
                 .tabItem {
                     Label("Play", systemImage: "pianokeys")
                 }

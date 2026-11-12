@@ -144,6 +144,52 @@ TEST(percentiles_worst_buffer_and_frame_counts) {
     CHECK(r.maxStallUs < 0.0);
 }
 
+// Phase timing: the split of the worst buffer, the mean over all timed
+// buffers and the mean over the top 1 % by render time; untimed buffers
+// count in the load statistics but not in the split. The worst buffer's
+// event kinds and recompute counts are kept with it.
+TEST(phase_split_worst_and_top_percent) {
+    LoadMeter m;
+    const double fs = 48000.0;
+    // 1000 timed buffers: 980 at 100 us (events 10, free 90), 20 at 400 us
+    // (events 300, free 100); one more, untimed, at 1000 us is the worst.
+    auto rec = [&](double us, double ev, double fr, bool timed) {
+        pm::host::BufferRecord b;
+        b.frames = 64;
+        b.periodSeconds = 64 / fs;
+        b.renderSeconds = us * 1e-6;
+        b.timed = timed;
+        b.phaseUs[0] = ev;
+        b.phaseUs[2] = fr;
+        b.noteOffs = timed ? 0 : 10;
+        b.damperUpdates = timed ? 0 : 10;
+        b.responseGroups = timed ? 0 : 123;
+        m.record(b);
+    };
+    for (int i = 0; i < 1000; ++i) {
+        const bool slow = i % 50 == 3;
+        rec(slow ? 400.0 : 100.0, slow ? 300.0 : 10.0, slow ? 100.0 : 90.0, true);
+    }
+    rec(1000.0, 0.0, 0.0, false);
+    auto s = m.snapshot();
+    CHECK(s.timedBuffers == 1000);
+    CHECK(s.topCount == 20);  // the 1 % (10) rounded up to the whole 400 us bin
+    CHECK_NEAR(s.topPhaseUs[0], 300.0, 1e-9);
+    CHECK_NEAR(s.topPhaseUs[2], 100.0, 1e-9);
+    CHECK_NEAR(s.meanPhaseUs[0], (980 * 10.0 + 20 * 300.0) / 1000, 1e-9);
+    CHECK(!s.worst.timed && s.worst.noteOffs == 10 && s.worst.damperUpdates == 10 &&
+          s.worst.responseGroups == 123);
+    // A timed worst buffer carries its own split.
+    rec(2000.0, 1500.0, 400.0, true);
+    s = m.snapshot();
+    CHECK(s.worst.timed && s.worst.phaseUs[0] == 1500.0 && s.worst.phaseUs[2] == 400.0);
+    CHECK(s.worst.noteOffs == 0);
+    m.requestReset();
+    rec(100.0, 1.0, 2.0, false);
+    s = m.snapshot();
+    CHECK(s.timedBuffers == 0 && s.topCount == 0 && s.meanPhaseUs[0] == 0.0);
+}
+
 TEST(worst_buffer_is_never_torn) {
     // The worst-buffer fields always come from one buffer: frames and
     // awake modes are written together (awake = 10 * frames).

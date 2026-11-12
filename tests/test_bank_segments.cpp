@@ -114,6 +114,50 @@ TEST(damper_scales_decay_rate) {
     CHECK(back);
 }
 
+// A damper change on a sleeping segment is applied when the segment wakes
+// (mode_bank.h, setSegmentDamper): the coefficients it then runs with, and
+// its output, are bit-identical to those of a segment that was awake when
+// the damper moved.
+TEST(sleeping_segment_takes_damper_on_wake) {
+    const StringParams p;
+    const int count = countStringModes(p, kFs);
+    ModeBank lazy, eager;
+    for (ModeBank* b : {&lazy, &eager}) {
+        b->allocateSegments(&count, 1);
+        b->setCulling(true, -100.0f);
+        loadInto(*b, 0, p, 40.0);
+    }
+    CHECK(lazy.activeGroups() == 0);
+    // Eager: awake (a non-zero state) when the damper moves.
+    for (int i = 0; i < count; ++i) eager.setState(i, 1e-3f, 0.0f);
+    bool same = true;
+    for (float d : {0.3f, 1.0f, 0.55f}) {
+        lazy.setSegmentDamper(0, d);
+        eager.setSegmentDamper(0, d);
+        for (int i = 0; i < count; ++i) same = same && lazy.coefficient(i) == eager.coefficient(i);
+    }
+    CHECK(same);
+    for (int i = 0; i < count; ++i) lazy.setState(i, 1e-3f, 0.0f);  // wakes, takes the damper
+    bool woke = true;
+    for (int i = 0; i < count; ++i) woke = woke && lazy.coefficient(i) == eager.coefficient(i);
+    CHECK(woke);
+    const int n = 4800;
+    std::vector<float> ya(n, 0.0f), yb(n, 0.0f);
+    SegmentIO ia, ib;
+    ia.out = ya.data();
+    ib.out = yb.data();
+    lazy.processSegments(&ia, n);
+    eager.processSegments(&ib, n);
+    double d = 0.0, peak = 0.0;
+    for (int i = 0; i < n; ++i) {
+        d = std::max(d, double(std::fabs(ya[i] - yb[i])));
+        peak = std::max(peak, double(std::fabs(yb[i])));
+    }
+    std::printf("  peak %.3g, max difference %.3g\n", peak, d);
+    CHECK(ia.wrote && peak > 0.0);
+    CHECK(d == 0.0);
+}
+
 TEST(skipped_segment_is_untouched) {
     const StringParams p;
     const int counts[2] = {countStringModes(p, kFs), countStringModes(p, kFs)};

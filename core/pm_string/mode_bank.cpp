@@ -19,7 +19,7 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
                     wOut_.allocate(padded) &&
                     dr0_.allocate(padded) && ci0_.allocate(padded) &&
                     dampRate_.allocate(padded) && dampAm1_.allocate(padded) &&
-                    groupInOut_.allocate(ng) && active_.allocate(ng) &&
+                    groupInOut_.allocate(ng) && active_.allocate(ng) && groupStale_.allocate(ng) &&
                     activeList_.allocate(ng) && segGroups_.allocate(ns + 1) &&
                     segCoupled_.allocate(ns) && groupSeg_.allocate(ng) && segVersion_.allocate(ns) &&
                     segWakeGain_.allocate(ns) && groupK0_.allocate(ng) && groupK1_.allocate(ng) &&
@@ -29,8 +29,15 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
                     segDamp_.allocate(ns) && segInput_.allocate(ns) &&
                     scratch_.allocate(static_cast<std::size_t>(kCullInterval) * simd::kWidth);
     capacity_ = ok ? static_cast<int>(padded) : 0;
-    if (ok)
+    if (ok) {
         for (std::size_t i = 0; i < ns; ++i) segCullScale_[i] = segInputScale_[i] = 1.0f;
+        for (std::size_t g = 0; g < ng; ++g) {
+            groupStale_[g] = 0;
+            groupSeg_[g] = 0;
+            active_[g] = 0;
+        }
+    }
+    activeCount_ = 0;
     size_ = 0;
     nSeg_ = ok ? segments : 0;
     sinceCull_ = 0;
@@ -62,6 +69,7 @@ bool ModeBank::allocateSegments(const int* modesPerSegment, int nSegments) noexc
     segGroups_[nSegments] = g;
     size_ = capacity_;
     for (int i = 0; i < groups; ++i) active_[i] = cullEnabled_ ? 0 : 1;
+    syncActive();
     touchAll();
     return true;
 }
@@ -79,6 +87,7 @@ void ModeBank::resize(int count) noexcept {
         if (g >= groupCount()) active_[g] = 0;
         else if (!cullEnabled_) active_[g] = 1;
     }
+    syncActive();
     touchAll();
 }
 
@@ -127,13 +136,61 @@ void ModeBank::setSegmentDamper(int s, float amount) noexcept {
     if (segDamp_[s] == amount) return;
     segDamp_[s] = amount;
     for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) invalidateResponse(g, false);
-    const int m0 = segmentFirstMode(s), m1 = m0 + segmentModeCount(s);
-    for (int i = m0; i < m1; ++i) {
-        const float am1 = damperAm1(amount * dampRate_[i]);
-        dampAm1_[i] = am1;
-        dr_[i] = dr0_[i] + am1 + dr0_[i] * am1;
-        ci_[i] = ci0_[i] * (1.0f + am1);
+    for (int g = segFirstGroup(s); g < segFirstGroup(s + 1); ++g) {
+        if (active_[g]) refreshGroup(g);
+        else groupStale_[g] = 1;
     }
+}
+
+void ModeBank::refreshGroup(int g) noexcept {
+    groupStale_[g] = 0;
+    const float amount = segDamp_[singleSegment_ ? 0 : groupSeg_[g]];
+    const int i0 = g * kGroupSize;
+    float x[kGroupSize];
+    bool series = true;
+    for (int j = 0; j < kGroupSize; ++j) {
+        x[j] = amount * dampRate_[i0 + j];
+        series = series && x[j] < 0.05f;
+    }
+    // The usual case (every x in the series range) as a branch-free loop
+    // the compiler vectorises; damperAm1() evaluates the same expression.
+    float am1[kGroupSize];
+    if (series)
+        for (int j = 0; j < kGroupSize; ++j)
+            am1[j] = -x[j] * (1.0f - x[j] * (0.5f - x[j] * (1.0f / 6.0f - x[j] * (1.0f / 24.0f))));
+    else
+        for (int j = 0; j < kGroupSize; ++j) am1[j] = damperAm1(x[j]);
+    for (int j = 0; j < kGroupSize; ++j) {
+        const int i = i0 + j;
+        dampAm1_[i] = am1[j];
+        dr_[i] = dr0_[i] + am1[j] + dr0_[i] * am1[j];
+        ci_[i] = ci0_[i] * (1.0f + am1[j]);
+    }
+}
+
+void ModeBank::syncActive() noexcept {
+    activeCount_ = 0;
+    for (int g = 0; g < groupCount(); ++g) {
+        if (!active_[g]) continue;
+        ++activeCount_;
+        if (groupStale_[g]) refreshGroup(g);
+    }
+}
+
+std::complex<double> ModeBank::coefficient(int i) const noexcept {
+    const int g = i / kGroupSize;
+    if (!groupStale_[g]) return {1.0 + static_cast<double>(dr_[i]), static_cast<double>(ci_[i])};
+    // The same float operations as refreshGroup().
+    const float am1 = damperAm1(segDamp_[singleSegment_ ? 0 : groupSeg_[g]] * dampRate_[i]);
+    const float dr = dr0_[i] + am1 + dr0_[i] * am1;
+    const float ci = ci0_[i] * (1.0f + am1);
+    return {1.0 + static_cast<double>(dr), static_cast<double>(ci)};
+}
+
+bool ModeBank::segmentAwake(int s) const noexcept {
+    for (int g = segFirstGroup(s); g < segFirstGroup(s + 1); ++g)
+        if (active_[g]) return true;
+    return false;
 }
 
 void ModeBank::wakeSegment(int s) noexcept {
@@ -157,6 +214,7 @@ void ModeBank::setState(int i, float re, float im) noexcept {
 void ModeBank::clearState() noexcept {
     for (int i = 0; i < capacity_; ++i) zr_[i] = zi_[i] = 0.0f;
     for (int g = 0; g < groupCount(); ++g) active_[g] = cullEnabled_ ? 0 : 1;
+    syncActive();
     touchAll();
 }
 
@@ -169,6 +227,7 @@ void ModeBank::setCulling(bool enabled, float thresholdDb) noexcept {
             any = zr_[m] != 0.0f || zi_[m] != 0.0f;
         active_[g] = any ? 1 : 0;
     }
+    syncActive();
     touchAll();
 }
 
@@ -180,11 +239,6 @@ void ModeBank::setSegmentCullOffset(int s, float stateDb, float inputDb) noexcep
     segInputScale_[s] = i;
 }
 
-int ModeBank::activeGroups() const noexcept {
-    int n = 0;
-    for (int g = 0; g < groupCount(); ++g) n += active_[g];
-    return n;
-}
 
 // Bound on the group's output gained per unit of summed |input|: each mode's
 // |z| grows by at most |wIn| sum|u|, so the output by sum |wIn| |wOut|.
@@ -202,6 +256,7 @@ void ModeBank::updateGroupGain(int g) noexcept {
 // but it only ever meets culled modes whose displacement is below
 // threshold / |wOut|, far below any felt compression, so wOut alone is used.
 void ModeBank::cullPass(const SegmentIO* io) noexcept {
+    if (activeCount_ == 0) return;
     for (int s = 0; s < nSeg_; ++s) {
         if (io && io[s].skip) continue;
         const float input = segInput_[s];
@@ -372,6 +427,7 @@ bool ModeBank::coupledResponse(int s, float* h, float* k1, Kernel kernel) noexce
         if (!valid[g]) hList_[nStale++] = g;
     }
     if (nActive == 0) return false;
+    responseGroups_ += static_cast<std::uint64_t>(nStale);
     if (nStale > 0) {
         // Responses of consecutive stale groups land in consecutive rows
         // when the groups are consecutive (the usual case: a damper change).
@@ -467,6 +523,7 @@ void ModeBank::wakeCoupled(int s, float inputBefore, const float* u, int n) noex
             if (acc * groupInOut_[g] > thr) break;
         }
         if (i == n) continue;
+        if (groupStale_[g]) refreshGroup(g);
         for (int m = g * kGroupSize; m < (g + 1) * kGroupSize; ++m) {
             const std::complex<double> w(wIn_[m], wInIm_[m]);
             std::complex<double> z = 0.0;
@@ -486,6 +543,7 @@ void ModeBank::wakeAllCoupled(int s, float u) noexcept {
     if (!cullEnabled_) return;
     for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) {
         if (active_[g]) continue;
+        if (groupStale_[g]) refreshGroup(g);
         for (int m = g * kGroupSize; m < (g + 1) * kGroupSize; ++m) {
             const std::complex<double> w(wIn_[m], wInIm_[m]);
             const std::complex<double> c(1.0 + double(dr_[m]), double(ci_[m]));

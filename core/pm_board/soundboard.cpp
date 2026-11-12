@@ -304,6 +304,7 @@ void CouplingLoop::reset() noexcept {
 }
 
 void CouplingLoop::rebuildKernel() noexcept {
+    ++rebuilds_;
     // Pack the entries the members use.
     int pos[kMaxEntries + kMaxTaps * kZ];
     for (int e = 0; e < nEnt_; ++e) pos[e] = -1;
@@ -380,7 +381,10 @@ void CouplingLoop::begin(ModeBank& bank, const Soundboard& board, const SegmentI
         if (!newListener_[k]) continue;
         const float u0 = keyInput(k, 0);
         bank.setCoupledInputHistory(k, u0);
-        if (!io[k].skip) bank.wakeAllCoupled(k, u0);
+        // With no input (a silent board) there is nothing to follow: the
+        // groups stay asleep and wake through the input bound once the
+        // board moves (ModeBank::applyCoupledInput).
+        if (!io[k].skip && u0 != 0.0f) bank.wakeAllCoupled(k, u0);
     }
 
     // Members and impulse responses.

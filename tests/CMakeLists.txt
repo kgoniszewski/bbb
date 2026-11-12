@@ -21,7 +21,8 @@ set(PM_TESTS
   test_soundboard_coupling
   test_passivity
   test_sympathetic
-  test_half_pedal)
+  test_half_pedal
+  test_idle)
 
 find_package(Threads REQUIRED)
 foreach(t IN LISTS PM_TESTS)

@@ -222,6 +222,8 @@ public:
     // Inspection: keys in the loop (awake coupled groups) during the last sub-block.
     int memberCount() const noexcept { return nMembers_; }
     int entryCount() const noexcept { return nEnt_; }
+    // Zone-kernel rebuilds so far.
+    std::uint64_t kernelRebuilds() const noexcept { return rebuilds_; }
 
 private:
     void rebuildKernel() noexcept;
@@ -246,6 +248,7 @@ private:
     bool hasH_[kMaxKeys]{}, member_[kMaxKeys]{}, listen_[kMaxKeys]{}, newListener_[kMaxKeys]{};
     int members_[kMaxKeys]{}, listenList_[kMaxKeys]{};
     int nMembers_ = 0, nListen_ = 0;
+    std::uint64_t rebuilds_ = 0;
     AlignedArray<float> G_;           // kMaxBlock x entPad
     AlignedArray<float> dE_;          // kMaxBlock x entPad: source displacement per entry
     AlignedArray<float> acc_;         // entPad

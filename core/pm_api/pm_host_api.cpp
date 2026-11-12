@@ -142,6 +142,25 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         rec.awakeModes = info.awakeModes;
         rec.events = info.events;
         rec.subBlocks = info.subBlocks;
+        rec.idleSubBlocks = info.idleSubBlocks;
+        rec.noteOns = info.noteOns;
+        rec.noteOffs = info.noteOffs;
+        rec.pedalEvents = info.pedalEvents;
+        rec.damperUpdates = info.damperUpdates;
+        rec.responseGroups = info.responseGroups;
+        rec.kernelRebuilds = info.kernelRebuilds;
+        const pm::EngineProfile& p = e->profile();
+        if (e->phaseTiming() && p.totalUs > 0.0) {
+            static_assert(pm::EngineProfile::kPhases + 1 == pm::host::kLoadPhases, "phase table out of date");
+            static_assert(PM_PHASE_COUNT == pm::host::kLoadPhases, "phase table out of date");
+            rec.timed = true;
+            double sum = 0.0;
+            for (int i = 0; i < pm::EngineProfile::kPhases; ++i) {
+                rec.phaseUs[i] = p.us[i];
+                sum += p.us[i];
+            }
+            rec.phaseUs[pm::EngineProfile::kPhases] = p.totalUs > sum ? p.totalUs - sum : 0.0;
+        }
     }
     host->core.meter().record(rec);
     host->lastFrames.store(frames, std::memory_order_relaxed);
@@ -235,6 +254,33 @@ void pm_host_get_diagnostics(const pm_host* host, pm_host_diagnostics* d) {
     d->worst_cpu_us = s.worst.cpuUs;
     d->max_stall_us = s.maxStallUs;
     d->cpu_timing = host->cpuTiming.load(std::memory_order_relaxed) && threadCpuSeconds() >= 0.0 ? 1 : 0;
+}
+
+void pm_host_set_phase_timing(pm_host* host, int enabled) {
+    if (!host) return;
+    if (pm::Engine* e = pmEngineOf(host->engine)) e->setPhaseTiming(enabled != 0);
+}
+
+void pm_host_get_phase_diagnostics(const pm_host* host, pm_host_phase_diagnostics* d) {
+    if (!host || !d) return;
+    *d = pm_host_phase_diagnostics{};
+    const pm::host::LoadSnapshot s = host->core.meter().snapshot();
+    if (const pm::Engine* e = pmEngineOf(host->engine)) d->phase_timing = e->phaseTiming() ? 1 : 0;
+    d->worst_timed = s.worst.timed ? 1 : 0;
+    d->timed_buffers = s.timedBuffers;
+    d->top_count = s.topCount;
+    for (int p = 0; p < PM_PHASE_COUNT; ++p) {
+        d->worst_phase_us[p] = s.worst.phaseUs[p];
+        d->top_phase_us[p] = s.topPhaseUs[p];
+        d->mean_phase_us[p] = s.meanPhaseUs[p];
+    }
+    d->worst_note_ons = s.worst.noteOns;
+    d->worst_note_offs = s.worst.noteOffs;
+    d->worst_pedal_events = s.worst.pedalEvents;
+    d->worst_damper_updates = s.worst.damperUpdates;
+    d->worst_response_groups = s.worst.responseGroups;
+    d->worst_kernel_rebuilds = s.worst.kernelRebuilds;
+    d->worst_idle_sub_blocks = s.worst.idleSubBlocks;
 }
 
 void pm_host_set_cpu_timing(pm_host* host, int enabled) {

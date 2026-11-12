@@ -1,10 +1,17 @@
 // Play screen (M2 minimal UI): status, MIDI sources, controls, CPU meter
 // and an on-screen keyboard strip.
+//
+// Observation (see AppModel): this view and the keyboard strip observe
+// nothing that changes while the engine idles. The status and meter
+// sections observe MeterStore (published only when a displayed value
+// changes) and AppModel (published only on user actions and audio or MIDI
+// configuration changes); the process-CPU line is a leaf of its own.
 import Foundation
 import SwiftUI
 
 struct PlayView: View {
-    @EnvironmentObject var model: AppModel
+    // Not observed: the sections below observe what they show.
+    let model: AppModel
     static let keyboardOctaves = 3
 
     var body: some View {
@@ -13,13 +20,16 @@ struct PlayView: View {
                 VStack(alignment: .leading, spacing: 16) {
                     StatusSection(meters: model.meters)
                     ControlsSection()
-                    CPUMeterView(meters: model.meters)
+                    CPUMeterView(meters: model.meters, cpu: model.cpuStore)
                 }
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            KeyboardStrip()
+            KeyboardStrip(model: model, keyboard: model.keyboard)
         }
+        // Meters are polled only while this tab is shown.
+        .onAppear { model.setPlayVisible(true) }
+        .onDisappear { model.setPlayVisible(false) }
     }
 }
 
@@ -28,15 +38,27 @@ struct StatusSection: View {
     @ObservedObject var meters: MeterStore
 
     var body: some View {
+        let m = meters.snapshot
+        let mismatch = model.ioMismatchText()
         VStack(alignment: .leading, spacing: 6) {
             Text("Status").font(.headline)
             row("Audio", model.audio.message + (model.audio.preparing ? " (preparing...)" : ""))
             row("Sample rate", model.audio.sampleRate > 0 ? String(format: "%.0f Hz", model.audio.sampleRate) : "-")
             row("I/O buffer", ioBufferText())
-            row("Render buffer", meters.renderFrames > 0 ? "\(meters.renderFrames) frames" : "-")
+            if !mismatch.isEmpty {
+                // The system did not grant the requested 48 kHz / 64 frames.
+                HStack(alignment: .firstTextBaseline) {
+                    Text(verbatim: "Not as requested")
+                        .foregroundColor(.orange)
+                        .frame(width: 120, alignment: .leading)
+                    Text(verbatim: mismatch)
+                        .foregroundColor(.orange)
+                }
+            }
+            row("Render buffer", m.renderFrames > 0 ? "\(m.renderFrames) frames" : "-")
             row("Output", model.audio.route)
-            row("Engine", "\(meters.awakeModes) modes awake, \(meters.activeHammers) hammers")
-            row("MIDI", "\(meters.midiMessages) messages, \(meters.droppedEvents) dropped events")
+            row("Engine", "\(m.awakeModes) modes awake, \(m.activeHammers) hammers")
+            row("MIDI", "\(m.midiEvents) engine events, \(m.droppedEvents) dropped")
             if !model.midiMessage.isEmpty {
                 row("MIDI status", model.midiMessage)
             }
@@ -105,10 +127,11 @@ struct ControlsSection: View {
 struct CPUMeterView: View {
     @EnvironmentObject var model: AppModel
     @ObservedObject var meters: MeterStore
+    let cpu: CpuStore
     @State private var copied = false
 
     var body: some View {
-        let d = meters.diag
+        let m = meters.snapshot
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("CPU: render time / buffer period").font(.headline)
@@ -116,57 +139,73 @@ struct CPUMeterView: View {
                 Button("Reset") { model.resetLoad() }
                     .buttonStyle(.bordered)
             }
-            meterRow("Now", meters.recentLoad)
-            meterRow("Mean", meters.meanLoad)
-            meterRow("p99", d.p99_load)
-            meterRow("Max", meters.maxLoad)
-            Text(verbatim: "Buffers over \(Int((meters.loadBudget * 100).rounded())) %: \(meters.overBudget) of \(meters.buffers)")
+            meterRow("Now", m.recentPct, budget: m.budgetPct)
+            meterRow("Mean", m.meanPct, budget: m.budgetPct)
+            meterRow("p99", m.p99Pct, budget: m.budgetPct)
+            meterRow("Max", m.maxPct, budget: m.budgetPct)
+            Text(verbatim: "Buffers over \(m.budgetPct) %: \(m.overBudget)")
                 .font(.caption)
                 .monospacedDigit()
             VStack(alignment: .leading, spacing: 2) {
-                Text(verbatim: "Render buffer: \(d.last_frames) frames = \(AppModel.us(d.last_period_us)); seen \(d.min_frames)...\(d.max_frames) frames, \(d.distinct_frame_counts) distinct size(s)")
-                Text(verbatim: "Render time: mean \(AppModel.us(d.mean_us)) (\(AppModel.pct(d.mean_load))), p99 \(AppModel.us(d.p99_us)) (\(AppModel.pct(d.p99_load))), max \(AppModel.us(d.max_us)) (\(AppModel.pct(d.max_load)))")
-                Text(verbatim: model.worstBufferText())
-                Text(verbatim: model.processCpuText())
-                if d.cpu_timing == 1 {
-                    Text(verbatim: "Largest wall minus CPU time of a buffer (preemption): \(AppModel.us(d.max_stall_us))")
-                }
+                if !m.renderLine.isEmpty { Text(verbatim: m.renderLine) }
+                Text(verbatim: m.worstLine)
+                ProcessCpuLine(cpu: cpu)
             }
             .font(.system(.caption, design: .monospaced))
             HStack(spacing: 16) {
                 Toggle("Thread CPU time", isOn: Binding(get: { model.cpuTiming }, set: { model.setCpuTiming($0) }))
                     .fixedSize()
+                Toggle("Phase timing", isOn: Binding(get: { model.phaseTiming }, set: { model.setPhaseTiming($0) }))
+                    .fixedSize()
                 Button(copied ? "Copied" : "Copy diagnostics") {
+                    // The full text (render times, phases, worst-buffer
+                    // events) is built only here.
                     MonitorView.copyToClipboard(model.diagnosticsText())
                     copied = true
                 }
                 .buttonStyle(.bordered)
             }
+            Text("Copy diagnostics has the render-time percentiles, the worst buffer's events and, with Phase timing on, where the time went.")
+                .font(.caption)
+                .foregroundColor(.secondary)
         }
     }
 
-    private func meterRow(_ label: String, _ value: Double) -> some View {
-        let color: Color = value > meters.loadBudget ? .red : (value > 0.5 ? .orange : .green)
+    private func meterRow(_ label: String, _ pct: Double, budget: Int) -> some View {
+        let color: Color = pct > Double(budget) ? .red : (pct > 50 ? .orange : .green)
         return HStack {
             Text(verbatim: label).frame(width: 50, alignment: .leading)
-            ProgressView(value: max(0.0, min(value, 1.0)))
+            ProgressView(value: max(0.0, min(pct / 100.0, 1.0)))
                 .tint(color)
-            Text(String(format: "%5.1f %%", value * 100.0))
+            Text(verbatim: String(format: "%5.1f %%", pct))
                 .monospacedDigit()
                 .frame(width: 72, alignment: .trailing)
         }
     }
 }
 
+/// The one view that observes the once-a-second process-CPU line.
+struct ProcessCpuLine: View {
+    @ObservedObject var cpu: CpuStore
+
+    var body: some View {
+        Text(verbatim: cpu.line)
+    }
+}
+
 struct KeyboardStrip: View {
-    @EnvironmentObject var model: AppModel
+    // Actions only (not observed); the keyboard position is the one thing
+    // this strip observes.
+    let model: AppModel
+    @ObservedObject var keyboard: KeyboardStore
 
     var body: some View {
         let octaves = PlayView.keyboardOctaves
+        let lowest = keyboard.lowestNote
         VStack(spacing: 4) {
             HStack {
                 Button("Octave -") { model.shiftKeyboard(octaves: -1, shown: octaves) }
-                Text(verbatim: MIDIMonitor.noteName(model.lowestNote) + " - " + MIDIMonitor.noteName(model.lowestNote + 12 * octaves))
+                Text(verbatim: MIDIMonitor.noteName(lowest) + " - " + MIDIMonitor.noteName(lowest + 12 * octaves))
                     .monospacedDigit()
                 Button("Octave +") { model.shiftKeyboard(octaves: 1, shown: octaves) }
                 Spacer()
@@ -175,10 +214,10 @@ struct KeyboardStrip: View {
                     .foregroundColor(.secondary)
             }
             .padding(.horizontal)
-            KeyboardView(lowestNote: model.lowestNote,
+            KeyboardView(lowestNote: lowest,
                          octaves: octaves,
-                         onNoteOn: { note, velocity in model.noteOn(note, velocity: velocity) },
-                         onNoteOff: { note in model.noteOff(note) })
+                         onNoteOn: { [model] note, velocity in model.noteOn(note, velocity: velocity) },
+                         onNoteOff: { [model] note in model.noteOff(note) })
                 .frame(height: 180)
         }
         .padding(.bottom, 4)

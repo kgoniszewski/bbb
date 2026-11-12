@@ -147,17 +147,21 @@ int main(void) {
         const char* info = pm_build_info();
         EXPECT(info != NULL && info[0] != 0);
         printf("  build: %s\n", info);
-        EXPECT(pm_bench_item_count(&bc) == 15);
+        /* 11 scenarios (7, then 4 of live playing, API 0.8) + 8 hammer keys;
+         * the 6 tier cases go before the live ones. */
+        EXPECT(pm_bench_item_count(&bc) == 19);
         bc.flags = PM_BENCH_ALL_TIERS;
-        EXPECT(pm_bench_item_count(&bc) == 21);
+        EXPECT(pm_bench_item_count(&bc) == 25);
+        EXPECT(pm_bench_item_name(&bc, 13)[0] == 'l'); /* legato */
         bc.flags = PM_BENCH_NO_HAMMER;
-        EXPECT(pm_bench_item_count(&bc) == 7);
-        EXPECT(pm_bench_item_name(&bc, 7)[0] == 0);
+        EXPECT(pm_bench_item_count(&bc) == 11);
+        EXPECT(pm_bench_item_name(&bc, 11)[0] == 0);
+        EXPECT(pm_bench_item_name(&bc, 8)[0] == 'p');  /* pedalling */
         bc.flags = 0;
         EXPECT(pm_bench_item_name(&bc, 3)[0] == 'c');  /* cluster */
-        EXPECT(pm_bench_item_name(&bc, 10)[0] == 'h'); /* hammer, key 40 */
+        EXPECT(pm_bench_item_name(&bc, 14)[0] == 'h'); /* hammer, key 40 */
         bc.hammer_strikes = 3;
-        EXPECT(pm_bench_run_item(&bc, 10, &br) == 1);
+        EXPECT(pm_bench_run_item(&bc, 14, &br) == 1);
         EXPECT(br.ok == 1 && br.kind == PM_BENCH_HAMMER && br.key == 40 && br.strings == 3 &&
                br.oversampling == 2 && br.contact_us > 0.0 && br.life_us > 0.0);
         bc.seconds = 0.05;

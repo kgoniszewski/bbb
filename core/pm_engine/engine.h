@@ -75,9 +75,27 @@
 //
 // Both outputs pass a 5 Hz DC blocker and a soft clipper that is transparent
 // below -1 dBFS (0.89) and never reaches 1.0.
+//
+// Cost of events (measured with per-buffer instruction counts, see
+// core/pm_bench "pedalling" and "release" scenes). A damper amount that
+// changes costs a coefficient update of the key's awake modes and a
+// recompute of the impulse response the loop caches for its awake coupled
+// groups (about one free pass of them over kSubBlock samples); sleeping
+// groups take the new amount when they wake (mode_bank.h). A key's own
+// damper motion applies on every control tick; what the sustain pedal moves
+// (every damper at once) on every second tick per key, half of the keys on
+// each, so a pedal stroke recomputes at most half of them per tick.
+//
+// Idle (setIdleSleep, on by default): with no string mode awake, no
+// hammer, no knock or damper noise and the board asleep for two sub-blocks,
+// the bank, the loop and the board are skipped, control ticks that would
+// change nothing are skipped, and once the output filters have decayed to
+// exactly zero the output stage writes zeros. Exact: the output is
+// bit-identical with it off (test_idle).
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 
 #include "pm_base/aligned.h"
@@ -122,14 +140,24 @@ struct RenderInfo {
     int hammersActive = 0;     // at the end of the buffer
     int hammersInContact = 0;  // hammers that touched a string during the buffer
     int awakeModes = 0;        // at the end of the buffer
+    int idleSubBlocks = 0;     // sub-blocks skipped as silent (board, loop and bank asleep)
+    // Events applied, by kind (note-on with velocity 0 counts as a note-off;
+    // pedal: sustain, sostenuto, una corda).
+    int noteOns = 0, noteOffs = 0, pedalEvents = 0;
+    int damperUpdates = 0;     // damper amounts applied to a key's modes
+    int responseGroups = 0;    // coupled groups whose impulse response was recomputed
+    int kernelRebuilds = 0;    // zone-kernel rebuilds of the soundboard loop
 };
 
-#if defined(PM_PROFILE)
-// Per-phase wall time of the last render() call, in microseconds. Only in
-// the profiling build of the engine (pm_engine_profile, which bench_engine
-// links); the real-time library has no timers. Everything not listed
-// (output mixing and filters, limiter, cull passes, hammer release,
-// statistics) is totalUs minus the sum of the phases.
+// Per-phase wall time of the last render() call, in microseconds, while
+// phase timing is on (Engine::setPhaseTiming, off by default; always on in
+// the profiling build pm_engine_profile that bench_engine links). Clock
+// reads: about five per sub-block (16 for 512 frames), plus two per sample
+// while a hammer is active (to split hammers from the board); each a
+// steady_clock read (a user-space counter read on Apple platforms and
+// Linux). Everything not listed (output mixing and filters, limiter, cull
+// passes, hammer release, statistics) is totalUs minus the sum of the
+// phases.
 struct EngineProfile {
     enum Phase : int {
         Events = 0,  // event handling, control tick (dampers, pedal), loop begin: wake-ups, impulse-response cache, kernel rebuild
@@ -142,7 +170,6 @@ struct EngineProfile {
     double us[kPhases] = {};
     double totalUs = 0.0;
 };
-#endif
 
 // Reported once per strike, when its hammer has left the string for good.
 struct StrikeInfo {
@@ -278,6 +305,12 @@ public:
         cullOn_.store(enabled, std::memory_order_relaxed);
         cullDb_.store(thresholdDb, std::memory_order_relaxed);
     }
+    // Idle sleep (on by default): with nothing sounding and no event, the
+    // bank, the soundboard loop, the board and the control ticks are
+    // skipped and the output stage stops once its filters have settled to
+    // exactly zero. Exact: the skipped work would compute zeros and change
+    // no state. Off only for A/B tests.
+    void setIdleSleep(bool on) noexcept { idleOn_.store(on, std::memory_order_relaxed); }
     float masterGainDb() const noexcept { return masterGainDb_.load(std::memory_order_relaxed); }
     float stereoWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
     SchedulingMode schedulingMode() const noexcept {
@@ -300,10 +333,12 @@ public:
     EngineStats stats() const noexcept;
     // Audio thread only, after render().
     const RenderInfo& lastRender() const noexcept { return info_; }
-#if defined(PM_PROFILE)
-    // Profiling build only: the phases of the last render() (same thread).
+    // The phases of the last render() while phase timing is on (same
+    // thread, after render()); zeros otherwise.
     const EngineProfile& profile() const noexcept { return prof_; }
-#endif
+    // Any thread; takes effect at the next render().
+    void setPhaseTiming(bool on) noexcept { phaseTiming_.store(on, std::memory_order_relaxed); }
+    bool phaseTiming() const noexcept { return phaseTiming_.load(std::memory_order_relaxed); }
 
     // Inspection, for tools and tests (not thread-safe against render()).
     double sampleRate() const noexcept { return fs_; }
@@ -363,6 +398,7 @@ private:
     float damperTarget(int k, std::int64_t now) const noexcept;
     void retargetDamper(int k, std::int64_t now, float releaseVelocity) noexcept;
     void controlTick(std::int64_t now) noexcept;
+    bool tickIsNoOp() const noexcept;
     void processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept;
     void processBoard(int n) noexcept;
     bool prepareImpl(double sampleRate, int maxFrames, const PianoTable& table, const BridgeAdmittance& bridge,
@@ -427,6 +463,12 @@ private:
     double pedalTau_ = 480.0;  // samples
     float pedalAt(std::int64_t t) const noexcept;
     float applied_[kNumKeys]{};
+    // Idle: consecutive quiet sub-blocks (capped at 2) and control ticks
+    // that changed nothing, with the parameters those ticks read.
+    int quietRun_ = 0, stableTicks_ = 0;
+    bool idleSleep_ = true;
+    std::atomic<bool> idleOn_{true};
+    float tickP0T_ = 0.0f, tickP0B_ = 0.0f, tickW_ = 0.0f, tickDampedCull_ = 0.0f;
 
     // Keys, dampers, pedal.
     bool keyDown_[kNumKeys]{};
@@ -497,9 +539,13 @@ private:
         std::atomic<std::uint64_t> deferred{0}, late{0}, limited{0}, nonFinite{0};
         std::atomic<float> peakPre{0.0f};
     } pub_;
-#if defined(PM_PROFILE)
-    EngineProfile prof_;
-#endif
+    using ProfClock = std::chrono::steady_clock;
+    void profLap(int phase) noexcept;
+    EngineProfile prof_{};
+    ProfClock::time_point profT_{};
+    bool profiling_ = false;
+    std::atomic<bool> phaseTiming_{false};
+    std::uint64_t damperUpdates_ = 0;  // counter, for RenderInfo::damperUpdates
 };
 
 }  // namespace pm

@@ -10,6 +10,14 @@
 //             every 100 ms: 12 hammers in contact at once, repeatedly
 //   bloom:    sustain pedal down, a staccato four-note chord every 0.5 s
 //   board off: worst and cluster without the soundboard (A/B)
+//   (with allTiers: worst, cluster and bloom at Balanced and Eco)
+// then, after those, scenes with the events of live playing:
+//   legato:   a melody with overlapping notes, each released while it
+//             sounds, and a bass line, pedal up
+//   pedalling: chords every 400-800 ms with legato pedalling, CC64 as
+//             ramps of many values and as plain on/off
+//   chord release: ten notes struck and released together, every 1.5 s
+//   idle:     nothing sounding (the cost of an idle engine)
 //   hammer:   cost of one active hammer per buffer, per key, while in
 //             contact and averaged over its life (from the launch until
 //             hammerFinished: the release wait, or since the sample path's
@@ -23,6 +31,7 @@
 #pragma once
 
 #include <cstdint>
+#include <vector>
 
 #include "pm_engine/engine.h"
 
@@ -37,7 +46,14 @@ struct Config {
     int hammerStrikes = 200; // per key, hammer micro-benchmark
 };
 
-enum class Scene : int { Worst = 0, Typical = 1, Cluster = 2, Bloom = 3 };
+enum class Scene : int {
+    Worst = 0, Typical = 1, Cluster = 2, Bloom = 3,
+    Legato = 4, Pedalling = 5, ChordRelease = 6, Idle = 7
+};
+
+// Every event of a scene up to sample 'end' (sample-time stamps), in time
+// order; events at the same time keep the order in which they are generated.
+void sceneEvents(Scene s, double sampleRate, std::uint64_t end, std::vector<Event>& out);
 
 struct Case {
     const char* name;  // static string

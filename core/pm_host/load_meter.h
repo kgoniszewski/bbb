@@ -16,7 +16,14 @@
 //    sequence counter so that a reader never mixes two buffers;
 //  - the frame counts seen: last, min, max and how many distinct values
 //    (a render callback with varying frame counts, e.g. behind a sample-
-//    rate converter, has more than one).
+//    rate converter, has more than one);
+//  - when the engine's phase timing is on, the per-phase split of the
+//    render time (events, hammers, free pass, forced pass, board, other):
+//    for the worst buffer, as a mean over all timed buffers and as a mean
+//    over the top 1 % by render time (phase sums kept per render-time bin,
+//    so the top 1 % is resolved to a bin, about 1.5 %);
+//  - for the worst buffer, the events by kind and the recomputations they
+//    caused (damper updates, impulse responses, zone-kernel rebuilds).
 #pragma once
 
 #include <algorithm>
@@ -29,6 +36,8 @@ namespace pm::host {
 // One rendered buffer. renderSeconds: wall time spent rendering;
 // periodSeconds: frames / sample rate; cpuSeconds: thread CPU time spent
 // rendering (< 0 when not measured).
+inline constexpr int kLoadPhases = 6;  // events, hammers, free, forced, board, other
+
 struct BufferRecord {
     double renderSeconds = 0.0;
     double periodSeconds = 0.0;
@@ -39,6 +48,11 @@ struct BufferRecord {
     int awakeModes = 0;
     int events = 0;
     int subBlocks = 0;
+    int idleSubBlocks = 0;
+    int noteOns = 0, noteOffs = 0, pedalEvents = 0;
+    int damperUpdates = 0, responseGroups = 0, kernelRebuilds = 0;
+    bool timed = false;                // phaseUs valid
+    double phaseUs[kLoadPhases] = {};
 };
 
 struct WorstBuffer {
@@ -53,6 +67,11 @@ struct WorstBuffer {
     int awakeModes = 0;
     int events = 0;
     int subBlocks = 0;
+    int idleSubBlocks = 0;
+    int noteOns = 0, noteOffs = 0, pedalEvents = 0;
+    int damperUpdates = 0, responseGroups = 0, kernelRebuilds = 0;
+    bool timed = false;
+    double phaseUs[kLoadPhases] = {};
 };
 
 struct LoadSnapshot {
@@ -73,6 +92,12 @@ struct LoadSnapshot {
     int lastFrames = 0, minFrames = 0, maxFrames = 0, distinctFrames = 0;
     double lastPeriodUs = 0.0;
     WorstBuffer worst;
+    // Phase timing: buffers timed since the reset, the mean split over them,
+    // and the mean over the top 1 % by render time (topCount buffers).
+    std::uint64_t timedBuffers = 0;
+    std::uint64_t topCount = 0;
+    double meanPhaseUs[kLoadPhases] = {};
+    double topPhaseUs[kLoadPhases] = {};
 };
 
 class LoadMeter {
@@ -101,7 +126,15 @@ public:
         if (a > 1.0) a = 1.0;
         recent_ = n_ == 1 ? load : recent_ + a * (load - recent_);
         bump(loadHist_[loadBin(load)]);
-        bump(usHist_[usBin(us)]);
+        const int ub = usBin(us);
+        bump(usHist_[ub]);
+        if (b.timed) {
+            for (int p = 0; p < kLoadPhases; ++p) {
+                addTo(phaseBin_[ub][p], b.phaseUs[p]);
+                addTo(phaseAll_[p], b.phaseUs[p]);
+            }
+            bump(phaseCnt_[ub]);
+        }
         if (us > maxUs_) maxUs_ = us;
         if (b.cpuSeconds >= 0.0) {
             // The CPU clock is read just outside the wall-clock interval.
@@ -137,6 +170,15 @@ public:
             wModes_.store(b.awakeModes, std::memory_order_relaxed);
             wEvents_.store(b.events, std::memory_order_relaxed);
             wSub_.store(b.subBlocks, std::memory_order_relaxed);
+            wIdle_.store(b.idleSubBlocks, std::memory_order_relaxed);
+            wOn_.store(b.noteOns, std::memory_order_relaxed);
+            wOff_.store(b.noteOffs, std::memory_order_relaxed);
+            wPedal_.store(b.pedalEvents, std::memory_order_relaxed);
+            wDamper_.store(b.damperUpdates, std::memory_order_relaxed);
+            wResp_.store(b.responseGroups, std::memory_order_relaxed);
+            wKernel_.store(b.kernelRebuilds, std::memory_order_relaxed);
+            wTimed_.store(b.timed, std::memory_order_relaxed);
+            for (int p = 0; p < kLoadPhases; ++p) wPhase_[p].store(b.timed ? b.phaseUs[p] : 0.0, std::memory_order_relaxed);
             worstSeq_.store(seq + 2, std::memory_order_release);
         }
         mean_.store(sum_ / static_cast<double>(n_), std::memory_order_relaxed);
@@ -205,12 +247,22 @@ public:
             w.awakeModes = wModes_.load(std::memory_order_relaxed);
             w.events = wEvents_.load(std::memory_order_relaxed);
             w.subBlocks = wSub_.load(std::memory_order_relaxed);
+            w.idleSubBlocks = wIdle_.load(std::memory_order_relaxed);
+            w.noteOns = wOn_.load(std::memory_order_relaxed);
+            w.noteOffs = wOff_.load(std::memory_order_relaxed);
+            w.pedalEvents = wPedal_.load(std::memory_order_relaxed);
+            w.damperUpdates = wDamper_.load(std::memory_order_relaxed);
+            w.responseGroups = wResp_.load(std::memory_order_relaxed);
+            w.kernelRebuilds = wKernel_.load(std::memory_order_relaxed);
+            w.timed = wTimed_.load(std::memory_order_relaxed);
+            for (int p = 0; p < kLoadPhases; ++p) w.phaseUs[p] = wPhase_[p].load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
             if (worstSeq_.load(std::memory_order_relaxed) == a) {
                 s.worst = w;
                 break;
             }
         }
+        phaseSummary(s);
         return s;
     }
 
@@ -235,6 +287,31 @@ private:
     static void bump(std::atomic<std::uint32_t>& c) noexcept {
         c.store(c.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
+    static void addTo(std::atomic<double>& c, double x) noexcept {
+        c.store(c.load(std::memory_order_relaxed) + x, std::memory_order_relaxed);
+    }
+    // Mean phase split over all timed buffers and over the top 1 % by
+    // render time: whole render-time bins from the top down until they hold
+    // at least 1 % of the timed buffers.
+    void phaseSummary(LoadSnapshot& s) const noexcept {
+        std::uint64_t total = 0;
+        for (int i = 0; i <= kUsBins; ++i) total += phaseCnt_[i].load(std::memory_order_relaxed);
+        s.timedBuffers = total;
+        if (total == 0) return;
+        for (int p = 0; p < kLoadPhases; ++p)
+            s.meanPhaseUs[p] = phaseAll_[p].load(std::memory_order_relaxed) / static_cast<double>(total);
+        const std::uint64_t want = (total + 99) / 100;
+        std::uint64_t n = 0;
+        double sum[kLoadPhases] = {};
+        for (int i = kUsBins; i >= 0 && n < want; --i) {
+            const std::uint32_t c = phaseCnt_[i].load(std::memory_order_relaxed);
+            if (c == 0) continue;
+            n += c;
+            for (int p = 0; p < kLoadPhases; ++p) sum[p] += phaseBin_[i][p].load(std::memory_order_relaxed);
+        }
+        s.topCount = n;
+        for (int p = 0; p < kLoadPhases; ++p) s.topPhaseUs[p] = sum[p] / static_cast<double>(n);
+    }
     template <typename Edge>
     static double percentile(const std::atomic<std::uint32_t>* h, int bins, double q, Edge edge) noexcept {
         std::uint64_t total = 0;
@@ -256,6 +333,10 @@ private:
         for (std::uint64_t& w : seenFrames_) w = 0;
         for (auto& c : loadHist_) c.store(0, std::memory_order_relaxed);
         for (auto& c : usHist_) c.store(0, std::memory_order_relaxed);
+        for (auto& c : phaseCnt_) c.store(0, std::memory_order_relaxed);
+        for (auto& row : phaseBin_)
+            for (auto& c : row) c.store(0.0, std::memory_order_relaxed);
+        for (auto& c : phaseAll_) c.store(0.0, std::memory_order_relaxed);
     }
 
     // Audio-thread state.
@@ -266,6 +347,10 @@ private:
     // Published.
     std::atomic<std::uint32_t> loadHist_[kLoadBins + 1] = {};
     std::atomic<std::uint32_t> usHist_[kUsBins + 1] = {};
+    // Phase timing: sums per render-time bin, over everything, and counts.
+    std::atomic<std::uint32_t> phaseCnt_[kUsBins + 1] = {};
+    std::atomic<double> phaseBin_[kUsBins + 1][kLoadPhases] = {};
+    std::atomic<double> phaseAll_[kLoadPhases] = {};
     std::atomic<double> mean_{0.0}, recentPub_{0.0}, maxPub_{0.0}, last_{0.0};
     std::atomic<double> meanUsPub_{0.0}, maxUsPub_{0.0}, stallPub_{-1.0}, lastPeriodUs_{0.0};
     std::atomic<int> lastFrames_{0}, minFramesPub_{0}, maxFramesPub_{0}, distinctPub_{0};
@@ -277,6 +362,9 @@ private:
     std::atomic<std::uint64_t> wIndex_{0};
     std::atomic<double> wLoad_{0.0}, wUs_{0.0}, wPeriodUs_{0.0}, wCpuUs_{-1.0};
     std::atomic<int> wFrames_{0}, wContact_{0}, wActive_{0}, wModes_{0}, wEvents_{0}, wSub_{0};
+    std::atomic<int> wIdle_{0}, wOn_{0}, wOff_{0}, wPedal_{0}, wDamper_{0}, wResp_{0}, wKernel_{0};
+    std::atomic<bool> wTimed_{false};
+    std::atomic<double> wPhase_[kLoadPhases] = {};
 };
 
 }  // namespace pm::host

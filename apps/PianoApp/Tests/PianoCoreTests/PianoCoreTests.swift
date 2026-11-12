@@ -54,16 +54,21 @@ final class PianoCoreTests: XCTestCase {
         XCTAssertEqual(diag.buffers, 20)
         XCTAssertEqual(diag.distinct_frame_counts, 1)
         XCTAssertGreaterThanOrEqual(diag.max_us, diag.p99_us)
+        var phases = pm_host_phase_diagnostics()
+        pm_host_get_phase_diagnostics(host, &phases)
+        XCTAssertEqual(phases.phase_timing, 0)
     }
 
     func testBenchmarkItems() {
         var config = pm_bench_config()
-        XCTAssertEqual(pm_bench_item_count(&config), 15)
+        // 11 scenarios (the live-playing ones from index 7, API 0.8) + 8 hammer keys.
+        XCTAssertEqual(pm_bench_item_count(&config), 19)
         XCTAssertEqual(String(cString: pm_bench_item_name(&config, 3)), "cluster (12 notes ff every 100 ms)")
+        XCTAssertEqual(String(cString: pm_bench_item_name(&config, 10)), "idle (nothing sounding)")
         XCTAssertFalse(String(cString: pm_build_info()).isEmpty)
         config.hammer_strikes = 2
         var result = pm_bench_result()
-        XCTAssertEqual(pm_bench_run_item(&config, 14, &result), 1)  // hammer, key 88
+        XCTAssertEqual(pm_bench_run_item(&config, 18, &result), 1)  // hammer, key 88
         XCTAssertEqual(result.key, 88)
         XCTAssertGreaterThan(result.contact_us, 0)
     }

@@ -23,52 +23,122 @@ Event ev(std::uint64_t t, EventType type, int note, int v7) {
     return e;
 }
 
-// The events of a scene due in [t0, t1).
-void sceneEvents(Scene s, double fs, std::uint64_t t0, std::uint64_t t1, std::vector<Event>& out) {
+}  // namespace
+
+void sceneEvents(Scene s, double fs, std::uint64_t end, std::vector<Event>& out) {
     out.clear();
-    const std::uint64_t period = static_cast<std::uint64_t>(0.5 * fs);
+    auto at = [fs](double seconds) { return static_cast<std::uint64_t>(seconds * fs); };
+    const std::uint64_t period = at(0.5);
+    auto add = [&](std::uint64_t t, EventType type, int note, int v7) {
+        if (t < end) out.push_back(ev(t, type, note, v7));
+    };
     switch (s) {
-        case Scene::Worst:
-            if (t0 == 0) out.push_back(ev(0, EventType::Sustain, 0, 127));
-            for (int n = 21; n <= 108; ++n) {
-                const std::uint64_t t = static_cast<std::uint64_t>(n - 21) * 48;  // 1 ms apart
-                if (t >= t0 && t < t1) out.push_back(ev(t, EventType::NoteOn, n, 110));
-            }
+        case Scene::Worst: {
+            add(0, EventType::Sustain, 0, 127);
+            const std::uint64_t ms = std::max<std::uint64_t>(1, at(0.001));
+            for (int n = 21; n <= 108; ++n) add(static_cast<std::uint64_t>(n - 21) * ms, EventType::NoteOn, n, 110);
             break;
+        }
         case Scene::Typical: {
             const int notes[4] = {48, 60, 64, 67};
-            for (std::uint64_t base = (t0 / period) * period; base < t1; base += period)
+            for (std::uint64_t base = 0; base < end; base += period)
                 for (int n : notes) {
-                    if (base >= t0) out.push_back(ev(base, EventType::NoteOn, n, 80));
-                    const std::uint64_t off = base + period * 3 / 4;
-                    if (off >= t0 && off < t1) out.push_back(ev(off, EventType::NoteOff, n, 64));
+                    add(base, EventType::NoteOn, n, 80);
+                    add(base + period * 3 / 4, EventType::NoteOff, n, 64);
                 }
             break;
         }
         case Scene::Cluster: {
-            const std::uint64_t cp = static_cast<std::uint64_t>(0.1 * fs);
-            for (std::uint64_t base = (t0 / cp) * cp; base < t1; base += cp) {
-                if (base < t0) continue;
+            const std::uint64_t cp = at(0.1);
+            for (std::uint64_t base = 0; base < end; base += cp) {
                 const int first = (base / cp) % 2 ? 72 : 48;
-                for (int n = first; n < first + 12; ++n) out.push_back(ev(base, EventType::NoteOn, n, 120));
-                for (int n = first; n < first + 12; ++n)
-                    out.push_back(ev(base + cp / 2, EventType::NoteOff, n, 64));
+                for (int n = first; n < first + 12; ++n) add(base, EventType::NoteOn, n, 120);
+                for (int n = first; n < first + 12; ++n) add(base + cp / 2, EventType::NoteOff, n, 64);
             }
             break;
         }
         case Scene::Bloom: {
-            if (t0 == 0) out.push_back(ev(0, EventType::Sustain, 0, 127));
+            add(0, EventType::Sustain, 0, 127);
             const int notes[4] = {48, 60, 64, 67};
-            for (std::uint64_t base = (t0 / period) * period; base < t1; base += period)
+            for (std::uint64_t base = 0; base < end; base += period)
                 for (int n : notes) {
-                    if (base >= t0) out.push_back(ev(base, EventType::NoteOn, n, 90));
-                    const std::uint64_t off = base + period / 5;
-                    if (off >= t0 && off < t1) out.push_back(ev(off, EventType::NoteOff, n, 64));
+                    add(base, EventType::NoteOn, n, 90);
+                    add(base + period / 5, EventType::NoteOff, n, 64);
                 }
             break;
         }
+        case Scene::Legato: {
+            // Right hand: a scale up and down, a note every 180 ms held for
+            // 250 ms (overlapping the next by 70 ms); left hand: a bass note
+            // every 720 ms held for 650 ms. Pedal up, every note released
+            // while it sounds.
+            const int melody[14] = {60, 62, 64, 65, 67, 69, 71, 72, 71, 69, 67, 65, 64, 62};
+            const int bass[4] = {36, 41, 43, 45};
+            const std::uint64_t ioi = at(0.18), hold = at(0.25);
+            for (std::uint64_t i = 0; i * ioi < end; ++i) {
+                const std::uint64_t t = i * ioi;
+                const int n = melody[i % 14];
+                add(t, EventType::NoteOn, n, 70 + static_cast<int>((i * 7) % 26));
+                add(t + hold, EventType::NoteOff, n, 64);
+                if (i % 4 == 0) {
+                    const int b = bass[(i / 4) % 4];
+                    add(t, EventType::NoteOn, b, 75);
+                    add(t + at(0.65), EventType::NoteOff, b, 50);
+                }
+            }
+            break;
+        }
+        case Scene::Pedalling: {
+            // Legato pedalling over a chord progression: at each chord change
+            // the pedal comes up, the new chord is struck 10 ms later, the
+            // pedal goes down 80 ms after that and the keys are released
+            // halfway through the chord (the pedal holds the strings).
+            // Chord lengths vary between 400 and 800 ms. On even chords
+            // CC64 arrives as a ramp of many values (as a continuous pedal
+            // sends it: down over 60 ms in 16 steps, up over 40 ms in 12
+            // steps); on odd chords as plain 0 / 127.
+            const int chords[4][5] = {{36, 48, 55, 60, 64}, {41, 53, 57, 60, 65}, {43, 55, 59, 62, 67}, {45, 57, 60, 64, 69}};
+            const double lens[6] = {0.45, 0.70, 0.55, 0.80, 0.40, 0.65};
+            double t = 0.0;
+            for (int c = 0; at(t) < end; ++c) {
+                const double len = lens[c % 6];
+                const bool ramp = c % 2 == 0;
+                if (c > 0) {
+                    if (ramp)
+                        for (int j = 1; j <= 12; ++j) add(at(t + 0.040 * (j - 1) / 11.0), EventType::Sustain, 0, 127 - 127 * j / 12);
+                    else
+                        add(at(t), EventType::Sustain, 0, 0);
+                }
+                const double on = t + 0.010, down = on + 0.080;
+                for (int n : chords[c % 4]) add(at(on), EventType::NoteOn, n, 72 + 6 * (c % 4));
+                if (ramp)
+                    for (int j = 1; j <= 16; ++j) add(at(down + 0.060 * (j - 1) / 15.0), EventType::Sustain, 0, 127 * j / 16);
+                else
+                    add(at(down), EventType::Sustain, 0, 127);
+                for (int n : chords[c % 4]) add(at(t + 0.5 * len), EventType::NoteOff, n, 64);
+                t += len;
+            }
+            break;
+        }
+        case Scene::ChordRelease: {
+            // Ten notes struck together and released together 1 s later,
+            // every 1.5 s, pedal up.
+            const int notes[10] = {36, 43, 48, 52, 55, 60, 64, 67, 72, 76};
+            const std::uint64_t cp = at(1.5);
+            for (std::uint64_t base = 0; base < end; base += cp)
+                for (int n : notes) {
+                    add(base, EventType::NoteOn, n, 100);
+                    add(base + at(1.0), EventType::NoteOff, n, 64);
+                }
+            break;
+        }
+        case Scene::Idle:
+            break;
     }
+    std::stable_sort(out.begin(), out.end(), [](const Event& a, const Event& b) { return a.time < b.time; });
 }
+
+namespace {
 
 #if defined(PM_PROFILE)
 Phases phasesOf(const EngineProfile& p) {
@@ -92,10 +162,24 @@ void accumulate(Phases& acc, const Phases& p, double w) {
 
 }  // namespace
 
-int caseCount(const Config& c) noexcept { return c.allTiers ? 13 : 7; }
+// The realistic scenes are appended after the tier cases, so that the
+// earlier cases keep their indices and output order.
+constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 4;
+
+int caseCount(const Config& c) noexcept { return kBaseCases + (c.allTiers ? kTierCases : 0) + kLiveCases; }
 
 Case caseAt(const Config& c, int i) noexcept {
     const QualityTier t = c.tier;
+    const int live = kBaseCases + (c.allTiers ? kTierCases : 0);
+    if (i >= live) {
+        switch (i - live) {
+            case 0: return {"legato (melody, note-offs, pedal up)", true, Scene::Legato, true, t};
+            case 1: return {"pedalling (chords, CC64 ramps / on-off)", true, Scene::Pedalling, true, t};
+            case 2: return {"release of a 10-note chord", true, Scene::ChordRelease, true, t};
+            case 3: return {"idle (nothing sounding)", true, Scene::Idle, true, t};
+            default: return {"?", true, Scene::Worst, true, t};
+        }
+    }
     switch (i) {
         case 0: return {"worst (88 keys held, pedal)", true, Scene::Worst, true, t};
         case 1: return {"worst, culling off", false, Scene::Worst, true, t};
@@ -139,10 +223,12 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     std::vector<Event> events;
     const int warmBlocks = static_cast<int>(warm * fs / block);
     const int blocks = std::max(1, static_cast<int>(c.seconds * fs / block));
+    sceneEvents(k.scene, fs, static_cast<std::uint64_t>(warmBlocks + blocks) * static_cast<std::uint64_t>(block), events);
+    std::size_t next = 0;
     std::uint64_t t = 0;
     auto step = [&](double* dt) {
-        sceneEvents(k.scene, fs, t, t + static_cast<std::uint64_t>(block), events);
-        for (const Event& e : events) eng.pushEvent(e);
+        const std::uint64_t t1 = t + static_cast<std::uint64_t>(block);
+        for (; next < events.size() && events[next].time < t1; ++next) eng.pushEvent(events[next]);
         const auto a = Clock::now();
         eng.render(l.data(), r.data(), block, nullptr);
         if (dt) *dt = std::chrono::duration<double>(Clock::now() - a).count();
