@@ -138,7 +138,14 @@ struct RenderInfo {
     int subBlocks = 0;         // processing segments the buffer was cut into
     int events = 0;            // events applied
     int hammersActive = 0;     // at the end of the buffer
-    int hammersInContact = 0;  // hammers that touched a string during the buffer
+    int hammersInContact = 0;  // hammers that touched a string during the buffer (released ones included)
+    // Most hammers in contact at the same sample (board off: in the same
+    // sub-block), and hammer-samples in contact (sum over the hammers of
+    // the base samples each spent touching a string).
+    int maxHammersInContact = 0;
+    int hammerContactSamples = 0;
+    int newtonEvals = 0;       // contact-solver Newton evaluations (each S felt forces)
+    int fallbackSolves = 0;    // contact substeps that needed the bracketed fallback
     int awakeModes = 0;        // at the end of the buffer
     int idleSubBlocks = 0;     // sub-blocks skipped as silent (board, loop and bank asleep)
     // Events applied, by kind (note-on with velocity 0 counts as a note-off;
@@ -146,12 +153,13 @@ struct RenderInfo {
     int noteOns = 0, noteOffs = 0, pedalEvents = 0;
     int damperUpdates = 0;     // damper amounts applied to a key's modes
     int responseGroups = 0;    // coupled groups whose impulse response was recomputed
-    int kernelRebuilds = 0;    // zone-kernel rebuilds of the soundboard loop
+    int kernelRebuilds = 0;    // full zone-kernel rebuilds of the soundboard loop (member set changed)
+    int kernelKeyUpdates = 0;  // keys whose zone-kernel columns were updated in place (response changed)
 };
 
 // Per-phase wall time of the last render() call, in microseconds, while
-// phase timing is on (Engine::setPhaseTiming, off by default; always on in
-// the profiling build pm_engine_profile that bench_engine links). Clock
+// phase timing is on (Engine::setPhaseTiming, off by default; bench_engine
+// turns it on). Clock
 // reads: about five per sub-block (16 for 512 frames), plus two per sample
 // while a hammer is active (to split hammers from the board); each a
 // steady_clock read (a user-space counter read on Apple platforms and
@@ -311,6 +319,10 @@ public:
     // exactly zero. Exact: the skipped work would compute zeros and change
     // no state. Off only for A/B tests.
     void setIdleSleep(bool on) noexcept { idleOn_.store(on, std::memory_order_relaxed); }
+    // Tests (not thread-safe against render()): rebuild the soundboard loop's
+    // zone kernel whole on every change instead of updating the changed
+    // columns in place (CouplingLoop::setAlwaysRebuild, the bit-exact reference).
+    void setKernelAlwaysRebuild(bool on) noexcept { loop_.setAlwaysRebuild(on); }
     float masterGainDb() const noexcept { return masterGainDb_.load(std::memory_order_relaxed); }
     float stereoWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
     SchedulingMode schedulingMode() const noexcept {
@@ -383,7 +395,10 @@ private:
         int key;
         std::uint64_t launchTime;
         float unaCorda;
-        std::int64_t contactMark;  // state.contactSubsteps at the end of the last render
+        // Hammer statistics already counted in a RenderInfo (contact
+        // substeps, Newton evaluations, fallbacks; zeroed at launch).
+        std::int64_t contactMark, evalMark;
+        int fallbackMark;
     };
     static constexpr std::uint8_t kStrikeOnly = 100;  // internal: deferred hammer launch
 
@@ -395,6 +410,7 @@ private:
     void noteOn(int k, std::uint16_t vel, std::int64_t now) noexcept;
     bool strike(int k, double velocity, std::int64_t now) noexcept;
     void releaseHammer(int slot, bool report) noexcept;
+    void harvestHammer(Hammer& h) noexcept;
     float damperTarget(int k, std::int64_t now) const noexcept;
     void retargetDamper(int k, std::int64_t now, float releaseVelocity) noexcept;
     void controlTick(std::int64_t now) noexcept;
@@ -534,6 +550,7 @@ private:
     int peakHammers_ = 0;
     int totalModes_ = 0;
     RenderInfo info_{};
+    double contactSamples_ = 0.0;  // this render: hammer-samples in contact
     struct Published {
         std::atomic<int> awakeGroups{0}, awakeModes{0}, activeHammers{0}, peakHammers{0};
         std::atomic<std::uint64_t> deferred{0}, late{0}, limited{0}, nonFinite{0};

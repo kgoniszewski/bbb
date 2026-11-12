@@ -10,7 +10,7 @@
 #include "pm_voicing/key_loader.h"
 
 // Per-phase timers (EngineProfile, engine.h), active while phase timing is
-// on (setPhaseTiming; always in the profiling build pm_engine_profile). A
+// on (setPhaseTiming). A
 // lap reads the clock and charges the time since the previous lap to a
 // phase; a mark restarts the interval without charging it (that time is
 // "other"). Off, each costs one predictable branch.
@@ -510,17 +510,34 @@ bool Engine::strike(int k, double velocity, std::int64_t now) noexcept {
     // with the damper when it wakes (mode_bank.h), and the solver reads them.
     bank_.wakeSegment(k);
     const HammerKeyModes m = contact_.view(bank_, k);
+    harvestHammer(h);  // a re-strike: what the last strike did in this buffer
     launchHammer(h.state, h.params, m, velocity);
-    h.contactMark = 0;
+    h.contactMark = h.evalMark = 0;
+    h.fallbackMark = 0;
     const float knock = knockLevel_.load(std::memory_order_relaxed);
     if (boardOn_ && knock > 0.0f && nKnocks_ < kMaxKnocks)
         knocks_[nKnocks_++] = Knock{k, knock * static_cast<float>(velocity), 0};
     return true;
 }
 
+// Adds what hammer h did since it was last counted to this render's info.
+void Engine::harvestHammer(Hammer& h) noexcept {
+    const std::int64_t dc = h.state.contactSubsteps - h.contactMark;
+    if (dc > 0) {
+        ++info_.hammersInContact;
+        contactSamples_ += static_cast<double>(dc) / std::max(1, contact_.view(bank_, h.key).oversampling);
+    }
+    info_.newtonEvals += static_cast<int>(h.state.newtonEvals - h.evalMark);
+    info_.fallbackSolves += h.state.fallbackSolves - h.fallbackMark;
+    h.contactMark = h.state.contactSubsteps;
+    h.evalMark = h.state.newtonEvals;
+    h.fallbackMark = h.state.fallbackSolves;
+}
+
 void Engine::releaseHammer(int a, bool report) noexcept {
     const int slot = active_[a];
     Hammer& h = hammers_[slot];
+    harvestHammer(h);
     if (report) {
         const HammerKeyModes m = contact_.view(bank_, h.key);
         StrikeInfo info;
@@ -580,11 +597,19 @@ float Engine::keyAmplitude(int k) const noexcept {
     const float* zi = bank_.stateImData() + m0;
     const float* ds = dampShape_.data() + m0;
     // Squares only (no hypot): this runs for every key on every control tick
-    // while the pedal holds the dampers off.
-    // (n is a whole number of groups.)
+    // while the pedal holds the dampers off. (n is a whole number of groups.)
+    // Only awake groups: a culled group's state is exactly zero, so skipping
+    // it adds exactly what it would have added (+0) and the sum is
+    // bit-identical, at the cost of the awake modes only.
+    constexpr int G = ModeBank::kGroupSize;
+    static_assert(G % 4 == 0, "lanes of the partial sums must not depend on the group");
+    const int g0 = m0 / G;
     float s[4] = {};
-    for (int i = 0; i < n; i += 4)
-        for (int j = 0; j < 4; ++j) s[j] += (zr[i + j] * zr[i + j] + zi[i + j] * zi[i + j]) * (ds[i + j] * ds[i + j]);
+    for (int base = 0; base < n; base += G) {
+        if (!bank_.groupActive(g0 + base / G)) continue;
+        for (int i = base; i < base + G; i += 4)
+            for (int j = 0; j < 4; ++j) s[j] += (zr[i + j] * zr[i + j] + zi[i + j] * zi[i + j]) * (ds[i + j] * ds[i + j]);
+    }
     return std::sqrt(2.0f * ((s[0] + s[1]) + (s[2] + s[3])));
 }
 
@@ -787,12 +812,14 @@ void Engine::processBoard(int n) noexcept {
         // Per-sample laps only while hammers are active (two clock reads
         // per sample); otherwise the whole loop is charged to the board.
         if (activeCount_ > 0) PM_PROF_LAP(Board);
+        int touching = 0;
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
             const int k = h.key;
             const float u = loop_.keyInput(k, i);
             float f = 0.0f;
             stepHammer(h.state, h.params, hView_[a], &u, &f, 1);
+            touching += h.state.inContact ? 1 : 0;
             // A hammer owns all of its key's modes: the key's full taps apply.
             f -= statK0_[k] * u + statK1_[k] * uPrev_[k];
             uPrev_[k] = u;
@@ -805,6 +832,7 @@ void Engine::processBoard(int n) noexcept {
             if (kz.w1 != 0.0f) zoneF_[kz.z0 + 1] += kz.w1 * fn;
         }
         if (activeCount_ > 0) PM_PROF_LAP(Hammers);
+        if (touching > info_.maxHammersInContact) info_.maxHammersInContact = touching;
         float tap[2] = {0.0f, 0.0f};
         loop_.forces(i, zoneF_, tap);
         hfL_[i] += tap[0];
@@ -898,12 +926,16 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
         }
     } else {
         PM_PROF_LAP(Events);
+        int touching = 0;
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
             const HammerKeyModes m = contact_.view(bank_, h.key);
+            const std::int64_t c0 = h.state.contactSubsteps;
             runHammer(h.state, h.params, m, io_[h.key].out, n);
             io_[h.key].skip = true;
+            touching += h.state.contactSubsteps > c0 ? 1 : 0;
         }
+        if (touching > info_.maxHammersInContact) info_.maxHammersInContact = touching;
         PM_PROF_LAP(Hammers);
         bank_.processSegments(io_.data(), n);
         PM_PROF_LAP(FreePass);
@@ -978,18 +1010,18 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     info_.subBlocks = 0;
     info_.idleSubBlocks = 0;
     info_.events = info_.noteOns = info_.noteOffs = info_.pedalEvents = 0;
-#if defined(PM_PROFILE)
-    profiling_ = true;
-#else
+    info_.hammersInContact = info_.maxHammersInContact = info_.hammerContactSamples = 0;
+    info_.newtonEvals = info_.fallbackSolves = 0;
+    contactSamples_ = 0.0;
     profiling_ = phaseTiming_.load(std::memory_order_relaxed);
-#endif
     ProfClock::time_point tRender{};
     if (profiling_) {
         prof_ = EngineProfile{};
         tRender = profT_ = ProfClock::now();
     }
     const std::uint64_t damperUpdates0 = damperUpdates_;
-    const std::uint64_t responses0 = bank_.responseGroupsComputed(), rebuilds0 = loop_.kernelRebuilds();
+    const std::uint64_t responses0 = bank_.responseGroupsComputed(), rebuilds0 = loop_.kernelRebuilds(),
+                        keyUpdates0 = loop_.kernelKeyUpdates();
     readParams();
     drainQueue(clock);
 
@@ -1020,14 +1052,9 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             ++awakeGroups;
             awakeModes += groupModes_[g];
         }
-    int inContact = 0;
-    for (int a = 0; a < activeCount_; ++a) {
-        Hammer& h = hammers_[active_[a]];
-        inContact += h.state.contactSubsteps > h.contactMark ? 1 : 0;
-        h.contactMark = h.state.contactSubsteps;
-    }
+    for (int a = 0; a < activeCount_; ++a) harvestHammer(hammers_[active_[a]]);
     info_.hammersActive = activeCount_;
-    info_.hammersInContact = inContact;
+    info_.hammerContactSamples = static_cast<int>(contactSamples_ + 0.5);
     info_.awakeModes = awakeModes;
     pub_.awakeGroups.store(awakeGroups, std::memory_order_relaxed);
     pub_.awakeModes.store(awakeModes, std::memory_order_relaxed);
@@ -1041,6 +1068,7 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     info_.damperUpdates = static_cast<int>(damperUpdates_ - damperUpdates0);
     info_.responseGroups = static_cast<int>(bank_.responseGroupsComputed() - responses0);
     info_.kernelRebuilds = static_cast<int>(loop_.kernelRebuilds() - rebuilds0);
+    info_.kernelKeyUpdates = static_cast<int>(loop_.kernelKeyUpdates() - keyUpdates0);
     if (profiling_) {
         // Time before the first sub-block (parameters, queue) and between
         // sub-blocks without a lap is "other" (totalUs minus the phases).

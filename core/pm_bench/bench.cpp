@@ -132,6 +132,32 @@ void sceneEvents(Scene s, double fs, std::uint64_t end, std::vector<Event>& out)
                 }
             break;
         }
+        case Scene::HammerBurst: {
+            const int notes[10] = {24, 29, 33, 36, 40, 43, 48, 52, 55, 60};
+            const std::uint64_t cp = at(1.0);
+            for (std::uint64_t base = 0; base < end; base += cp)
+                for (int n : notes) {
+                    add(base, EventType::NoteOn, n, 127);
+                    add(base + cp / 2, EventType::NoteOff, n, 64);
+                }
+            break;
+        }
+        case Scene::PedalChords: {
+            // At each change: pedal up, the new chord 10 ms later, pedal
+            // down 80 ms after that, keys released halfway through.
+            const int chords[8][5] = {{28, 40, 47, 56, 64}, {33, 45, 52, 61, 69}, {26, 38, 45, 54, 62},
+                                      {31, 43, 50, 59, 67}, {36, 48, 55, 64, 71}, {29, 41, 48, 57, 65},
+                                      {34, 46, 53, 62, 70}, {24, 36, 43, 52, 60}};
+            const double len = 0.7;
+            for (int c = 0; at(c * len) < end; ++c) {
+                const double t = c * len;
+                if (c > 0) add(at(t), EventType::Sustain, 0, 0);
+                for (int j = 0; j < 5; ++j) add(at(t + 0.010), EventType::NoteOn, chords[c % 8][j], 60 + 9 * ((c + j) % 5));
+                add(at(t + 0.090), EventType::Sustain, 0, 127);
+                for (int n : chords[c % 8]) add(at(t + 0.5 * len), EventType::NoteOff, n, 64);
+            }
+            break;
+        }
         case Scene::Idle:
             break;
     }
@@ -140,7 +166,6 @@ void sceneEvents(Scene s, double fs, std::uint64_t end, std::vector<Event>& out)
 
 namespace {
 
-#if defined(PM_PROFILE)
 Phases phasesOf(const EngineProfile& p) {
     static_assert(EngineProfile::kPhases + 1 == kPhaseCount, "phase table out of date");
     Phases r;
@@ -153,7 +178,20 @@ Phases phasesOf(const EngineProfile& p) {
     r.total = p.totalUs;
     return r;
 }
-#endif
+
+BufferDetail detailOf(const RenderInfo& i) {
+    BufferDetail d;
+    d.hammersInContact = i.hammersInContact;
+    d.maxHammersInContact = i.maxHammersInContact;
+    d.hammerContactSamples = i.hammerContactSamples;
+    d.newtonEvals = i.newtonEvals;
+    d.fallbackSolves = i.fallbackSolves;
+    d.kernelRebuilds = i.kernelRebuilds;
+    d.kernelKeyUpdates = i.kernelKeyUpdates;
+    d.responseGroups = i.responseGroups;
+    d.damperUpdates = i.damperUpdates;
+    return d;
+}
 
 void accumulate(Phases& acc, const Phases& p, double w) {
     for (int i = 0; i < kPhaseCount; ++i) acc.us[i] += w * p.us[i];
@@ -164,7 +202,7 @@ void accumulate(Phases& acc, const Phases& p, double w) {
 
 // The realistic scenes are appended after the tier cases, so that the
 // earlier cases keep their indices and output order.
-constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 4;
+constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 6;
 
 int caseCount(const Config& c) noexcept { return kBaseCases + (c.allTiers ? kTierCases : 0) + kLiveCases; }
 
@@ -177,6 +215,8 @@ Case caseAt(const Config& c, int i) noexcept {
             case 1: return {"pedalling (chords, CC64 ramps / on-off)", true, Scene::Pedalling, true, t};
             case 2: return {"release of a 10-note chord", true, Scene::ChordRelease, true, t};
             case 3: return {"idle (nothing sounding)", true, Scene::Idle, true, t};
+            case 4: return {"hammer burst (10 notes at 127, one sample)", true, Scene::HammerBurst, true, t};
+            case 5: return {"pedalled chords (8 roots, CC64 on/off)", true, Scene::PedalChords, true, t};
             default: return {"?", true, Scene::Worst, true, t};
         }
     }
@@ -215,6 +255,8 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     bc.tier = k.tier;
     eng.setSoundboardConfig(bc);
     if (!eng.prepare(fs, block)) return false;
+    const bool timing = c.phaseTiming;
+    eng.setPhaseTiming(timing);
     // The worst cases are measured from the first strike, so the max
     // includes the burst of 88 hammers (1 ms apart, pool of 32).
     const double warm = k.scene == Scene::Worst ? 0.0 : 0.5;
@@ -241,35 +283,40 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     const int firstBlocks = std::max(1, static_cast<int>(0.1 * fs / block));
     std::vector<double> dts(static_cast<std::size_t>(blocks));
     std::vector<Phases> ph(static_cast<std::size_t>(blocks));
-    double total = 0.0, first = 0.0, awake = 0.0;
+    double total = 0.0, first = 0.0, awake = 0.0, worstDt = -1.0;
+    long rebuilds = 0, keyUpdates = 0;
     for (int b = 0; b < blocks; ++b) {
         step(&dts[b]);
-#if defined(PM_PROFILE)
-        ph[b] = phasesOf(eng.profile());
-#else
-        ph[b].total = 1e6 * dts[b];
-#endif
+        if (timing) ph[b] = phasesOf(eng.profile());
+        else ph[b].total = 1e6 * dts[b];
+        const RenderInfo& info = eng.lastRender();
+        rebuilds += info.kernelRebuilds;
+        keyUpdates += info.kernelKeyUpdates;
+        if (dts[b] > worstDt) {
+            worstDt = dts[b];
+            res.maxDetail = detailOf(info);
+        }
         total += dts[b];
         if (b < firstBlocks) first += dts[b];
         awake += eng.stats().awakeModes;
     }
     res.meanAwakeModes = awake / blocks;
+    res.kernelRebuildsPerBuffer = static_cast<double>(rebuilds) / blocks;
+    res.kernelKeyUpdatesPerBuffer = static_cast<double>(keyUpdates) / blocks;
     res.first100msPercent = 100.0 * first / (std::min(firstBlocks, blocks) * period);
-#if defined(PM_PROFILE)
-    // Breakdown, ranked by the engine's own render time (the same buffers
-    // as the timing above to within the timer overhead).
-    res.hasPhases = true;
-    std::vector<int> order(static_cast<std::size_t>(blocks));
-    for (int b = 0; b < blocks; ++b) order[b] = b;
-    std::sort(order.begin(), order.end(), [&](int a, int b) { return ph[a].total > ph[b].total; });
-    res.maxIndex = order[0];
-    res.maxBuf = ph[order[0]];
-    res.topCount = std::max(1, blocks - static_cast<int>(0.99 * (blocks - 1)));
-    for (int i = 0; i < res.topCount; ++i) accumulate(res.top1, ph[order[i]], 1.0 / res.topCount);
-    for (int b = 0; b < blocks; ++b) accumulate(res.all, ph[b], 1.0 / blocks);
-#else
-    (void)accumulate;
-#endif
+    if (timing) {
+        // Breakdown, ranked by the engine's own render time (the same buffers
+        // as the timing above to within the timer overhead).
+        res.hasPhases = true;
+        std::vector<int> order(static_cast<std::size_t>(blocks));
+        for (int b = 0; b < blocks; ++b) order[b] = b;
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return ph[a].total > ph[b].total; });
+        res.maxIndex = order[0];
+        res.maxBuf = ph[order[0]];
+        res.topCount = std::max(1, blocks - static_cast<int>(0.99 * (blocks - 1)));
+        for (int i = 0; i < res.topCount; ++i) accumulate(res.top1, ph[order[i]], 1.0 / res.topCount);
+        for (int b = 0; b < blocks; ++b) accumulate(res.all, ph[b], 1.0 / blocks);
+    }
     std::sort(dts.begin(), dts.end());
     res.avgPercent = 100.0 * total / (blocks * period);
     res.p99Percent = 100.0 * dts[static_cast<std::size_t>(0.99 * (blocks - 1))] / period;

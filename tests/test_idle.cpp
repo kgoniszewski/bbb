@@ -4,6 +4,7 @@
 // exact: the output is identical with and without it, also across a pedal
 // press during the silence and the next note-on (no click, nothing lost),
 // and it does not depend on the buffer size.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -120,3 +121,50 @@ TEST(idle_sleep_is_buffer_size_invariant) {
     }
 }
 
+
+// The soundboard loop's zone kernel is updated in place, column by column,
+// when only some keys' impulse responses change (wake-ups and cull
+// decisions under a sustained chord); the result must be the full rebuild's
+// bit for bit (CouplingLoop, soundboard.h).
+TEST(kernel_column_update_matches_full_rebuild) {
+    auto at = [](double s) { return static_cast<std::uint64_t>(s * kFs); };
+    std::vector<pm::Event> ev = {sustain(0, true)};
+    const int chords[3][4] = {{36, 48, 55, 64}, {41, 53, 60, 69}, {31, 43, 59, 74}};
+    for (int c = 0; c < 3; ++c)
+        for (int n : chords[c]) {
+            ev.push_back(noteOn(at(0.05 + 0.6 * c) + 7 * n, n, 70 + 10 * c));
+            ev.push_back(noteOff(at(0.35 + 0.6 * c), n));
+        }
+    std::stable_sort(ev.begin(), ev.end(), [](const pm::Event& x, const pm::Event& y) { return x.time < y.time; });
+    const int n = static_cast<int>(2.4 * kFs), block = 256;
+    pm::Engine ref, upd;
+    ref.setKernelAlwaysRebuild(true);
+    ref.prepare(kFs, block);
+    upd.prepare(kFs, block);
+    Stereo a, b;
+    long rebuildsRef = 0, rebuildsUpd = 0, keyUpdates = 0;
+    for (Stereo* s : {&a, &b}) {
+        s->l.assign(static_cast<std::size_t>(n), 0.0f);
+        s->r.assign(static_cast<std::size_t>(n), 0.0f);
+    }
+    std::size_t next = 0;
+    for (int pos = 0; pos < n; pos += block) {
+        const int m = std::min(block, n - pos);
+        while (next < ev.size() && ev[next].time < ref.sampleTime() + static_cast<std::uint64_t>(m)) {
+            ref.pushEvent(ev[next]);
+            upd.pushEvent(ev[next++]);
+        }
+        ref.render(a.l.data() + pos, a.r.data() + pos, m, nullptr);
+        upd.render(b.l.data() + pos, b.r.data() + pos, m, nullptr);
+        rebuildsRef += ref.lastRender().kernelRebuilds;
+        rebuildsUpd += upd.lastRender().kernelRebuilds;
+        keyUpdates += upd.lastRender().kernelKeyUpdates;
+    }
+    int differ = 0;
+    for (int i = 0; i < n; ++i) differ += (a.l[i] != b.l[i] || a.r[i] != b.r[i]) ? 1 : 0;
+    std::printf("  full rebuilds %ld (reference) vs %ld + %ld in-place key updates; samples differing: %d of %d\n",
+                rebuildsRef, rebuildsUpd, keyUpdates, differ, n);
+    CHECK(differ == 0);
+    CHECK(keyUpdates > 0 && rebuildsUpd < rebuildsRef);
+    CHECK(peakAbs(a.l) > 1e-3);
+}

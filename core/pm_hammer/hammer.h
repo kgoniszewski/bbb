@@ -202,6 +202,7 @@ struct HammerState {
     int contacts = 0;            // separate contact episodes (any string touching)
     bool inContact = false;
     int fallbackSolves = 0;      // substeps solved by the nested fallback
+    std::int64_t newtonEvals = 0;  // Newton evaluations (S felt forces each), for load diagnostics
 };
 
 // Per-mode contact coefficients for every key of a segmented bank, parallel

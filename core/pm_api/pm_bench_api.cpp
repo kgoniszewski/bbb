@@ -19,6 +19,7 @@ pm::bench::Config toConfig(const pm_bench_config* c) {
     if (c->tier >= 0 && c->tier <= 2) k.tier = static_cast<pm::QualityTier>(c->tier);
     if (c->hammer_strikes > 0) k.hammerStrikes = c->hammer_strikes;
     k.allTiers = (c->flags & PM_BENCH_ALL_TIERS) != 0;
+    k.phaseTiming = (c->flags & PM_BENCH_PHASE_TIMING) != 0;
     return k;
 }
 
@@ -114,9 +115,6 @@ const char* pm_build_info(void) {
 #endif
 #if defined(__ARM_FEATURE_FMA) || defined(__FMA__)
         ", hardware fma"
-#endif
-#if defined(PM_PROFILE)
-        ", PM_PROFILE"
 #endif
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer)

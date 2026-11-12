@@ -414,7 +414,8 @@ inline bool powNear(double x, double x0, double invX0, double g0, double q, doub
 template <int S>
 inline void solveContacts(const Felt& felt, const double* dFree, const Felt::Point* q0, double Ah,
                           const double (&G)[kMaxStrings][kMaxStrings], const double* guess,
-                          Felt::Point* q1, double* F, double* jDiag, int& fallbacks) noexcept {
+                          Felt::Point* q1, double* F, double* jDiag, int& fallbacks,
+                          std::int64_t& evals) noexcept {
     double scale = 0.0;
     for (int s = 0; s < S; ++s) scale = std::max(scale, std::max(std::fabs(dFree[s]), std::fabs(q0[s].d)));
     const double tol = kSolveTol * scale;
@@ -426,6 +427,7 @@ inline void solveContacts(const Felt& felt, const double* dFree, const Felt::Poi
         ePrev[s] = 0.0;
     }
     for (int it = 0; it < 12; ++it) {
+        ++evals;
         double P = 0.0;
         for (int s = 0; s < S; ++s) {
             const double es = e[s];
@@ -573,7 +575,7 @@ struct ContactStep {
                     guess[s] += (dFree[s] - (st.dFreePrev[s] + 2.0 * st.dDFreePrev[s] - st.dDFreePrev2[s])) *
                                 st.sensPrev[s];
             }
-            solveContacts<S>(felt, dFree, q0, Ah, G, guess, q1, F, jDiag, st.fallbackSolves);
+            solveContacts<S>(felt, dFree, q0, Ah, G, guess, q1, F, jDiag, st.fallbackSolves, st.newtonEvals);
             for (int s = 0; s < S; ++s) {
                 P += F[s];
                 st.sensPrev[s] = jDiag[s] > 0.0 ? 1.0 / jDiag[s] : 0.0;
@@ -1025,6 +1027,7 @@ void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m
     h.contacts = 0;
     h.inContact = false;
     h.fallbackSolves = 0;
+    h.newtonEvals = 0;
 }
 
 void stepHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in,

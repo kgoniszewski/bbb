@@ -61,15 +61,26 @@ final class PianoCoreTests: XCTestCase {
 
     func testBenchmarkItems() {
         var config = pm_bench_config()
-        // 11 scenarios (the live-playing ones from index 7, API 0.8) + 8 hammer keys.
-        XCTAssertEqual(pm_bench_item_count(&config), 19)
+        // 13 scenarios (the live-playing ones from index 7: four in API 0.8,
+        // hammer burst and pedalled chords in 0.9) + 8 hammer keys.
+        XCTAssertEqual(pm_bench_item_count(&config), 21)
         XCTAssertEqual(String(cString: pm_bench_item_name(&config, 3)), "cluster (12 notes ff every 100 ms)")
         XCTAssertEqual(String(cString: pm_bench_item_name(&config, 10)), "idle (nothing sounding)")
+        XCTAssertEqual(String(cString: pm_bench_item_name(&config, 11)), "hammer burst (10 notes at 127, one sample)")
         XCTAssertFalse(String(cString: pm_build_info()).isEmpty)
         config.hammer_strikes = 2
         var result = pm_bench_result()
-        XCTAssertEqual(pm_bench_run_item(&config, 18, &result), 1)  // hammer, key 88
+        XCTAssertEqual(pm_bench_run_item(&config, 20, &result), 1)  // hammer, key 88
         XCTAssertEqual(result.key, 88)
         XCTAssertGreaterThan(result.contact_us, 0)
+    }
+
+    func testSpeedProbe() {
+        var stats = pm_speed_probe_stats()
+        let median = pm_speed_probe_run_us(21, &stats)
+        XCTAssertEqual(stats.runs, 21)
+        XCTAssertGreaterThan(stats.min_us, 0)
+        XCTAssertLessThanOrEqual(stats.min_us, median)
+        XCTAssertLessThanOrEqual(median, stats.max_us)
     }
 }

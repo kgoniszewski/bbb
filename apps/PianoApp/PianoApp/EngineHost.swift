@@ -155,6 +155,29 @@ final class EngineHost {
         return d
     }
 
+    /// Hammer work and zone-kernel updates of the worst buffer.
+    func worstDetail() -> pm_host_worst_detail {
+        var d = pm_host_worst_detail()
+        pm_host_get_worst_detail(raw, &d)
+        return d
+    }
+
+    /// Speed probe on the audio thread every `everyBuffers` render calls (0: off).
+    func setSpeedProbe(everyBuffers: Int) { pm_host_set_speed_probe(raw, Int32(max(0, everyBuffers))) }
+
+    func speedProbe() -> pm_speed_probe_stats {
+        var s = pm_speed_probe_stats()
+        pm_host_get_speed_probe(raw, &s)
+        return s
+    }
+
+    /// The same workload on the calling thread (non-real-time): its median, us.
+    static func runSpeedProbe(runs: Int) -> pm_speed_probe_stats {
+        var s = pm_speed_probe_stats()
+        _ = pm_speed_probe_run_us(Int32(runs), &s)
+        return s
+    }
+
     /// How the engine was compiled (SIMD kernel, optimisation, NDEBUG, compiler).
     static var buildInfo: String { String(cString: pm_build_info()) }
 

@@ -147,21 +147,23 @@ int main(void) {
         const char* info = pm_build_info();
         EXPECT(info != NULL && info[0] != 0);
         printf("  build: %s\n", info);
-        /* 11 scenarios (7, then 4 of live playing, API 0.8) + 8 hammer keys;
-         * the 6 tier cases go before the live ones. */
-        EXPECT(pm_bench_item_count(&bc) == 19);
+        /* 13 scenarios (7, then 6 of live playing: 4 in API 0.8, hammer
+         * burst and pedalled chords in 0.9) + 8 hammer keys; the 6 tier
+         * cases go before the live ones. */
+        EXPECT(pm_bench_item_count(&bc) == 21);
         bc.flags = PM_BENCH_ALL_TIERS;
-        EXPECT(pm_bench_item_count(&bc) == 25);
+        EXPECT(pm_bench_item_count(&bc) == 27);
         EXPECT(pm_bench_item_name(&bc, 13)[0] == 'l'); /* legato */
         bc.flags = PM_BENCH_NO_HAMMER;
-        EXPECT(pm_bench_item_count(&bc) == 11);
-        EXPECT(pm_bench_item_name(&bc, 11)[0] == 0);
+        EXPECT(pm_bench_item_count(&bc) == 13);
+        EXPECT(pm_bench_item_name(&bc, 13)[0] == 0);
         EXPECT(pm_bench_item_name(&bc, 8)[0] == 'p');  /* pedalling */
+        EXPECT(pm_bench_item_name(&bc, 11)[0] == 'h'); /* hammer burst */
         bc.flags = 0;
         EXPECT(pm_bench_item_name(&bc, 3)[0] == 'c');  /* cluster */
-        EXPECT(pm_bench_item_name(&bc, 14)[0] == 'h'); /* hammer, key 40 */
+        EXPECT(pm_bench_item_name(&bc, 16)[0] == 'h'); /* hammer, key 40 */
         bc.hammer_strikes = 3;
-        EXPECT(pm_bench_run_item(&bc, 14, &br) == 1);
+        EXPECT(pm_bench_run_item(&bc, 16, &br) == 1);
         EXPECT(br.ok == 1 && br.kind == PM_BENCH_HAMMER && br.key == 40 && br.strings == 3 &&
                br.oversampling == 2 && br.contact_us > 0.0 && br.life_us > 0.0);
         bc.seconds = 0.05;
@@ -170,6 +172,19 @@ int main(void) {
         EXPECT(br.mean_load > 0.0 && fabs(br.period_us - 1e6 * 64 / 48000.0) < 1e-9);
         printf("  bench item 6: mean %.1f us, p99 %.1f us, max %.1f us\n", br.mean_us, br.p99_us, br.max_us);
         EXPECT(pm_bench_run_item(&bc, 99, &br) == 0);
+    }
+
+    /* Speed probe (API 0.9): the reference measurement on this thread. */
+    {
+        pm_speed_probe_stats ps;
+        const double med = pm_speed_probe_run_us(31, &ps);
+        printf("  speed probe on this thread: min %.2f / median %.2f / max %.2f us\n", ps.min_us, ps.median_us, ps.max_us);
+        EXPECT(ps.runs == 31 && med == ps.median_us);
+        EXPECT(ps.min_us > 0.0 && ps.min_us <= ps.median_us && ps.median_us <= ps.max_us);
+        EXPECT(ps.min_us < 1000.0 && ps.checksum != 0.0f);
+        pm_host_set_speed_probe(NULL, 1);
+        pm_host_get_speed_probe(NULL, &ps);
+        pm_host_get_worst_detail(NULL, NULL);
     }
     printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

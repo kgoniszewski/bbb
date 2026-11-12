@@ -17,7 +17,7 @@ by a one-sample run-time loop (sympathetic resonance, pedal bloom),
 continuous half-pedalling, hammer-knock and damper-lift noise hooks, and a
 placeholder two-pickup output, and the app half of M2: a portable host
 layer (MIDI 1.0 / UMP parsing, event queues from the MIDI and UI threads,
-a prepare gate, a render-load meter with diagnostics; `core/pm_host`, C API 0.8), an
+a prepare gate, a render-load meter with diagnostics and a speed probe; `core/pm_host`, C API 0.9), an
 offline benchmark library shared by `bench_engine` and the app (`core/pm_bench`), a Swift
 package exposing the C API, and a SwiftUI app for iPad and Mac (see
 [iPad app](#ipad-app); not yet built by anyone, see its checklist). There
@@ -35,8 +35,8 @@ duplex yet.
 | `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface (smooth placeholder kept for unit tests), soundboard mode set v0 and its admittances (`soundboard_model.h`), unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
-| `core/pm_bench/` | Non-real-time: the engine benchmark scenarios (worst, typical, cluster, bloom, board-off A/Bs, then the live-playing scenes legato, pedalling, chord release and idle, and the hammer per key), shared by `bench_engine` and the app's Benchmark screen |
-| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, (0.6) the app host `pm_host_*`, (0.7) load diagnostics, build information and the offline benchmark `pm_bench_*`, (0.8) phase timing and the worst buffer's events; `include/` holds the Swift module map |
+| `core/pm_bench/` | Non-real-time: the engine benchmark scenarios (worst, typical, cluster, bloom, board-off A/Bs, then the live-playing scenes legato, pedalling, chord release, idle, hammer burst and pedalled chords, and the hammer per key), shared by `bench_engine` and the app's Benchmark screen |
+| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, (0.6) the app host `pm_host_*`, (0.7) load diagnostics, build information and the offline benchmark `pm_bench_*`, (0.8) phase timing and the worst buffer's events, (0.9) the worst buffer's hammer and zone-kernel detail, the speed probe and `PM_BENCH_PHASE_TIMING`; `include/` holds the Swift module map |
 | `Package.swift` | Swift package `PianoEngine`, library `PianoCore` (the C++ core, imported in Swift through the C API) |
 | `apps/PianoApp/` | SwiftUI app (iPadOS 17+, macOS 14+): XcodeGen spec `project.yml`, sources, and the package's Swift smoke test |
 | `tools/render_cli/` | Offline renderer: one plucked string to a mono WAV, or a text score through the engine to a stereo WAV |
@@ -330,6 +330,7 @@ input and free-running (the engine's case: no input).
 ```sh
 ./build/tools/bench/bench_engine                         # 48 kHz, 64-frame buffers
 ./build/tools/bench/bench_engine --block 512 --fs 44100  # what an iPad app on a Mac is granted
+./build/tools/bench/bench_engine --timing both           # every case with phase timing off and on
 ```
 
 Engine cost in % of one core: all 88 keys struck and held with the pedal
@@ -341,8 +342,13 @@ off (A/B), then (appended, so that the earlier lines stay comparable)
 scenes with the events of live playing: a legato melody with overlapping
 notes released while they sound, chords with legato pedalling (CC64 as
 ramps of many values and as plain on/off), a ten-note chord released
-together, and an idle engine; last, the cost of one hammer per buffer for
-eight keys. `--tier balanced|eco` and `--tiers` run the board cases at the
+together, an idle engine, a hammer burst (ten bass and middle notes at
+velocity 127 struck at the same sample, every second) and pedalled chords
+(eight different roots across the keyboard with legato on/off pedalling,
+which keeps the loop's awake set changing as in live playing); last, the
+cost of one hammer per buffer for eight keys (at mf, 2.2 m/s; the scenes
+use MIDI velocities 70-127, the clusters 120, the burst 127, i.e. 5.5
+m/s). `--tier balanced|eco` and `--tiers` run the board cases at the
 other quality tiers; `--block` and `--fs` set the buffer size and sample
 rate (every load is relative to the buffer's own period). Numbers from x86 machines are only indicative for the Apple
 silicon target (SSE2, 4-wide like NEON, is the closer proxy). A coupled
@@ -359,19 +365,27 @@ coupled modes), `board` (zone kernel, noise, knocks, board step) and
 `other` (output, filters, limiter, cull passes). It lets a run on the
 target attribute peaks without a profiler: note-onset buffers are mostly
 `hammer`, whose cost per hammer can be compared with the hammer-solver
-lines. bench_engine links the profiling build of the engine
-(`pm_engine_profile`, compiled with `PM_PROFILE`), in which the phase
-timers are always on; in the real-time library they exist too but are
-off unless enabled at run time (`Engine::setPhaseTiming`, C API
-`pm_host_set_phase_timing`, the app's Phase timing toggle). They read the
-clock about five times per 32-frame sub-block, plus twice per sample
-while a hammer is active, included in every number.
+lines. The breakdown uses the engine's run-time phase timing
+(`Engine::setPhaseTiming`, C API `pm_host_set_phase_timing`, the app's
+Phase timing toggle; there is no separate profiling build any more). It
+reads the clock about five times per 32-frame sub-block, plus twice per
+sample while a hammer is active, included in every number; `--timing
+both` measures what that costs (on the x86 container: within the run-to-run
+noise for every playing scene, about +1.3 µs per idle 512-frame buffer),
+`--timing off` skips it.
+
+The first line is the speed probe on the benchmark thread (see the Play
+screen's Speed probe toggle). Before the breakdown, per case, the most
+expensive buffer's hammer work (hammers that touched a string, the most
+at once, hammer-samples in contact, contact-solver Newton evaluations and
+fallbacks) and the zone-kernel full rebuilds and in-place key updates per
+buffer.
 
 The scenarios live in `core/pm_bench` (`bench.h`) and are also reachable
 through the C API (`pm_bench_item_count`, `pm_bench_item_name`,
-`pm_bench_run_item`): the app's Benchmark tab runs exactly these cases on
-the device (without the per-phase breakdown, which needs the profiling
-build).
+`pm_bench_run_item`; flag `PM_BENCH_PHASE_TIMING` runs them with phase
+timing on): the app's Benchmark tab runs exactly these cases on the
+device.
 
 ## Tests
 
@@ -473,7 +487,14 @@ your Team (bundle id placeholder `com.example.piano.app`: change it if
 Xcode says it is taken). Then:
 
 - **Mac first:** scheme `PianoAppMac`, destination "My Mac", Run. Plug the
-  M32 into the Mac; the Play tab lists it under MIDI sources.
+  M32 into the Mac; the Play tab lists it under MIDI sources. The native
+  Mac app asks the output device (HAL) for 48 kHz (only if the device
+  supports it; this changes the device's rate for every app, as audio
+  apps do) and a 64-frame buffer (clamped to the device's range); the
+  Play tab shows the request ("I/O request") and the grant ("I/O buffer",
+  "Not as requested"). An iPad app on a Mac (scheme `PianoApp`, "My Mac
+  (Designed for iPad)") cannot do this and runs at the device's current
+  settings.
 - **iPad:** connect the iPad (Developer Mode on), scheme `PianoApp`,
   destination the iPad, Run. Then connect the M32 to the iPad's USB-C
   port (directly, or through a powered hub if it does not power up).
@@ -548,8 +569,10 @@ Below the bars (C API `pm_host_get_diagnostics`):
   screen is locked); a load is always relative to that call's own period.
 - **Worst buffer**: for the buffer with the highest load since Reset, its
   frame count, render time and period, how many hammers touched a string
-  in it (and how many were active), awake modes, events applied and the
-  number of sub-blocks the engine cut it into.
+  in it (including hammers that left the strings and were released before
+  its end; API 0.9) and how many were still active at its end, awake
+  modes, events applied and the number of sub-blocks the engine cut it
+  into.
 - **Thread CPU time** (toggle, off by default: two kernel clock reads per
   buffer): adds the CPU time of the worst buffer and the largest
   wall-clock minus CPU time of any buffer. A worst buffer whose CPU time
@@ -563,6 +586,16 @@ Below the bars (C API `pm_host_get_diagnostics`):
   input into the strings), board (zone kernel and board step) and other,
   for the worst buffer, the top 1 % and the mean. Turning it on resets
   the meter so that all of them are timed.
+- **Speed probe** (toggle, off by default): every 8th render call first
+  runs a small fixed workload (`core/pm_host/speed_probe.h`: SIMD one-pole
+  modes and a scalar Newton chain, a few µs on a fast core, no
+  allocation) on the audio thread and records its time. Copy diagnostics
+  compares it with the same workload on the benchmark thread (from the
+  last Benchmark run; without one, on the main thread at the moment of
+  copying) and states the speed the audio thread ran at, e.g. "0.32x
+  (mean)". Below 1 the audio thread ran on a slower core or at a lower
+  clock than the benchmark: its "% of buffer" then overstates the work,
+  and the benchmark is the measure of headroom.
 - **Process CPU** (once a second, main thread): the whole app's CPU over
   the last second in % of one core, split into the audio render (from the
   meter), the main thread (UI) and the other threads (Core MIDI, system
@@ -570,14 +603,28 @@ Below the bars (C API `pm_host_get_diagnostics`):
 
 The meters are polled four times a second, and only while the Play tab is
 shown and the app is active; nothing on screen is updated unless what it
-shows changed, so an idle app leaves the main thread asleep (apart from
-the once-a-second CPU line).
+shows changed (the load rows, the status rows and the CPU line are
+separate observed leaves, so a changing load re-renders only the rows),
+so an idle app should leave the main thread asleep apart from the
+once-a-second CPU line. Measured on a Mac (iPad app) it still used about
+15 % of a core at idle; the cause could not be found from the code (the
+SwiftUI app cannot be built or profiled in the development container).
+**UI cost test** (segmented control at the bottom of the Play tab) hides
+the keyboard ("No keyboard"), stops the meter updates ("No meters") or
+both ("CPU line only"); the process-CPU line keeps updating in every
+mode, so comparing its "main thread" figure across the modes shows what
+each part costs. If even "CPU line only" stays high, the cost is outside
+these views (the tab bar, the window, the system) and needs Instruments
+(Time Profiler on the main thread).
 
 **Copy diagnostics** builds the full text at that moment: the above plus
 render time (mean, p99, max in µs and %; p99 from a histogram with 0.25 %
 bins), MIDI message counts, the worst buffer's events (note-ons, note-offs,
 pedal changes) and the recomputes they caused (damper updates, impulse
-responses, zone-kernel rebuilds), the phase split when timed, the build
+responses, zone-kernel full rebuilds and in-place key updates), its
+hammer work (hammers that touched a string, the most at once,
+hammer-samples in contact, Newton evaluations, fallbacks), the phase split
+when timed, the speed probe, the UI cost test mode, the build
 information (SIMD kernel, optimisation, NDEBUG, compiler), device, thermal
 state and audio route.
 
@@ -587,14 +634,17 @@ The Benchmark tab runs the `bench_engine` scenarios (`core/pm_bench`) on
 the device at 48 kHz in 64-frame buffers (or, with "512 frames at 44.1
 kHz", at what an iPad app on a Mac is granted), at the selected quality
 tier ("All tiers" adds Balanced and Eco): render time per buffer (mean, p99,
-max, in µs and %) per case, then one hammer alone per key. Audio output is
+max, in µs and %) per case, then one hammer alone per key. The first line
+is the speed probe on the benchmark thread, which Copy diagnostics uses
+as the reference for the audio thread's probe. Audio output is
 paused for the run (about a minute; each case prepares its own engine) so
 that the numbers are the engine's alone, then resumes by itself. The run
 is on a background thread of QoS user-interactive. Copy puts the table,
 with the build and device information, on the clipboard.
 
 What to send back from a device: the Benchmark table (Copy), at both
-buffer settings, and Copy diagnostics with Phase timing on after (a) a
+buffer settings, and Copy diagnostics with Phase timing and Speed probe
+on (after a Benchmark run, for the reference) after (a) a
 minute of normal playing, (b) Reset, then ten notes hard together and
 released together a few times, (c) Reset, then chords with the sustain
 pedal pressed and released, and (d) Reset, then a minute with nothing

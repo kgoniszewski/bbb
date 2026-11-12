@@ -1,4 +1,5 @@
 // C API of the app host (pm_api.h, "App host"), over pm::host::Host.
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <new>
@@ -6,6 +7,7 @@
 #include "pm_api/pm_api.h"
 #include "pm_api/pm_api_internal.h"
 #include "pm_host/host.h"
+#include "pm_host/speed_probe.h"
 
 struct pm_host {
     pm_engine* engine = nullptr;
@@ -18,6 +20,11 @@ struct pm_host {
     std::atomic<int32_t> lastFrames{0};
     std::atomic<bool> cpuTiming{false};
     std::uint32_t numer = 1, denom = 1;
+    // Speed probe: every probeEvery-th render call (0: off); the counter
+    // and the checksum sink belong to the audio thread.
+    std::atomic<int32_t> probeEvery{0};
+    int32_t probeCounter = 0;
+    std::atomic<float> probeSink{0.0f};
 };
 
 namespace {
@@ -109,6 +116,17 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         for (int32_t i = 0; i < frames; ++i) left[i] = right[i] = 0.0f;
         return;
     }
+    // Speed probe, before the timed render (it is not part of the render
+    // time, but of the callback's).
+    if (const int32_t every = host->probeEvery.load(std::memory_order_relaxed); every > 0) {
+        if (++host->probeCounter >= every) {
+            host->probeCounter = 0;
+            float sink = 0.0f;
+            const double us = pm::host::timeSpeedProbe(&sink);
+            host->probeSink.store(sink, std::memory_order_relaxed);
+            host->core.meter().recordProbe(us);
+        }
+    }
     const bool cpu = host->cpuTiming.load(std::memory_order_relaxed);
     const double c0 = cpu ? threadCpuSeconds() : -1.0;
     const auto t0 = std::chrono::steady_clock::now();
@@ -149,6 +167,11 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         rec.damperUpdates = info.damperUpdates;
         rec.responseGroups = info.responseGroups;
         rec.kernelRebuilds = info.kernelRebuilds;
+        rec.kernelKeyUpdates = info.kernelKeyUpdates;
+        rec.maxHammersInContact = info.maxHammersInContact;
+        rec.hammerContactSamples = info.hammerContactSamples;
+        rec.newtonEvals = info.newtonEvals;
+        rec.fallbackSolves = info.fallbackSolves;
         const pm::EngineProfile& p = e->profile();
         if (e->phaseTiming() && p.totalUs > 0.0) {
             static_assert(pm::EngineProfile::kPhases + 1 == pm::host::kLoadPhases, "phase table out of date");
@@ -281,6 +304,61 @@ void pm_host_get_phase_diagnostics(const pm_host* host, pm_host_phase_diagnostic
     d->worst_response_groups = s.worst.responseGroups;
     d->worst_kernel_rebuilds = s.worst.kernelRebuilds;
     d->worst_idle_sub_blocks = s.worst.idleSubBlocks;
+}
+
+void pm_host_get_worst_detail(const pm_host* host, pm_host_worst_detail* d) {
+    if (!host || !d) return;
+    *d = pm_host_worst_detail{};
+    const pm::host::LoadSnapshot s = host->core.meter().snapshot();
+    d->hammers_in_contact = s.worst.hammersInContact;
+    d->max_hammers_in_contact = s.worst.maxHammersInContact;
+    d->hammer_contact_samples = s.worst.hammerContactSamples;
+    d->newton_evals = s.worst.newtonEvals;
+    d->fallback_solves = s.worst.fallbackSolves;
+    d->kernel_rebuilds = s.worst.kernelRebuilds;
+    d->kernel_key_updates = s.worst.kernelKeyUpdates;
+}
+
+void pm_host_set_speed_probe(pm_host* host, int32_t every_n_buffers) {
+    if (host) host->probeEvery.store(every_n_buffers > 0 ? every_n_buffers : 0, std::memory_order_relaxed);
+}
+
+void pm_host_get_speed_probe(const pm_host* host, pm_speed_probe_stats* stats) {
+    if (!host || !stats) return;
+    *stats = pm_speed_probe_stats{};
+    stats->interval = host->probeEvery.load(std::memory_order_relaxed);
+    const pm::host::ProbeSnapshot p = host->core.meter().probeSnapshot();
+    stats->runs = p.count;
+    stats->min_us = p.minUs;
+    stats->median_us = p.medianUs;
+    stats->mean_us = p.meanUs;
+    stats->max_us = p.maxUs;
+}
+
+double pm_speed_probe_run_us(int32_t runs, pm_speed_probe_stats* stats) {
+    constexpr int kMax = 4096;
+    double t[kMax];
+    const int n = runs < 1 ? 1 : (runs > kMax ? kMax : runs);
+    float sink = 0.0f;
+    double sum = 0.0;
+    for (int i = 0; i < n; ++i) {
+        float r = 0.0f;
+        t[i] = pm::host::timeSpeedProbe(&r);
+        sink += r;
+        sum += t[i];
+    }
+    std::sort(t, t + n);
+    const double median = n % 2 ? t[n / 2] : 0.5 * (t[n / 2 - 1] + t[n / 2]);
+    if (stats) {
+        *stats = pm_speed_probe_stats{};
+        stats->runs = static_cast<uint64_t>(n);
+        stats->min_us = t[0];
+        stats->median_us = median;
+        stats->mean_us = sum / n;
+        stats->max_us = t[n - 1];
+        stats->checksum = sink;
+    }
+    return median;
 }
 
 void pm_host_set_cpu_timing(pm_host* host, int enabled) {

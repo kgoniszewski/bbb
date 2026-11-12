@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 8
+#define PM_API_VERSION_MINOR 9
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -266,8 +266,10 @@ typedef struct pm_host_diagnostics {
     /* The buffer with the highest load. */
     uint64_t worst_index;        /* its number since the reset (1 = first) */
     int32_t worst_frames;
-    int32_t worst_hammers_in_contact; /* hammers that touched a string in it */
-    int32_t worst_hammers_active;
+    int32_t worst_hammers_in_contact; /* hammers that touched a string in it, including those
+                                         released before its end (API 0.9; before: only those
+                                         still active at its end) */
+    int32_t worst_hammers_active;     /* active at its end */
     int32_t worst_awake_modes;
     int32_t worst_events;        /* events applied in it */
     int32_t worst_sub_blocks;    /* segments the engine cut it into */
@@ -332,13 +334,55 @@ typedef struct pm_host_phase_diagnostics {
     int32_t worst_pedal_events;  /* sustain, sostenuto and una corda changes */
     int32_t worst_damper_updates;   /* keys whose damper amount was applied to their strings */
     int32_t worst_response_groups;  /* string mode groups whose loop impulse response was recomputed */
-    int32_t worst_kernel_rebuilds;  /* soundboard-loop zone-kernel rebuilds */
+    int32_t worst_kernel_rebuilds;  /* full soundboard-loop zone-kernel rebuilds (API 0.9: only
+                                       when the loop's member set changes; see pm_host_worst_detail) */
     int32_t worst_idle_sub_blocks;  /* sub-blocks skipped as silent */
     int32_t reserved;
 } pm_host_phase_diagnostics;
 
 void pm_host_set_phase_timing(pm_host* host, int enabled);
 void pm_host_get_phase_diagnostics(const pm_host* host, pm_host_phase_diagnostics* diagnostics);
+
+/* ------------------------------------------------------------------------
+ * Hammer and kernel detail of the worst buffer (API 0.9), recorded whether
+ * or not phase timing is on. */
+typedef struct pm_host_worst_detail {
+    int32_t hammers_in_contact;      /* hammers that touched a string in it (= pm_host_diagnostics) */
+    int32_t max_hammers_in_contact;  /* most hammers touching at the same sample (board off: sub-block) */
+    int32_t hammer_contact_samples;  /* sum over hammers of the base samples each spent in contact */
+    int32_t newton_evals;            /* contact-solver Newton evaluations (each S felt forces) */
+    int32_t fallback_solves;         /* contact substeps that needed the bracketed fallback */
+    int32_t kernel_rebuilds;         /* full zone-kernel rebuilds (member set changed) */
+    int32_t kernel_key_updates;      /* keys whose zone-kernel columns were updated in place */
+    int32_t reserved;
+} pm_host_worst_detail;
+
+void pm_host_get_worst_detail(const pm_host* host, pm_host_worst_detail* detail);
+
+/* ------------------------------------------------------------------------
+ * Speed probe (API 0.9): how fast the audio thread actually executes. A
+ * fixed workload (core/pm_host/speed_probe.h: SIMD one-pole modes and a
+ * scalar Newton chain, a few microseconds on a fast core; no allocation,
+ * no lock) is timed on the audio thread at the start of every Nth
+ * pm_host_render call (before the render's own timing), and the same
+ * workload on any other thread with pm_speed_probe_run_us. The ratio
+ * reference / audio-thread time is the speed the audio thread ran at
+ * relative to the reference thread (core type, clock). Off by default. */
+typedef struct pm_speed_probe_stats {
+    int32_t interval;    /* pm_host_get_speed_probe: N (0 = off) */
+    int32_t reserved;
+    uint64_t runs;       /* probe runs since the last pm_host_reset_load (or measured) */
+    double min_us, median_us, mean_us, max_us;  /* host median: histogram bin centre, about 1.5 % */
+    float checksum;      /* pm_speed_probe_run_us: the workload's result (consumed) */
+    float reserved2;
+} pm_speed_probe_stats;
+
+/* Any thread; takes effect at the next buffer. every_n_buffers <= 0: off. */
+void pm_host_set_speed_probe(pm_host* host, int32_t every_n_buffers);
+void pm_host_get_speed_probe(const pm_host* host, pm_speed_probe_stats* stats);
+/* Runs the workload 'runs' times (1..4096) on the calling thread; returns
+ * the median in microseconds and fills stats (may be NULL). Non-real-time. */
+double pm_speed_probe_run_us(int32_t runs, pm_speed_probe_stats* stats);
 
 /* ------------------------------------------------------------------------
  * Build information (API 0.7): a static string describing how the engine
@@ -355,7 +399,8 @@ const char* pm_build_info(void);
  * hammer micro-benchmark per key (unless PM_BENCH_NO_HAMMER). */
 enum pm_bench_flags {
     PM_BENCH_ALL_TIERS = 1,  /* also worst/cluster/bloom at Balanced and Eco */
-    PM_BENCH_NO_HAMMER = 2
+    PM_BENCH_NO_HAMMER = 2,
+    PM_BENCH_PHASE_TIMING = 4  /* API 0.9: phase timing on during the scenarios (its cost included) */
 };
 
 enum pm_bench_kind {

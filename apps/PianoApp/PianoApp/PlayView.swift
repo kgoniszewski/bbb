@@ -6,6 +6,9 @@
 // sections observe MeterStore (published only when a displayed value
 // changes) and AppModel (published only on user actions and audio or MIDI
 // configuration changes); the process-CPU line is a leaf of its own.
+// PlayContent observes only the UI cost test mode (UICostStore), which hides
+// the keyboard and / or stops the meter poll so that the process-CPU line
+// shows what they cost on the main thread.
 import Foundation
 import SwiftUI
 
@@ -15,30 +18,81 @@ struct PlayView: View {
     static let keyboardOctaves = 3
 
     var body: some View {
+        PlayContent(model: model, ui: model.uiCost)
+            // Meters are polled only while this tab is shown.
+            .onAppear { model.setPlayVisible(true) }
+            .onDisappear { model.setPlayVisible(false) }
+    }
+}
+
+struct PlayContent: View {
+    let model: AppModel
+    @ObservedObject var ui: UICostStore
+
+    var body: some View {
+        let mode = ui.mode
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    StatusSection(meters: model.meters)
-                    ControlsSection()
-                    CPUMeterView(meters: model.meters, cpu: model.cpuStore)
+                    if mode != .minimal {
+                        StatusSection(status: model.engineStatus)
+                        ControlsSection()
+                        CPUMeterView(meters: model.meters, cpu: model.cpuStore)
+                    }
+                    UICostSection(model: model, mode: mode, cpu: model.cpuStore)
                 }
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            KeyboardStrip(model: model, keyboard: model.keyboard)
+            if mode.showsKeyboard {
+                KeyboardStrip(model: model, keyboard: model.keyboard)
+            }
         }
-        // Meters are polled only while this tab is shown.
-        .onAppear { model.setPlayVisible(true) }
-        .onDisappear { model.setPlayVisible(false) }
+    }
+}
+
+/// The UI cost test: hides parts of this screen so that the process-CPU
+/// line (kept running once a second in every mode) shows what they cost.
+struct UICostSection: View {
+    let model: AppModel
+    let mode: UICostMode
+    let cpu: CpuStore
+    @State private var copied = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("UI cost test")
+                Picker("UI cost test", selection: Binding(get: { mode }, set: { model.setUICostMode($0) })) {
+                    ForEach(UICostMode.allCases) { m in
+                        Text(m.label).tag(m)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 420)
+            }
+            if mode == .minimal {
+                ProcessCpuLine(cpu: cpu)
+                    .font(.system(.caption, design: .monospaced))
+                Button(copied ? "Copied" : "Copy diagnostics") {
+                    MonitorView.copyToClipboard(model.diagnosticsText())
+                    copied = true
+                }
+                .buttonStyle(.bordered)
+            }
+            Text("Hides the keyboard and / or stops the meter updates; the process-CPU line keeps updating once a second, so the change in \"main thread\" shows what the hidden part costs.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
     }
 }
 
 struct StatusSection: View {
     @EnvironmentObject var model: AppModel
-    @ObservedObject var meters: MeterStore
+    @ObservedObject var status: EngineStatusStore
 
     var body: some View {
-        let m = meters.snapshot
+        let m = status.snapshot
         let mismatch = model.ioMismatchText()
         VStack(alignment: .leading, spacing: 6) {
             Text("Status").font(.headline)
@@ -54,6 +108,9 @@ struct StatusSection: View {
                     Text(verbatim: mismatch)
                         .foregroundColor(.orange)
                 }
+            }
+            if !model.audio.ioRequest.isEmpty {
+                row("I/O request", model.audio.ioRequest)
             }
             row("Render buffer", m.renderFrames > 0 ? "\(m.renderFrames) frames" : "-")
             row("Output", model.audio.route)
@@ -125,13 +182,14 @@ struct ControlsSection: View {
 }
 
 struct CPUMeterView: View {
+    // Not observed here: LoadRows observes the meters, so a changing load
+    // re-renders only the rows, not the toggles and buttons.
     @EnvironmentObject var model: AppModel
-    @ObservedObject var meters: MeterStore
+    let meters: MeterStore
     let cpu: CpuStore
     @State private var copied = false
 
     var body: some View {
-        let m = meters.snapshot
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("CPU: render time / buffer period").font(.headline)
@@ -139,6 +197,38 @@ struct CPUMeterView: View {
                 Button("Reset") { model.resetLoad() }
                     .buttonStyle(.bordered)
             }
+            LoadRows(meters: meters)
+            ProcessCpuLine(cpu: cpu)
+                .font(.system(.caption, design: .monospaced))
+            HStack(spacing: 16) {
+                Toggle("Thread CPU time", isOn: Binding(get: { model.cpuTiming }, set: { model.setCpuTiming($0) }))
+                    .fixedSize()
+                Toggle("Phase timing", isOn: Binding(get: { model.phaseTiming }, set: { model.setPhaseTiming($0) }))
+                    .fixedSize()
+                Toggle("Speed probe", isOn: Binding(get: { model.speedProbe }, set: { model.setSpeedProbe($0) }))
+                    .fixedSize()
+                Button(copied ? "Copied" : "Copy diagnostics") {
+                    // The full text (render times, phases, worst-buffer
+                    // events) is built only here.
+                    MonitorView.copyToClipboard(model.diagnosticsText())
+                    copied = true
+                }
+                .buttonStyle(.bordered)
+            }
+            Text("Copy diagnostics has the render-time percentiles, the worst buffer's events and hammer work and, with Phase timing on, where the time went. Speed probe times a fixed workload on the audio thread every \(AppModel.speedProbeInterval) buffers; against the benchmark thread (run the benchmark once) it shows how fast the audio thread really runs.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
+/// The load rows: the only part of the CPU section that observes the meters.
+struct LoadRows: View {
+    @ObservedObject var meters: MeterStore
+
+    var body: some View {
+        let m = meters.snapshot
+        VStack(alignment: .leading, spacing: 6) {
             meterRow("Now", m.recentPct, budget: m.budgetPct)
             meterRow("Mean", m.meanPct, budget: m.budgetPct)
             meterRow("p99", m.p99Pct, budget: m.budgetPct)
@@ -149,25 +239,8 @@ struct CPUMeterView: View {
             VStack(alignment: .leading, spacing: 2) {
                 if !m.renderLine.isEmpty { Text(verbatim: m.renderLine) }
                 Text(verbatim: m.worstLine)
-                ProcessCpuLine(cpu: cpu)
             }
             .font(.system(.caption, design: .monospaced))
-            HStack(spacing: 16) {
-                Toggle("Thread CPU time", isOn: Binding(get: { model.cpuTiming }, set: { model.setCpuTiming($0) }))
-                    .fixedSize()
-                Toggle("Phase timing", isOn: Binding(get: { model.phaseTiming }, set: { model.setPhaseTiming($0) }))
-                    .fixedSize()
-                Button(copied ? "Copied" : "Copy diagnostics") {
-                    // The full text (render times, phases, worst-buffer
-                    // events) is built only here.
-                    MonitorView.copyToClipboard(model.diagnosticsText())
-                    copied = true
-                }
-                .buttonStyle(.bordered)
-            }
-            Text("Copy diagnostics has the render-time percentiles, the worst buffer's events and, with Phase timing on, where the time went.")
-                .font(.caption)
-                .foregroundColor(.secondary)
         }
     }
 

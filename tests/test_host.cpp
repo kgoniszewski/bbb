@@ -382,6 +382,89 @@ TEST(phase_timing) {
     pm_host_destroy(h);
 }
 
+// Speed probe (0.9): off by default; on, it runs on the render thread every
+// Nth call without allocating, its statistics are ordered and plausible
+// against the same workload on this (the same) thread, and it is not part
+// of the render time.
+TEST(speed_probe) {
+    pm_host* h = makeHost(true);
+    CHECK(h != nullptr);
+    if (!h) return;
+    std::vector<float> l(kFrames), r(kFrames);
+    pm_speed_probe_stats ps;
+    for (int buf = 0; buf < 8; ++buf) pm_host_render(h, l.data(), r.data(), kFrames, bufferStart(buf));
+    pm_host_get_speed_probe(h, &ps);
+    CHECK(ps.interval == 0 && ps.runs == 0);
+    pm_host_set_speed_probe(h, 4);
+    pm_host_reset_load(h);
+    gAllocs.store(0);
+    gArmed.store(true);
+    for (int buf = 8; buf < 8 + 400; ++buf) pm_host_render(h, l.data(), r.data(), kFrames, bufferStart(buf));
+    gArmed.store(false);
+    pm_host_get_speed_probe(h, &ps);
+    pm_speed_probe_stats ref;
+    const double refUs = pm_speed_probe_run_us(101, &ref);
+    pm_host_diagnostics d;
+    pm_host_get_diagnostics(h, &d);
+    std::printf("  audio-thread probe: %llu runs, min %.2f / median %.2f / mean %.2f / max %.2f us; "
+                "this thread %.2f us; render mean %.1f us; allocations %ld\n",
+                static_cast<unsigned long long>(ps.runs), ps.min_us, ps.median_us, ps.mean_us, ps.max_us, refUs,
+                d.mean_us, gAllocs.load());
+    CHECK(ps.interval == 4 && ps.runs == 100);
+    CHECK(ps.min_us > 0.0 && ps.min_us <= ps.median_us && ps.median_us <= ps.max_us);
+    CHECK(ps.min_us <= ps.mean_us && ps.mean_us <= ps.max_us);
+    // Same thread, same work: the medians agree to well within a factor 3
+    // (scheduling noise only).
+    CHECK(ps.median_us < 3.0 * refUs && refUs < 3.0 * ps.median_us);
+    CHECK(gAllocs.load() == 0);
+    pm_host_set_speed_probe(h, 0);
+    pm_host_reset_load(h);
+    for (int buf = 0; buf < 8; ++buf) pm_host_render(h, l.data(), r.data(), kFrames, bufferStart(buf));
+    pm_host_get_speed_probe(h, &ps);
+    CHECK(ps.interval == 0 && ps.runs == 0);
+    pm_host_destroy(h);
+}
+
+// Worst-buffer hammer detail (0.9): ten hard notes arriving in one 512-frame
+// buffer (board on). Most hammers have left their strings again before the
+// buffer ends, which the end-of-buffer count used to miss.
+TEST(worst_buffer_hammer_detail) {
+    pm_host* h = pm_host_create();
+    CHECK(h != nullptr);
+    if (!h) return;
+    constexpr int kBig = 512;
+    CHECK(pm_host_prepare(h, 44100.0, kBig) == 1);
+    std::vector<float> l(kBig), r(kBig);
+    for (int buf = 0; buf < 4; ++buf) pm_host_render(h, l.data(), r.data(), kBig, 0);
+    pm_host_reset_load(h);
+    const std::uint8_t notes[10] = {24, 29, 33, 36, 40, 43, 48, 52, 55, 60};
+    for (std::uint8_t n : notes) {
+        const std::uint8_t on[] = {0x90, n, 127};
+        pm_host_midi_bytes(h, on, 3, 0, 1);
+    }
+    for (int buf = 0; buf < 30; ++buf) pm_host_render(h, l.data(), r.data(), kBig, 0);
+    pm_host_diagnostics d;
+    pm_host_worst_detail w;
+    pm_host_phase_diagnostics pd;
+    pm_host_get_diagnostics(h, &d);
+    pm_host_get_worst_detail(h, &w);
+    pm_host_get_phase_diagnostics(h, &pd);
+    std::printf("  worst buffer #%llu: %d note-ons; %d hammers touched strings, at most %d at once, %d contact "
+                "samples, %d active at the end; %d Newton evaluations, %d fallbacks; kernel %d rebuilds + %d "
+                "key updates\n",
+                static_cast<unsigned long long>(d.worst_index), pd.worst_note_ons, w.hammers_in_contact,
+                w.max_hammers_in_contact, w.hammer_contact_samples, d.worst_hammers_active, w.newton_evals,
+                w.fallback_solves, w.kernel_rebuilds, w.kernel_key_updates);
+    CHECK(pd.worst_note_ons == 10);
+    CHECK(w.hammers_in_contact == 10 && d.worst_hammers_in_contact == 10);
+    CHECK(w.max_hammers_in_contact >= 5 && w.max_hammers_in_contact <= 10);
+    CHECK(d.worst_hammers_active < w.hammers_in_contact);  // released within the buffer
+    // Contact lasts 1-5 ms (44-220 samples) per hammer.
+    CHECK(w.hammer_contact_samples >= 10 * 40 && w.hammer_contact_samples <= 10 * kBig);
+    CHECK(w.newton_evals >= w.hammer_contact_samples && w.fallback_solves == 0);
+    pm_host_destroy(h);
+}
+
 TEST(null_tolerance) {
     pm_event e = sampleEvent(PM_EVENT_NOTE_ON, 0, 60, 1);
     pm_midi_monitor_entry m;

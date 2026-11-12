@@ -281,6 +281,25 @@ bool CouplingLoop::configure(const KeyZone* kz, int keys, int zones, int taps) n
                 entDst_[e] = zones + t;
                 entSrc_[e] = kz[k].z0 + a;
             }
+    // Contributors of every entry, keys ascending (counting sort by entry).
+    auto forEachContribution = [&](auto&& fn) {
+        for (int k = 0; k < keys; ++k) {
+            for (int q = 0; q < 4; ++q)
+                if (keyEnt_[k][q] >= 0) fn(keyEnt_[k][q], k, q);
+            for (int t = 0; t < taps; ++t)
+                for (int a = 0; a < (kz[k].w1 != 0.0f ? 2 : 1); ++a) fn(tapEnt_[t][kz[k].z0 + a], k, 4 + 2 * t + a);
+        }
+    };
+    for (int e = 0; e <= nEnt_; ++e) entFirst_[e] = 0;
+    forEachContribution([&](int e, int, int) { ++entFirst_[e + 1]; });
+    for (int e = 0; e < nEnt_; ++e) entFirst_[e + 1] += entFirst_[e];
+    int fill[kMaxEntries + kMaxTaps * kZ];
+    for (int e = 0; e < nEnt_; ++e) fill[e] = entFirst_[e];
+    forEachContribution([&](int e, int k, int code) {
+        entKey_[fill[e]] = k;
+        entCode_[fill[e]] = static_cast<std::uint8_t>(code);
+        ++fill[e];
+    });
     entPad_ = (nEnt_ + simd::kWidth - 1) / simd::kWidth * simd::kWidth;
     const std::size_t ep = static_cast<std::size_t>(entPad_);  // bounds the packed width
     if (!h_.allocate(std::size_t{kMaxKeys} * kMaxBlock) || !G_.allocate(kMaxBlock * ep) ||
@@ -299,24 +318,39 @@ void CouplingLoop::reset() noexcept {
     for (int z = 0; z < kZ; ++z) zoneOut_[z] = zoneOutPrev_[z] = false;
     for (int i = 0; i <= kMaxBlock; ++i)
         for (int z = 0; z < kZ; ++z) d_[i * kZ + z] = 0.0f;
-    nMembers_ = nListen_ = nOut_ = 0;
+    nMembers_ = nListen_ = nOut_ = nChanged_ = 0;
     dirty_ = true;
 }
+
+// Weight of key k's response in an entry (code: see entCode_). Tap t sums
+// tapGain fs F_k with u_k = g (w0 d_z0 + w1 d_z1).
+float CouplingLoop::entryWeight(int k, int code) const noexcept {
+    const float s = gain_ * kz_[k].forceScale;
+    if (code < 4) return s * keyEntW_[k][code];
+    const int t = (code - 4) >> 1, a = (code - 4) & 1;
+    return s * tapGain_[t][k] * (a == 0 ? kz_[k].w0 : kz_[k].w1);
+}
+
+namespace {
+// The one place a response is added to a kernel column (full rebuild and
+// in-place update alike, so that both round identically).
+inline void addColumn(float* G, std::size_t ep, int e, float w, const float* h) noexcept {
+    for (int j = 0; j < CouplingLoop::kMaxBlock; ++j) G[j * ep + e] += w * h[j];
+}
+}  // namespace
 
 void CouplingLoop::rebuildKernel() noexcept {
     ++rebuilds_;
     // Pack the entries the members use.
-    int pos[kMaxEntries + kMaxTaps * kZ];
-    for (int e = 0; e < nEnt_; ++e) pos[e] = -1;
+    for (int e = 0; e < nEnt_; ++e) packed_[e] = -1;
     nAct_ = 0;
     auto use = [&](int e) {
-        if (pos[e] < 0) {
-            pos[e] = nAct_;
+        if (packed_[e] < 0) {
+            packed_[e] = nAct_;
             actDst_[nAct_] = entDst_[e];
             actSrc_[nAct_] = entSrc_[e];
             ++nAct_;
         }
-        return pos[e];
     };
     for (int m = 0; m < nMembers_; ++m) {
         const int k = members_[m];
@@ -328,25 +362,53 @@ void CouplingLoop::rebuildKernel() noexcept {
     actPad_ = (nAct_ + simd::kWidth - 1) / simd::kWidth * simd::kWidth;
     const std::size_t ep = static_cast<std::size_t>(actPad_);
     for (std::size_t i = 0; i < kMaxBlock * ep; ++i) G_[i] = 0.0f;
+    // Members ascending, each adding to its entries: per column, the
+    // contributions arrive in ascending key order (updateColumns relies on it).
     for (int m = 0; m < nMembers_; ++m) {
         const int k = members_[m];
-        const float s = gain_ * kz_[k].forceScale;
         const float* h = h_.data() + std::size_t(k) * kMaxBlock;
-        for (int q = 0; q < 4; ++q) {
-            if (keyEnt_[k][q] < 0) continue;
-            const int e = pos[keyEnt_[k][q]];
-            const float w = s * keyEntW_[k][q];
-            for (int j = 0; j < kMaxBlock; ++j) G_[j * ep + e] += w * h[j];
-        }
-        // Tap t: sum_k tapGain fs F_k with u_k = g (w0 d_z0 + w1 d_z1).
+        for (int q = 0; q < 4; ++q)
+            if (keyEnt_[k][q] >= 0) addColumn(G_.data(), ep, packed_[keyEnt_[k][q]], entryWeight(k, q), h);
         for (int t = 0; t < taps_; ++t)
-            for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a) {
-                const float w = s * tapGain_[t][k] * (a == 0 ? kz_[k].w0 : kz_[k].w1);
-                const int e = pos[tapEnt_[t][kz_[k].z0 + a]];
-                for (int j = 0; j < kMaxBlock; ++j) G_[j * ep + e] += w * h[j];
-            }
+            for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a)
+                addColumn(G_.data(), ep, packed_[tapEnt_[t][kz_[k].z0 + a]], entryWeight(k, 4 + 2 * t + a), h);
     }
     dirty_ = false;
+    nChanged_ = 0;
+}
+
+// The member set is unchanged and only the keys in changed_ have a new h:
+// re-sum just their columns, from zero and in ascending key order, exactly
+// as rebuildKernel() would.
+void CouplingLoop::updateColumns() noexcept {
+    const std::size_t ep = static_cast<std::size_t>(actPad_);
+    int cols[kMaxEntries + kMaxTaps * kZ];
+    int nCols = 0;
+    auto mark = [&](int e) {
+        if (!colDirty_[e]) {
+            colDirty_[e] = true;
+            cols[nCols++] = e;
+        }
+    };
+    for (int c = 0; c < nChanged_; ++c) {
+        const int k = changed_[c];
+        for (int q = 0; q < 4; ++q)
+            if (keyEnt_[k][q] >= 0) mark(keyEnt_[k][q]);
+        for (int t = 0; t < taps_; ++t)
+            for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a) mark(tapEnt_[t][kz_[k].z0 + a]);
+    }
+    keyUpdates_ += static_cast<std::uint64_t>(nChanged_);
+    nChanged_ = 0;
+    for (int c = 0; c < nCols; ++c) {
+        const int e = cols[c];
+        colDirty_[e] = false;
+        const int col = packed_[e];
+        for (int j = 0; j < kMaxBlock; ++j) G_[j * ep + col] = 0.0f;
+        for (int i = entFirst_[e]; i < entFirst_[e + 1]; ++i) {
+            const int k = entKey_[i];
+            if (member_[k]) addColumn(G_.data(), ep, col, entryWeight(k, entCode_[i]), h_.data() + std::size_t(k) * kMaxBlock);
+        }
+    }
 }
 
 void CouplingLoop::begin(ModeBank& bank, const Soundboard& board, const SegmentIO* io, Kernel kernel) noexcept {
@@ -396,7 +458,9 @@ void CouplingLoop::begin(ModeBank& bank, const Soundboard& board, const SegmentI
             if (v != ver_[k] || !hasH_[k]) {
                 hasH_[k] = bank.coupledResponse(k, h_.data() + std::size_t(k) * kMaxBlock, &k1_[k], kernel);
                 ver_[k] = v;
-                if (hasH_[k] || member_[k]) dirty_ = true;
+                // A member whose h changed: its columns (if it stays a member).
+                if (hasH_[k] && member_[k]) changed_[nChanged_++] = k;
+                else if (hasH_[k] || member_[k]) dirty_ = true;
             }
             mem = hasH_[k];
         }
@@ -405,7 +469,8 @@ void CouplingLoop::begin(ModeBank& bank, const Soundboard& board, const SegmentI
         if (mem) members_[nm++] = k;
     }
     nMembers_ = nm;
-    if (dirty_) rebuildKernel();
+    if (dirty_ || (alwaysRebuild_ && nChanged_ > 0)) rebuildKernel();
+    else if (nChanged_ > 0) updateColumns();
 }
 
 void CouplingLoop::collect(ModeBank& bank, const SegmentIO* io, int n) noexcept {

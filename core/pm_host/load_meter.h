@@ -23,7 +23,13 @@
 //    over the top 1 % by render time (phase sums kept per render-time bin,
 //    so the top 1 % is resolved to a bin, about 1.5 %);
 //  - for the worst buffer, the events by kind and the recomputations they
-//    caused (damper updates, impulse responses, zone-kernel rebuilds).
+//    caused (damper updates, impulse responses, zone-kernel rebuilds and
+//    in-place updates), and the hammer work (hammers that touched a string,
+//    the most at the same time, hammer-samples in contact, contact-solver
+//    Newton evaluations and fallbacks);
+//  - the speed probe (recordProbe): the time of a fixed workload run on
+//    the audio thread every Nth buffer, as min / median / mean / max, to
+//    compare with the same workload on a benchmark thread (speed_probe.h).
 #pragma once
 
 #include <algorithm>
@@ -51,6 +57,8 @@ struct BufferRecord {
     int idleSubBlocks = 0;
     int noteOns = 0, noteOffs = 0, pedalEvents = 0;
     int damperUpdates = 0, responseGroups = 0, kernelRebuilds = 0;
+    int kernelKeyUpdates = 0;
+    int maxHammersInContact = 0, hammerContactSamples = 0, newtonEvals = 0, fallbackSolves = 0;
     bool timed = false;                // phaseUs valid
     double phaseUs[kLoadPhases] = {};
 };
@@ -70,8 +78,15 @@ struct WorstBuffer {
     int idleSubBlocks = 0;
     int noteOns = 0, noteOffs = 0, pedalEvents = 0;
     int damperUpdates = 0, responseGroups = 0, kernelRebuilds = 0;
+    int kernelKeyUpdates = 0;
+    int maxHammersInContact = 0, hammerContactSamples = 0, newtonEvals = 0, fallbackSolves = 0;
     bool timed = false;
     double phaseUs[kLoadPhases] = {};
+};
+
+struct ProbeSnapshot {
+    std::uint64_t count = 0;  // probe runs since the last reset
+    double minUs = 0.0, medianUs = 0.0, meanUs = 0.0, maxUs = 0.0;  // median: bin centre (about 1.5 %)
 };
 
 struct LoadSnapshot {
@@ -98,6 +113,7 @@ struct LoadSnapshot {
     std::uint64_t topCount = 0;
     double meanPhaseUs[kLoadPhases] = {};
     double topPhaseUs[kLoadPhases] = {};
+    ProbeSnapshot probe;
 };
 
 class LoadMeter {
@@ -177,6 +193,11 @@ public:
             wDamper_.store(b.damperUpdates, std::memory_order_relaxed);
             wResp_.store(b.responseGroups, std::memory_order_relaxed);
             wKernel_.store(b.kernelRebuilds, std::memory_order_relaxed);
+            wKeyUpd_.store(b.kernelKeyUpdates, std::memory_order_relaxed);
+            wMaxContact_.store(b.maxHammersInContact, std::memory_order_relaxed);
+            wContactSamples_.store(b.hammerContactSamples, std::memory_order_relaxed);
+            wNewton_.store(b.newtonEvals, std::memory_order_relaxed);
+            wFallback_.store(b.fallbackSolves, std::memory_order_relaxed);
             wTimed_.store(b.timed, std::memory_order_relaxed);
             for (int p = 0; p < kLoadPhases; ++p) wPhase_[p].store(b.timed ? b.phaseUs[p] : 0.0, std::memory_order_relaxed);
             worstSeq_.store(seq + 2, std::memory_order_release);
@@ -254,6 +275,11 @@ public:
             w.damperUpdates = wDamper_.load(std::memory_order_relaxed);
             w.responseGroups = wResp_.load(std::memory_order_relaxed);
             w.kernelRebuilds = wKernel_.load(std::memory_order_relaxed);
+            w.kernelKeyUpdates = wKeyUpd_.load(std::memory_order_relaxed);
+            w.maxHammersInContact = wMaxContact_.load(std::memory_order_relaxed);
+            w.hammerContactSamples = wContactSamples_.load(std::memory_order_relaxed);
+            w.newtonEvals = wNewton_.load(std::memory_order_relaxed);
+            w.fallbackSolves = wFallback_.load(std::memory_order_relaxed);
             w.timed = wTimed_.load(std::memory_order_relaxed);
             for (int p = 0; p < kLoadPhases; ++p) w.phaseUs[p] = wPhase_[p].load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
@@ -263,7 +289,40 @@ public:
             }
         }
         phaseSummary(s);
+        s.probe = probeSnapshot();
         return s;
+    }
+
+    // Audio thread: one run of the speed probe, in microseconds.
+    void recordProbe(double us) noexcept {
+        if (reset_.exchange(false, std::memory_order_acquire)) clearAudioState();
+        if (!(us >= 0.0)) return;
+        ++probeN_;
+        probeSum_ += us;
+        if (probeN_ == 1 || us < probeMin_) probeMin_ = us;
+        if (us > probeMax_) probeMax_ = us;
+        bump(probeHist_[usBin(us)]);
+        probeMinPub_.store(probeMin_, std::memory_order_relaxed);
+        probeMaxPub_.store(probeMax_, std::memory_order_relaxed);
+        probeMeanPub_.store(probeSum_ / static_cast<double>(probeN_), std::memory_order_relaxed);
+        probeCount_.store(probeN_, std::memory_order_release);
+    }
+
+    // Any thread (also part of snapshot()).
+    ProbeSnapshot probeSnapshot() const noexcept {
+        ProbeSnapshot p;
+        if (reset_.load(std::memory_order_acquire)) return p;
+        p.count = probeCount_.load(std::memory_order_acquire);
+        if (p.count == 0) return p;
+        p.minUs = probeMinPub_.load(std::memory_order_relaxed);
+        p.maxUs = probeMaxPub_.load(std::memory_order_relaxed);
+        p.meanUs = probeMeanPub_.load(std::memory_order_relaxed);
+        // Bin centre (geometric) of the bin holding the median, clamped to
+        // the observed range.
+        const double edge = percentile(probeHist_, kUsBins + 1, 0.5,
+                                       [](int i) { return std::exp2(static_cast<double>(i + 1) / kUsBinsPerOctave); });
+        p.medianUs = std::clamp(edge * std::exp2(-0.5 / kUsBinsPerOctave), p.minUs, p.maxUs);
+        return p;
     }
 
     // Any thread. The audio thread clears its totals at its next record();
@@ -337,6 +396,10 @@ private:
         for (auto& row : phaseBin_)
             for (auto& c : row) c.store(0.0, std::memory_order_relaxed);
         for (auto& c : phaseAll_) c.store(0.0, std::memory_order_relaxed);
+        probeN_ = 0;
+        probeSum_ = probeMin_ = probeMax_ = 0.0;
+        for (auto& c : probeHist_) c.store(0, std::memory_order_relaxed);
+        probeCount_.store(0, std::memory_order_relaxed);
     }
 
     // Audio-thread state.
@@ -363,6 +426,13 @@ private:
     std::atomic<double> wLoad_{0.0}, wUs_{0.0}, wPeriodUs_{0.0}, wCpuUs_{-1.0};
     std::atomic<int> wFrames_{0}, wContact_{0}, wActive_{0}, wModes_{0}, wEvents_{0}, wSub_{0};
     std::atomic<int> wIdle_{0}, wOn_{0}, wOff_{0}, wPedal_{0}, wDamper_{0}, wResp_{0}, wKernel_{0};
+    std::atomic<int> wKeyUpd_{0}, wMaxContact_{0}, wContactSamples_{0}, wNewton_{0}, wFallback_{0};
+    // Speed probe: audio-thread totals and the published values.
+    std::uint64_t probeN_ = 0;
+    double probeSum_ = 0.0, probeMin_ = 0.0, probeMax_ = 0.0;
+    std::atomic<std::uint32_t> probeHist_[kUsBins + 1] = {};
+    std::atomic<std::uint64_t> probeCount_{0};
+    std::atomic<double> probeMinPub_{0.0}, probeMaxPub_{0.0}, probeMeanPub_{0.0};
     std::atomic<bool> wTimed_{false};
     std::atomic<double> wPhase_[kLoadPhases] = {};
 };

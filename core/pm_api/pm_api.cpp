@@ -25,7 +25,7 @@ uint32_t pm_api_version(void) {
     return (PM_API_VERSION_MAJOR << 16) | (PM_API_VERSION_MINOR << 8) | PM_API_VERSION_PATCH;
 }
 
-const char* pm_version_string(void) { return "0.8.0 (M4, app host, diagnostics, phase timing, benchmark)"; }
+const char* pm_version_string(void) { return "0.9.0 (M4, app host, diagnostics, phase timing, speed probe, benchmark)"; }
 
 pm_engine* pm_engine_create(void) {
     pm_engine* e = new (std::nothrow) pm_engine();

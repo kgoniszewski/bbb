@@ -18,16 +18,24 @@
 //             ramps of many values and as plain on/off
 //   chord release: ten notes struck and released together, every 1.5 s
 //   idle:     nothing sounding (the cost of an idle engine)
+//   hammer burst: ten bass and middle notes at velocity 127 struck at the
+//             same sample (as a chord played hard arrives in one buffer),
+//             every second, released after half a second, pedal up
+//   pedalled chords: chords on eight different roots across the keyboard,
+//             one every 0.7 s, with legato pedalling (CC64 as plain on/off,
+//             as a switch pedal sends it): the sustained strings' wake-ups
+//             and cull decisions change the loop's set of awake modes on
+//             most sub-blocks (zone-kernel updates), as in live playing
 //   hammer:   cost of one active hammer per buffer, per key, while in
 //             contact and averaged over its life (from the launch until
 //             hammerFinished: the release wait, or since the sample path's
 //             early release, until the hammer provably cannot return),
 //             measured on the solver alone
 //
-// Compiled twice: pm_bench (the real-time engine library, for the C API and
-// the app) and pm_bench_profile (with PM_PROFILE against the profiling
-// engine, for bench_engine's per-phase breakdown). The Engine class differs
-// between the two, so each variant must be linked with its own engine.
+// Phase timing (Config::phaseTiming) is the engine's run-time switch, the
+// same one the app's diagnostics use; bench_engine turns it on for its
+// per-phase breakdown and can run every case with it off as well, to
+// measure what the timers themselves cost.
 #pragma once
 
 #include <cstdint>
@@ -44,11 +52,13 @@ struct Config {
     QualityTier tier = QualityTier::Full;  // board-on scenarios
     bool allTiers = false;   // also worst/cluster/bloom at Balanced and Eco
     int hammerStrikes = 200; // per key, hammer micro-benchmark
+    bool phaseTiming = false; // Engine::setPhaseTiming during the scenarios (always on in the profiling build)
 };
 
 enum class Scene : int {
     Worst = 0, Typical = 1, Cluster = 2, Bloom = 3,
-    Legato = 4, Pedalling = 5, ChordRelease = 6, Idle = 7
+    Legato = 4, Pedalling = 5, ChordRelease = 6, Idle = 7,
+    HammerBurst = 8, PedalChords = 9
 };
 
 // Every event of a scene up to sample 'end' (sample-time stamps), in time
@@ -81,6 +91,13 @@ struct Phases {
     double total = 0.0;
 };
 
+// Load diagnostics of a scenario's most expensive buffer (RenderInfo).
+struct BufferDetail {
+    int hammersInContact = 0, maxHammersInContact = 0, hammerContactSamples = 0;
+    int newtonEvals = 0, fallbackSolves = 0;
+    int kernelRebuilds = 0, kernelKeyUpdates = 0, responseGroups = 0, damperUpdates = 0;
+};
+
 struct ScenarioResult {
     double periodUs = 0.0;
     double avgPercent = 0.0, p99Percent = 0.0, maxPercent = 0.0;
@@ -92,6 +109,8 @@ struct ScenarioResult {
     bool hasPhases = false;
     Phases maxBuf, top1, all;  // the most expensive buffer, mean of the top 1 %, mean of all
     int maxIndex = 0, topCount = 0;
+    BufferDetail maxDetail;    // the most expensive buffer by wall time
+    double kernelRebuildsPerBuffer = 0.0, kernelKeyUpdatesPerBuffer = 0.0;
 };
 
 // Prepares 'eng' for the case (culling, soundboard, tier) and runs it.

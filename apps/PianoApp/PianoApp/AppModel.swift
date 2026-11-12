@@ -18,6 +18,11 @@
 //    diagnostics text with all of them is built only when Copy is pressed.
 //  - The keyboard observes only KeyboardStore; the Play screen itself
 //    observes nothing.
+//  - What is left on the main thread cannot be profiled from here, so the
+//    Play screen has a "UI cost test" switch (UICostMode) that hides the
+//    keyboard, stops the meter poll, or both, while the once-a-second
+//    process-CPU line keeps running: the change in "main thread" CPU shows
+//    what the hidden part cost.
 import Combine
 import Foundation
 import PianoCore
@@ -36,9 +41,15 @@ struct MeterSnapshot: Equatable {
     var maxPct = 0.0
     var budgetPct = 70
     var overBudget: UInt64 = 0
-    var renderFrames = 0
     var renderLine = ""      // frame counts seen (changes only with the I/O configuration)
     var worstLine = "worst buffer: -"
+}
+
+/// The engine and MIDI status rows, kept apart from the load meters so that
+/// a changing load (which it does at every poll while sound plays) does not
+/// re-render the status section, and vice versa.
+struct EngineStatusSnapshot: Equatable {
+    var renderFrames = 0
     var awakeModes = 0
     var activeHammers = 0
     var midiEvents: UInt64 = 0   // engine events from MIDI (not active sensing or clock)
@@ -51,6 +62,14 @@ final class MeterStore: ObservableObject {
     @Published private(set) var snapshot = MeterSnapshot()
 
     func update(_ s: MeterSnapshot) {
+        if s != snapshot { snapshot = s }
+    }
+}
+
+final class EngineStatusStore: ObservableObject {
+    @Published private(set) var snapshot = EngineStatusSnapshot()
+
+    func update(_ s: EngineStatusSnapshot) {
         if s != snapshot { snapshot = s }
     }
 }
@@ -77,6 +96,28 @@ final class MonitorStore: ObservableObject {
     @Published var paused = false
 }
 
+/// Play-screen diagnostics: what to switch off to see what it costs on the
+/// main thread (the process-CPU line stays on in every mode).
+enum UICostMode: Int, CaseIterable, Identifiable {
+    case normal = 0, noKeyboard = 1, noMeters = 2, minimal = 3
+    var id: Int { rawValue }
+    var label: String {
+        switch self {
+        case .normal: return "All"
+        case .noKeyboard: return "No keyboard"
+        case .noMeters: return "No meters"
+        case .minimal: return "CPU line only"
+        }
+    }
+    var showsKeyboard: Bool { self == .normal || self == .noMeters }
+    var pollsMeters: Bool { self == .normal || self == .noKeyboard }
+}
+
+/// Small store for the UI cost mode (observed by the Play screen only).
+final class UICostStore: ObservableObject {
+    @Published var mode: UICostMode = .normal
+}
+
 enum QualityTier: Int, CaseIterable, Identifiable {
     case full = 0, balanced = 1, eco = 2
     var id: Int { rawValue }
@@ -97,10 +138,17 @@ final class AppModel: ObservableObject {
     @Published var midiMessage = ""
     // Meters (separately observed)
     let meters = MeterStore()
+    let engineStatus = EngineStatusStore()
     let cpuStore = CpuStore()
     let keyboard = KeyboardStore()
     @Published var cpuTiming = false
     @Published var phaseTiming = false
+    @Published var speedProbe = false
+    let uiCost = UICostStore()
+    /// Speed probe on the audio thread: every this many render calls.
+    static let speedProbeInterval = 8
+    /// The probe on the benchmark thread at the last benchmark run (reference).
+    private var benchProbe: pm_speed_probe_stats?
     // Offline benchmark (Benchmark tab)
     @Published var benchRunning = false
     @Published var benchProgress = ""
@@ -275,7 +323,7 @@ final class AppModel: ObservableObject {
     private func meterTick() {
         guard let host = host else { return }
         meterTicks += 1
-        updateMeters(host)
+        if uiCost.mode.pollsMeters { updateMeters(host) }
         if meterTicks % 4 == 1 { updateProcessCpu(host) }  // once a second
     }
 
@@ -295,16 +343,18 @@ final class AppModel: ObservableObject {
         s.maxPct = AppModel.roundedPct(d.max_load)
         s.budgetPct = Int((d.budget * 100).rounded())
         s.overBudget = d.over_budget
-        s.renderFrames = Int(d.last_frames)
         if d.buffers > 0 {
             s.renderLine = "Render buffer: \(d.last_frames) frames = \(AppModel.us(d.last_period_us)); seen \(d.min_frames)...\(d.max_frames) frames, \(d.distinct_frame_counts) distinct size(s)"
         }
         s.worstLine = AppModel.worstBufferText(d)
-        s.awakeModes = Int(stats.awake_modes)
-        s.activeHammers = Int(stats.active_hammers)
-        s.midiEvents = counters.midi_events
-        s.droppedEvents = counters.dropped_events + stats.dropped_events
         meters.update(s)
+        var e = EngineStatusSnapshot()
+        e.renderFrames = Int(d.last_frames)
+        e.awakeModes = Int(stats.awake_modes)
+        e.activeHammers = Int(stats.active_hammers)
+        e.midiEvents = counters.midi_events
+        e.droppedEvents = counters.dropped_events + stats.dropped_events
+        engineStatus.update(e)
     }
 
     /// Process CPU (getrusage: all threads), main-thread CPU (this thread's
@@ -366,6 +416,45 @@ final class AppModel: ObservableObject {
         host?.resetLoad()  // so that the worst buffer and the top 1 % are all timed
     }
 
+    func setSpeedProbe(_ on: Bool) {
+        speedProbe = on
+        host?.setSpeedProbe(everyBuffers: on ? AppModel.speedProbeInterval : 0)
+        host?.resetLoad()
+    }
+
+    func setUICostMode(_ mode: UICostMode) {
+        guard mode != uiCost.mode else { return }
+        uiCost.mode = mode
+        cpuPrev = nil  // the next CPU reading covers a full second in the new mode
+    }
+
+    /// The speed-probe line of the diagnostics: the audio thread's probe
+    /// times against the same workload on the benchmark thread (the last
+    /// benchmark run) or, without one, on the main thread now.
+    func speedProbeText() -> String {
+        guard let host = host else { return "" }
+        let p = host.speedProbe()
+        if p.interval == 0 && p.runs == 0 { return "audio-thread speed probe: off" }
+        var out = "audio-thread speed probe (every \(p.interval) buffers, \(p.runs) runs): "
+        guard p.runs > 0 else { return out + "no runs yet" }
+        out += String(format: "min %.1f / median %.1f / mean %.1f / max %.1f us", p.min_us, p.median_us, p.mean_us, p.max_us)
+        let ref: pm_speed_probe_stats
+        let refName: String
+        if let b = benchProbe {
+            ref = b
+            refName = "benchmark thread"
+        } else {
+            ref = EngineHost.runSpeedProbe(runs: 101)
+            refName = "main thread now (no benchmark run yet)"
+        }
+        out += String(format: "; %@ %.1f us (median, min %.1f)", refName, ref.median_us, ref.min_us)
+        if p.mean_us > 0 && p.median_us > 0 && p.min_us > 0 {
+            out += String(format: " -> audio thread ran at %.2fx (mean), %.2fx (median), %.2fx (fastest run)",
+                          ref.median_us / p.mean_us, ref.median_us / p.median_us, ref.median_us / p.min_us)
+        }
+        return out
+    }
+
     // MARK: - Diagnostics text (Copy diagnostics)
 
     /// Device, build and audio facts shared by the diagnostics and the benchmark export.
@@ -420,6 +509,7 @@ final class AppModel: ObservableObject {
         let counters = host.counters()
         out += "audio: \(audio.message), \(String(format: "%.0f", audio.sampleRate)) Hz, I/O buffer \(audio.ioBufferFrames) frames"
         out += String(format: ", output latency %.2f ms, route %@\n", audio.outputLatencyMs, audio.route)
+        if !audio.ioRequest.isEmpty { out += "I/O request: " + audio.ioRequest + "\n" }
         let mismatch = ioMismatchText()
         if !mismatch.isEmpty { out += "I/O: " + mismatch + "\n" }
         out += "engine: tier \(tier.label), soundboard \(boardOn ? "on" : "off"), \(stats.awake_modes) modes awake, \(stats.active_hammers) hammers active\n"
@@ -432,9 +522,14 @@ final class AppModel: ObservableObject {
         out += "max \(AppModel.us(d.max_us)) (\(AppModel.pct(d.max_load)))\n"
         out += AppModel.worstBufferText(d) + "\n"
         if d.worst_index > 0 {
+            let w = host.worstDetail()
             out += "worst buffer events: \(pd.worst_note_ons) note-on, \(pd.worst_note_offs) note-off, \(pd.worst_pedal_events) pedal; "
             out += "\(pd.worst_damper_updates) damper updates, \(pd.worst_response_groups) impulse responses recomputed, "
-            out += "\(pd.worst_kernel_rebuilds) zone-kernel rebuilds, \(pd.worst_idle_sub_blocks) idle sub-blocks\n"
+            out += "zone kernel \(w.kernel_rebuilds) full rebuilds + \(w.kernel_key_updates) key updates in place, "
+            out += "\(pd.worst_idle_sub_blocks) idle sub-blocks\n"
+            out += "worst buffer hammers: \(w.hammers_in_contact) touched strings, at most \(w.max_hammers_in_contact) at once, "
+            out += "\(w.hammer_contact_samples) hammer-samples in contact, \(d.worst_hammers_active) still active at its end; "
+            out += "\(w.newton_evals) Newton evaluations, \(w.fallback_solves) fallback solves\n"
         }
         if pd.phase_timing == 1 || pd.timed_buffers > 0 {
             out += "phase timing: \(pd.phase_timing == 1 ? "on" : "off"), \(pd.timed_buffers) buffers timed; us per buffer, "
@@ -450,7 +545,9 @@ final class AppModel: ObservableObject {
         } else {
             out += "thread CPU time: off\n"
         }
+        out += speedProbeText() + "\n"
         out += processCpuText() + "\n"
+        out += "UI cost test: \(uiCost.mode.label)\n"
         out += "(loads are render time / each buffer's own period; p99 is the upper edge of a 0.25 % bin)\n"
         return out
     }
@@ -467,7 +564,7 @@ final class AppModel: ObservableObject {
         var out = "worst buffer #\(d.worst_index): \(d.worst_frames) frames, \(AppModel.us(d.worst_render_us)) of "
         out += "\(AppModel.us(d.worst_period_us)) (\(AppModel.pct(d.worst_load)))"
         if d.worst_cpu_us >= 0 { out += ", CPU \(AppModel.us(d.worst_cpu_us))" }
-        out += "; \(d.worst_hammers_in_contact) hammers in contact (\(d.worst_hammers_active) active), "
+        out += "; \(d.worst_hammers_in_contact) hammers touched strings (\(d.worst_hammers_active) active at its end), "
         out += "\(d.worst_awake_modes) modes awake, \(d.worst_events) events, \(d.worst_sub_blocks) sub-blocks"
         return out
     }
@@ -534,6 +631,14 @@ final class AppModel: ObservableObject {
         let count = Int(pm_bench_item_count(&cfg))
         benchProgress = "0/\(count)"
         benchQueue.async { [weak self] in
+            // The speed probe's reference: the same workload as on the audio
+            // thread, here on the benchmark thread.
+            let probe = EngineHost.runSpeedProbe(runs: 501)
+            let probeLine = String(format: "speed probe on the benchmark thread: min %.2f / median %.2f us", probe.min_us, probe.median_us)
+            DispatchQueue.main.async {
+                self?.benchProbe = probe
+                self?.benchLines.append(probeLine)
+            }
             var c = config
             for i in 0..<count {
                 let name = String(cString: pm_bench_item_name(&c, Int32(i)))

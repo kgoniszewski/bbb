@@ -28,6 +28,9 @@ final class AudioController {
         var running = false
         var preparing = false
         var message = "Starting"
+        /// macOS: what was asked of the output device and its answer
+        /// (supported range, errors); empty where the system decides (iOS).
+        var ioRequest = ""
     }
 
     static let preferredSampleRate: Double = 48000
@@ -224,7 +227,10 @@ final class AudioController {
         }
         status.message = reason
         #if os(macOS)
-        setMacBufferFrames(AudioController.preferredFrames)
+        // Native macOS app: ask the output device itself (HAL) for 48 kHz
+        // and 64 frames, as an audio app would. (An iPad app on a Mac runs
+        // the iOS path and gets the device's current settings.)
+        status.ioRequest = requestMacDeviceIO()
         #endif
         readHardwareStatus()
         var rate = status.sampleRate
@@ -297,6 +303,11 @@ final class AudioController {
             try engine.start()
             status.running = true
             status.message = "Running"
+            #if os(macOS)
+            // Again once running, in case starting the engine reset the
+            // device buffer; readHardwareStatus() below reads the grant.
+            status.ioRequest = requestMacDeviceIO()
+            #endif
         } catch {
             status.running = false
             status.message = "Audio engine failed to start: \(error.localizedDescription)"
@@ -446,19 +457,84 @@ final class AudioController {
     // MARK: - macOS buffer size (the device's I/O buffer, set through the output unit)
 
     #if os(macOS)
-    private func macBufferFrames() -> Int? {
+    /// The device AVAudioEngine's output unit plays to.
+    private func macOutputDevice() -> AudioDeviceID? {
         guard let unit = engine.outputNode.audioUnit else { return nil }
-        var frames: UInt32 = 0
-        var size = UInt32(MemoryLayout<UInt32>.size)
-        let err = AudioUnitGetProperty(unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &frames, &size)
-        return err == noErr ? Int(frames) : nil
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let err = AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, &size)
+        return err == noErr && device != 0 ? device : nil
     }
 
-    private func setMacBufferFrames(_ frames: Int) {
-        guard let unit = engine.outputNode.audioUnit else { return }
-        var value = UInt32(frames)
-        _ = AudioUnitSetProperty(unit, kAudioDevicePropertyBufferFrameSize, kAudioUnitScope_Global, 0, &value,
-                                 UInt32(MemoryLayout<UInt32>.size))
+    private static func address(_ selector: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
+        return AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                          mElement: kAudioObjectPropertyElementMain)
+    }
+
+    private static func getDeviceProperty<T>(_ device: AudioDeviceID, _ selector: AudioObjectPropertySelector, _ value: inout T) -> OSStatus {
+        var addr = address(selector)
+        var size = UInt32(MemoryLayout<T>.size)
+        return AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &value)
+    }
+
+    private static func setDeviceProperty<T>(_ device: AudioDeviceID, _ selector: AudioObjectPropertySelector, _ value: T) -> OSStatus {
+        var addr = address(selector)
+        var v = value
+        return AudioObjectSetPropertyData(device, &addr, 0, nil, UInt32(MemoryLayout<T>.size), &v)
+    }
+
+    /// The device's I/O buffer (kAudioDevicePropertyBufferFrameSize), as granted.
+    private func macBufferFrames() -> Int? {
+        guard let device = macOutputDevice() else { return nil }
+        var frames: UInt32 = 0
+        return AudioController.getDeviceProperty(device, kAudioDevicePropertyBufferFrameSize, &frames) == noErr ? Int(frames) : nil
+    }
+
+    private static func deviceSupportsRate(_ device: AudioDeviceID, _ rate: Double) -> Bool {
+        var addr = address(kAudioDevicePropertyAvailableNominalSampleRates)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &addr, 0, nil, &size) == noErr, size > 0 else { return false }
+        let count = Int(size) / MemoryLayout<AudioValueRange>.size
+        var ranges = [AudioValueRange](repeating: AudioValueRange(), count: count)
+        guard AudioObjectGetPropertyData(device, &addr, 0, nil, &size, &ranges) == noErr else { return false }
+        return ranges.contains { rate >= $0.mMinimum - 0.5 && rate <= $0.mMaximum + 0.5 }
+    }
+
+    /// Asks the output device for the preferred rate (only if it supports
+    /// it and runs at another one; this changes the device's rate for every
+    /// app, as audio apps do) and the preferred buffer, clamped to the
+    /// device's range (kAudioDevicePropertyBufferFrameSizeRange). Returns a
+    /// line for the status: what was requested and anything refused. A rate
+    /// change makes AVAudioEngine post a configuration change, which runs
+    /// reconfigure() again; by then the device is at the requested rate and
+    /// nothing is set twice.
+    private func requestMacDeviceIO() -> String {
+        guard let device = macOutputDevice() else { return "no output device found" }
+        let wantRate = AudioController.preferredSampleRate
+        var notes: [String] = []
+        var rate: Float64 = 0
+        _ = AudioController.getDeviceProperty(device, kAudioDevicePropertyNominalSampleRate, &rate)
+        if abs(rate - wantRate) > 0.5 {
+            if AudioController.deviceSupportsRate(device, wantRate) {
+                let err = AudioController.setDeviceProperty(device, kAudioDevicePropertyNominalSampleRate, Float64(wantRate))
+                if err != noErr { notes.append("sample rate refused (OSStatus \(err))") }
+            } else {
+                notes.append(String(format: "device has no %.0f Hz", wantRate))
+            }
+        }
+        var range = AudioValueRange()
+        var frames = UInt32(AudioController.preferredFrames)
+        if AudioController.getDeviceProperty(device, kAudioDevicePropertyBufferFrameSizeRange, &range) == noErr {
+            frames = UInt32(max(range.mMinimum, min(range.mMaximum, Double(frames))))
+            if Int(frames) != AudioController.preferredFrames {
+                notes.append(String(format: "buffer range %.0f...%.0f frames", range.mMinimum, range.mMaximum))
+            }
+        }
+        let err = AudioController.setDeviceProperty(device, kAudioDevicePropertyBufferFrameSize, frames)
+        if err != noErr { notes.append("buffer size refused (OSStatus \(err))") }
+        var out = String(format: "requested %.0f Hz / %ld frames from the output device", wantRate, Int(frames))
+        if !notes.isEmpty { out += "; " + notes.joined(separator: "; ") }
+        return out
     }
     #endif
 }
