@@ -39,6 +39,7 @@ final class AudioController {
     private var nodeSampleRate: Double = 0
     private var observers: [NSObjectProtocol] = []
     private var generation = 0  // invalidates completions of superseded prepares
+    private var terminated = false  // set by shutdownForTermination(); drops all later queue work
 
     /// Owns every session and engine lifecycle call; all state above (and
     /// `status`) is touched only on this queue after init.
@@ -67,6 +68,9 @@ final class AudioController {
     }
 
     deinit {
+        // `host` is released after this body: the render block must be stopped
+        // before the pm_host it points to can be destroyed.
+        engine.stop()
         for o in observers { NotificationCenter.default.removeObserver(o) }
     }
 
@@ -75,7 +79,7 @@ final class AudioController {
     /// Runs `work` on `audioQueue` unless the controller is gone by then.
     private func onAudioQueue(_ work: @escaping (AudioController) -> Void) {
         audioQueue.async { [weak self] in
-            guard let self = self else { return }
+            guard let self = self, !self.terminated else { return }
             work(self)
         }
     }
@@ -89,17 +93,48 @@ final class AudioController {
         }
     }
 
+    /// Full asynchronous teardown (engine, source node, observers, session).
+    /// `start()` afterwards rebuilds everything.
     func stop() {
         onAudioQueue { me in
-            me.cancelPendingRouteWork()
-            me.generation += 1  // a prepare still in flight must not restart the engine
-            me.engine.stop()
-            me.status.running = false
+            me.tearDown()
             me.status.message = "Stopped"
             #if os(iOS)
             try? AVAudioSession.sharedInstance().setActive(false, options: [])
             #endif
         }
+    }
+
+    /// Process exit (willTerminate), main thread. Stops the render callback
+    /// with a bounded wait and disables the controller for good. The session
+    /// is not deactivated (that can block while I/O winds down, and the OS
+    /// reclaims it) and the host is not destroyed. If audioQueue is busy past
+    /// the timeout, the teardown still runs when it gets there; the host stays
+    /// alive regardless, so a late render callback never sees freed memory.
+    func shutdownForTermination(timeout: DispatchTimeInterval = .milliseconds(300)) {
+        let done = DispatchSemaphore(value: 0)
+        audioQueue.async { [self] in
+            if !terminated {
+                terminated = true
+                tearDown()
+            }
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + timeout)
+    }
+
+    /// audioQueue only.
+    private func tearDown() {
+        cancelPendingRouteWork()
+        generation += 1  // a prepare still in flight must not restart the engine
+        engine.stop()
+        if let node = sourceNode {
+            engine.detach(node)
+            sourceNode = nil
+        }
+        nodeSampleRate = 0
+        removeObservers()
+        status.running = false
     }
 
     // MARK: - Session (iOS)
@@ -260,8 +295,14 @@ final class AudioController {
 
     // MARK: - Notifications
 
-    /// audioQueue only. Observer blocks run on the posting thread (queue nil)
-    /// and only forward to audioQueue.
+    /// audioQueue only.
+    private func removeObservers() {
+        for o in observers { NotificationCenter.default.removeObserver(o) }
+        observers.removeAll()
+    }
+
+    /// audioQueue only; a no-op while observers are installed. Observer blocks
+    /// run on the posting thread (queue nil) and only forward to audioQueue.
     private func installObservers() {
         guard observers.isEmpty else { return }
         let center = NotificationCenter.default
@@ -359,8 +400,7 @@ final class AudioController {
         generation += 1
         sourceNode = nil
         nodeSampleRate = 0
-        for o in observers { NotificationCenter.default.removeObserver(o) }
-        observers.removeAll()
+        removeObservers()
         engine = AVAudioEngine()
         installObservers()
         configureSession()

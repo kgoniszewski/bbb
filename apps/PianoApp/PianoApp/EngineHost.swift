@@ -51,8 +51,12 @@ final class EngineHost {
         // Pointers cross to the queue as integers (OpaquePointer is not Sendable).
         let hostBits = Int(bitPattern: raw)
         let frames = Int32(max(16, min(maxFrames, 8192)))
-        prepareQueue.async {
-            let ok = pm_host_prepare(OpaquePointer(bitPattern: hostBits), sampleRate, frames) == 1
+        // The closure retains self, so deinit (pm_host_destroy) cannot run
+        // while a prepare is in flight.
+        prepareQueue.async { [self] in
+            let ok = withExtendedLifetime(self) {
+                pm_host_prepare(OpaquePointer(bitPattern: hostBits), sampleRate, frames) == 1
+            }
             DispatchQueue.main.async {
                 completion(ok)
             }
@@ -64,8 +68,10 @@ final class EngineHost {
     func setPrepareTimeParam(_ id: pm_param, _ value: Double) {
         let engineBits = Int(bitPattern: engine)
         let idValue = Int32(id.rawValue)
-        prepareQueue.async {
-            _ = pm_engine_set_param(OpaquePointer(bitPattern: engineBits), idValue, value)
+        prepareQueue.async { [self] in
+            withExtendedLifetime(self) {
+                _ = pm_engine_set_param(OpaquePointer(bitPattern: engineBits), idValue, value)
+            }
         }
     }
 

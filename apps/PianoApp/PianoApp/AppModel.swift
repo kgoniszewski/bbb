@@ -115,9 +115,18 @@ final class AppModel: ObservableObject {
         #else
         let terminate = NSApplication.willTerminateNotification
         #endif
+        guard terminateObserver == nil else { return }
         terminateObserver = NotificationCenter.default.addObserver(forName: terminate, object: nil, queue: .main) { [weak self] _ in
-            self?.stop()
+            self?.terminate()
         }
+    }
+
+    /// willTerminate: stop the render callback (bounded wait) and nothing
+    /// more. The host is never destroyed here, so a late callback is safe.
+    private func terminate() {
+        timer?.invalidate()
+        timer = nil
+        audioController?.shutdownForTermination()
     }
 
     func stop() {
