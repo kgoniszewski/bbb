@@ -118,7 +118,54 @@ int main(void) {
         EXPECT(load.buffers == 20 && load.budget > 0.0);
         pm_host_get_counters(h, &hc);
         EXPECT(hc.midi_messages == 2 && hc.midi_events == 2);
+        /* Diagnostics (API 0.7). */
+        {
+            pm_host_diagnostics d;
+            pm_host_set_cpu_timing(h, 1);
+            pm_host_render(h, left, right, 100, 0);
+            pm_host_get_diagnostics(h, &d);
+            EXPECT(d.buffers == 21 && d.last_frames == 100 && d.min_frames == 100 && d.max_frames == 256);
+            EXPECT(d.distinct_frame_counts == 2 && d.sample_rate == 48000.0);
+            EXPECT(d.max_us >= d.p99_us && d.p99_us > 0.0 && d.mean_us > 0.0);
+            EXPECT(d.worst_index >= 1 && d.worst_frames > 0 && d.worst_load == d.max_load);
+            EXPECT(d.worst_hammers_active >= 0 && d.worst_sub_blocks >= 1);
+            printf("  diagnostics: mean %.1f us, p99 %.1f us, max %.1f us (%d frames, %d sub-blocks), "
+                   "cpu timing %d, stall %.1f us\n",
+                   d.mean_us, d.p99_us, d.max_us, d.worst_frames, d.worst_sub_blocks, d.cpu_timing,
+                   d.max_stall_us);
+            pm_host_reset_load(h);
+            pm_host_get_diagnostics(h, &d);
+            EXPECT(d.buffers == 0);
+        }
         pm_host_destroy(h);
+    }
+
+    /* Build information and the offline benchmark (API 0.7). */
+    {
+        pm_bench_config bc = {0};
+        pm_bench_result br;
+        const char* info = pm_build_info();
+        EXPECT(info != NULL && info[0] != 0);
+        printf("  build: %s\n", info);
+        EXPECT(pm_bench_item_count(&bc) == 15);
+        bc.flags = PM_BENCH_ALL_TIERS;
+        EXPECT(pm_bench_item_count(&bc) == 21);
+        bc.flags = PM_BENCH_NO_HAMMER;
+        EXPECT(pm_bench_item_count(&bc) == 7);
+        EXPECT(pm_bench_item_name(&bc, 7)[0] == 0);
+        bc.flags = 0;
+        EXPECT(pm_bench_item_name(&bc, 3)[0] == 'c');  /* cluster */
+        EXPECT(pm_bench_item_name(&bc, 10)[0] == 'h'); /* hammer, key 40 */
+        bc.hammer_strikes = 3;
+        EXPECT(pm_bench_run_item(&bc, 10, &br) == 1);
+        EXPECT(br.ok == 1 && br.kind == PM_BENCH_HAMMER && br.key == 40 && br.strings == 3 &&
+               br.oversampling == 2 && br.contact_us > 0.0 && br.life_us > 0.0);
+        bc.seconds = 0.05;
+        EXPECT(pm_bench_run_item(&bc, 6, &br) == 1); /* cluster, board off */
+        EXPECT(br.ok == 1 && br.kind == PM_BENCH_SCENARIO && br.max_us >= br.p99_us && br.p99_us > 0.0);
+        EXPECT(br.mean_load > 0.0 && fabs(br.period_us - 1e6 * 64 / 48000.0) < 1e-9);
+        printf("  bench item 6: mean %.1f us, p99 %.1f us, max %.1f us\n", br.mean_us, br.p99_us, br.max_us);
+        EXPECT(pm_bench_run_item(&bc, 99, &br) == 0);
     }
     printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

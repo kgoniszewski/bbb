@@ -132,6 +132,19 @@ final class EngineHost {
         return s
     }
 
+    /// Load diagnostics: percentiles, frame counts and the worst buffer.
+    func diagnostics() -> pm_host_diagnostics {
+        var d = pm_host_diagnostics()
+        pm_host_get_diagnostics(raw, &d)
+        return d
+    }
+
+    /// Thread CPU time per buffer (two kernel clock reads per buffer; off by default).
+    func setCpuTiming(_ on: Bool) { pm_host_set_cpu_timing(raw, on ? 1 : 0) }
+
+    /// How the engine was compiled (SIMD kernel, optimisation, NDEBUG, compiler).
+    static var buildInfo: String { String(cString: pm_build_info()) }
+
     /// Host ticks to milliseconds.
     func milliseconds(ticks: Int64) -> Double {
         return Double(ticks) * Double(timebaseNumer) / Double(timebaseDenom) / 1_000_000.0

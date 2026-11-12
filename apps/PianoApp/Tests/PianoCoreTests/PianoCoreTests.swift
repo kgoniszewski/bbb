@@ -48,5 +48,23 @@ final class PianoCoreTests: XCTestCase {
         pm_host_get_load(host, &load)
         XCTAssertEqual(load.buffers, 20)
         XCTAssertEqual(load.last_frames, 256)
+
+        var diag = pm_host_diagnostics()
+        pm_host_get_diagnostics(host, &diag)
+        XCTAssertEqual(diag.buffers, 20)
+        XCTAssertEqual(diag.distinct_frame_counts, 1)
+        XCTAssertGreaterThanOrEqual(diag.max_us, diag.p99_us)
+    }
+
+    func testBenchmarkItems() {
+        var config = pm_bench_config()
+        XCTAssertEqual(pm_bench_item_count(&config), 15)
+        XCTAssertEqual(String(cString: pm_bench_item_name(&config, 3)), "cluster (12 notes ff every 100 ms)")
+        XCTAssertFalse(String(cString: pm_build_info()).isEmpty)
+        config.hammer_strikes = 2
+        var result = pm_bench_result()
+        XCTAssertEqual(pm_bench_run_item(&config, 14, &result), 1)  // hammer, key 88
+        XCTAssertEqual(result.key, 88)
+        XCTAssertGreaterThan(result.contact_us, 0)
     }
 }

@@ -1,8 +1,10 @@
 // C API of the app host (pm_api.h, "App host"), over pm::host::Host.
 #include <chrono>
+#include <ctime>
 #include <new>
 
 #include "pm_api/pm_api.h"
+#include "pm_api/pm_api_internal.h"
 #include "pm_host/host.h"
 
 struct pm_host {
@@ -14,11 +16,24 @@ struct pm_host {
     double ticksPerSample = 0.0;
     std::atomic<double> publishedRate{0.0};
     std::atomic<int32_t> lastFrames{0};
+    std::atomic<bool> cpuTiming{false};
     std::uint32_t numer = 1, denom = 1;
 };
 
 namespace {
 static_assert(sizeof(pm_event) == sizeof(pm::Event), "pm_event must mirror pm::Event");
+
+// CPU time of the calling thread in seconds, or -1 where the clock does not
+// exist. A plain kernel call (Darwin: a trap reading the thread's own
+// timers; Linux: clock_gettime), no allocation and no lock it could wait on.
+double threadCpuSeconds() noexcept {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        return static_cast<double>(ts.tv_sec) + 1e-9 * static_cast<double>(ts.tv_nsec);
+#endif
+    return -1.0;
+}
 
 void toEntry(const pm::host::MonitorEntry& in, pm_midi_monitor_entry& out) {
     const pm::host::MidiMessage& m = in.message;
@@ -94,6 +109,8 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         for (int32_t i = 0; i < frames; ++i) left[i] = right[i] = 0.0f;
         return;
     }
+    const bool cpu = host->cpuTiming.load(std::memory_order_relaxed);
+    const double c0 = cpu ? threadCpuSeconds() : -1.0;
     const auto t0 = std::chrono::steady_clock::now();
     pm_engine* engine = host->engine;
     host->core.forwardEvents([engine](const pm::Event& e) {
@@ -112,7 +129,21 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
     clock.host_ticks_per_sample = host->ticksPerSample;
     pm_engine_render(engine, left, right, frames, host_time != 0 ? &clock : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
-    host->core.meter().record(std::chrono::duration<double>(t1 - t0).count(), frames / host->sampleRate);
+    const double c1 = cpu ? threadCpuSeconds() : -1.0;
+    pm::host::BufferRecord rec;
+    rec.renderSeconds = std::chrono::duration<double>(t1 - t0).count();
+    rec.periodSeconds = frames / host->sampleRate;
+    rec.cpuSeconds = c0 >= 0.0 && c1 >= 0.0 ? c1 - c0 : -1.0;
+    rec.frames = frames;
+    if (const pm::Engine* e = pmEngineOf(engine)) {
+        const pm::RenderInfo& info = e->lastRender();
+        rec.hammersInContact = info.hammersInContact;
+        rec.hammersActive = info.hammersActive;
+        rec.awakeModes = info.awakeModes;
+        rec.events = info.events;
+        rec.subBlocks = info.subBlocks;
+    }
+    host->core.meter().record(rec);
     host->lastFrames.store(frames, std::memory_order_relaxed);
     host->core.exitRender();
 }
@@ -169,6 +200,45 @@ void pm_host_get_load(const pm_host* host, pm_host_load* load) {
     load->over_budget = s.overBudget;
     load->last_frames = host->lastFrames.load(std::memory_order_relaxed);
     load->reserved = 0;
+}
+
+void pm_host_get_diagnostics(const pm_host* host, pm_host_diagnostics* d) {
+    if (!host || !d) return;
+    *d = pm_host_diagnostics{};
+    const pm::host::LoadSnapshot s = host->core.meter().snapshot();
+    d->sample_rate = host->publishedRate.load(std::memory_order_relaxed);
+    d->buffers = s.buffers;
+    d->last_frames = s.lastFrames;
+    d->min_frames = s.minFrames;
+    d->max_frames = s.maxFrames;
+    d->distinct_frame_counts = s.distinctFrames;
+    d->last_period_us = s.lastPeriodUs;
+    d->mean_us = s.meanUs;
+    d->p99_us = s.p99Us;
+    d->max_us = s.maxUs;
+    d->mean_load = s.meanLoad;
+    d->p99_load = s.p99Load;
+    d->max_load = s.maxLoad;
+    d->recent_load = s.recentLoad;
+    d->budget = s.budget;
+    d->over_budget = s.overBudget;
+    d->worst_index = s.worst.index;
+    d->worst_frames = s.worst.frames;
+    d->worst_hammers_in_contact = s.worst.hammersInContact;
+    d->worst_hammers_active = s.worst.hammersActive;
+    d->worst_awake_modes = s.worst.awakeModes;
+    d->worst_events = s.worst.events;
+    d->worst_sub_blocks = s.worst.subBlocks;
+    d->worst_period_us = s.worst.periodUs;
+    d->worst_render_us = s.worst.renderUs;
+    d->worst_load = s.worst.load;
+    d->worst_cpu_us = s.worst.cpuUs;
+    d->max_stall_us = s.maxStallUs;
+    d->cpu_timing = host->cpuTiming.load(std::memory_order_relaxed) && threadCpuSeconds() >= 0.0 ? 1 : 0;
+}
+
+void pm_host_set_cpu_timing(pm_host* host, int enabled) {
+    if (host) host->cpuTiming.store(enabled != 0, std::memory_order_relaxed);
 }
 
 void pm_host_reset_load(pm_host* host) {

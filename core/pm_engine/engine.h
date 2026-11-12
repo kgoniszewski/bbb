@@ -112,6 +112,18 @@ struct EngineStats {
     float peakPreLimiter = 0.0f;
 };
 
+// What the last render() call did, for a load meter that explains a slow
+// buffer (written and read on the audio thread only: read it right after
+// render(), on the same thread).
+struct RenderInfo {
+    int frames = 0;
+    int subBlocks = 0;         // processing segments the buffer was cut into
+    int events = 0;            // events applied
+    int hammersActive = 0;     // at the end of the buffer
+    int hammersInContact = 0;  // hammers that touched a string during the buffer
+    int awakeModes = 0;        // at the end of the buffer
+};
+
 #if defined(PM_PROFILE)
 // Per-phase wall time of the last render() call, in microseconds. Only in
 // the profiling build of the engine (pm_engine_profile, which bench_engine
@@ -286,6 +298,8 @@ public:
 
     // Safe to read from another thread (relaxed snapshot).
     EngineStats stats() const noexcept;
+    // Audio thread only, after render().
+    const RenderInfo& lastRender() const noexcept { return info_; }
 #if defined(PM_PROFILE)
     // Profiling build only: the phases of the last render() (same thread).
     const EngineProfile& profile() const noexcept { return prof_; }
@@ -334,6 +348,7 @@ private:
         int key;
         std::uint64_t launchTime;
         float unaCorda;
+        std::int64_t contactMark;  // state.contactSubsteps at the end of the last render
     };
     static constexpr std::uint8_t kStrikeOnly = 100;  // internal: deferred hammer launch
 
@@ -476,6 +491,7 @@ private:
     float peakPre_ = 0.0f;
     int peakHammers_ = 0;
     int totalModes_ = 0;
+    RenderInfo info_{};
     struct Published {
         std::atomic<int> awakeGroups{0}, awakeModes{0}, activeHammers{0}, peakHammers{0};
         std::atomic<std::uint64_t> deferred{0}, late{0}, limited{0}, nonFinite{0};

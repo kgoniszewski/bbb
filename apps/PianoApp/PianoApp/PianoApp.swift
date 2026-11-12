@@ -31,6 +31,10 @@ struct ContentView: View {
                 .tabItem {
                     Label("MIDI Monitor", systemImage: "list.bullet.rectangle")
                 }
+            BenchmarkView()
+                .tabItem {
+                    Label("Benchmark", systemImage: "speedometer")
+                }
         }
     }
 }

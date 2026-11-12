@@ -23,6 +23,7 @@ let package = Package(
                 "pm_voicing/CMakeLists.txt",
                 "pm_engine/CMakeLists.txt",
                 "pm_host/CMakeLists.txt",
+                "pm_bench/CMakeLists.txt",
             ],
             sources: [
                 "pm_string",
@@ -31,8 +32,10 @@ let package = Package(
                 "pm_voicing",
                 "pm_engine",
                 "pm_host",
+                "pm_bench",
                 "pm_api/pm_api.cpp",
                 "pm_api/pm_host_api.cpp",
+                "pm_api/pm_bench_api.cpp",
             ],
             publicHeadersPath: "pm_api/include",
             cxxSettings: [

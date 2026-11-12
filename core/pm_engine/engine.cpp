@@ -347,6 +347,7 @@ void Engine::drainQueue(const ClockMapping* clock) noexcept {
 }
 
 void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
+    ++info_.events;
     const int k = static_cast<int>(e.note) - kFirstMidiNote;
     const bool validKey = k >= 0 && k < kNumKeys;
     switch (static_cast<std::uint8_t>(e.type)) {
@@ -492,6 +493,7 @@ bool Engine::strike(int k, double velocity, std::int64_t now) noexcept {
     }
     const HammerKeyModes m = contact_.view(bank_, k);
     launchHammer(h.state, h.params, m, velocity);
+    h.contactMark = 0;
     bank_.wakeSegment(k);
     const float knock = knockLevel_.load(std::memory_order_relaxed);
     if (boardOn_ && knock > 0.0f && nKnocks_ < kMaxKnocks)
@@ -778,6 +780,7 @@ void Engine::processBoard(int n) noexcept {
 }
 
 void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept {
+    ++info_.subBlocks;
     float* mL = mixL_.data();
     float* mR = mixR_.data();
     if (boardOn_) {
@@ -873,6 +876,9 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
         return;
     }
     ScopedFlushDenormals ftz;
+    info_.frames = nFrames;
+    info_.subBlocks = 0;
+    info_.events = 0;
 #if defined(PM_PROFILE)
     prof_ = EngineProfile{};
     const auto tRender = std::chrono::steady_clock::now();
@@ -911,6 +917,15 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             ++awakeGroups;
             awakeModes += groupModes_[g];
         }
+    int inContact = 0;
+    for (int a = 0; a < activeCount_; ++a) {
+        Hammer& h = hammers_[active_[a]];
+        inContact += h.state.contactSubsteps > h.contactMark ? 1 : 0;
+        h.contactMark = h.state.contactSubsteps;
+    }
+    info_.hammersActive = activeCount_;
+    info_.hammersInContact = inContact;
+    info_.awakeModes = awakeModes;
     pub_.awakeGroups.store(awakeGroups, std::memory_order_relaxed);
     pub_.awakeModes.store(awakeModes, std::memory_order_relaxed);
     pub_.activeHammers.store(activeCount_, std::memory_order_relaxed);

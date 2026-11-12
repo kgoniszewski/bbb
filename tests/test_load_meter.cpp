@@ -86,3 +86,86 @@ TEST(concurrent_reads) {
     const auto s = m.snapshot();
     CHECK(s.maxLoad <= 0.99 + 1e-12);
 }
+
+TEST(percentiles_worst_buffer_and_frame_counts) {
+    LoadMeter m;
+    const double fs = 48000.0;
+    // 990 buffers of 64 frames at 20 %, 10 buffers of 70 frames at 50 % (one
+    // of them, the 500th buffer, at 90 % with its engine details), plus a
+    // handful of odd frame counts.
+    std::uint64_t worstAt = 0;
+    for (int i = 0; i < 1000; ++i) {
+        pm::host::BufferRecord b;
+        b.frames = i % 100 == 7 ? 70 : 64;
+        b.periodSeconds = b.frames / fs;
+        double load = b.frames == 70 ? 0.5 : 0.2;
+        if (i == 499) {
+            b.frames = 70;
+            b.periodSeconds = 70 / fs;
+            load = 0.9;
+            b.hammersInContact = 7;
+            b.hammersActive = 12;
+            b.awakeModes = 4321;
+            b.events = 5;
+            b.subBlocks = 9;
+            b.cpuSeconds = 0.5 * load * b.periodSeconds;  // half of the wall time
+            worstAt = static_cast<std::uint64_t>(i + 1);
+        }
+        b.renderSeconds = load * b.periodSeconds;
+        m.record(b);
+    }
+    const auto s = m.snapshot();
+    CHECK(s.buffers == 1000);
+    // p99: 11 of 1000 buffers are above 20 %, so the 99th percentile is in
+    // the 50 % bin (upper edge 50.25 %).
+    CHECK(s.p99Load > 0.49 && s.p99Load <= 0.5025 + 1e-12);
+    CHECK_NEAR(s.maxLoad, 0.9, 1e-12);
+    // Render times: 20 % of 1333 us = 267 us; 50 % of 1458 us = 729 us.
+    CHECK(s.p99Us >= 729.0 && s.p99Us <= 729.0 * 1.016);
+    CHECK_NEAR(s.maxUs, 0.9 * 70 / fs * 1e6, 1e-6);
+    CHECK(s.minFrames == 64 && s.maxFrames == 70 && s.distinctFrames == 2 && s.lastFrames == 64);
+    CHECK(s.worst.index == worstAt && s.worst.frames == 70 && s.worst.hammersInContact == 7 &&
+          s.worst.hammersActive == 12 && s.worst.awakeModes == 4321 && s.worst.events == 5 &&
+          s.worst.subBlocks == 9);
+    CHECK_NEAR(s.worst.periodUs, 70 / fs * 1e6, 1e-9);
+    CHECK_NEAR(s.worst.cpuUs, 0.5 * s.worst.renderUs, 1e-9);
+    CHECK_NEAR(s.maxStallUs, 0.5 * s.worst.renderUs, 1e-9);  // only that buffer had CPU time
+    // Reset clears everything, histograms included.
+    m.requestReset();
+    pm::host::BufferRecord b;
+    b.frames = 512;
+    b.periodSeconds = 512 / fs;
+    b.renderSeconds = 0.1 * b.periodSeconds;
+    m.record(b);
+    const auto r = m.snapshot();
+    CHECK(r.buffers == 1 && r.distinctFrames == 1 && r.minFrames == 512 && r.maxFrames == 512);
+    CHECK(r.p99Load <= 0.1 + 1e-12 && r.p99Load > 0.0975);
+    CHECK(r.worst.index == 1 && r.worst.frames == 512 && r.worst.cpuUs < 0.0);
+    CHECK(r.maxStallUs < 0.0);
+}
+
+TEST(worst_buffer_is_never_torn) {
+    // The worst-buffer fields always come from one buffer: frames and
+    // awake modes are written together (awake = 10 * frames).
+    LoadMeter m;
+    std::atomic<bool> done{false};
+    std::thread audio([&] {
+        for (int i = 0; i < 300000; ++i) {
+            pm::host::BufferRecord b;
+            b.frames = 1 + i % 4000;
+            b.awakeModes = 10 * b.frames;
+            b.periodSeconds = 1e-3;
+            b.renderSeconds = 1e-3 * (i % 5000) / 5000.0;
+            m.record(b);
+            if (i % 5000 == 4999) m.requestReset();
+        }
+        done.store(true);
+    });
+    bool ok = true;
+    while (!done.load()) {
+        const auto s = m.snapshot();
+        if (s.worst.awakeModes != 10 * s.worst.frames) ok = false;
+    }
+    audio.join();
+    CHECK(ok);
+}

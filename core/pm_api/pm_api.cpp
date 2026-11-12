@@ -2,6 +2,7 @@
 
 #include <new>
 
+#include "pm_api/pm_api_internal.h"
 #include "pm_engine/engine.h"
 
 struct pm_engine {
@@ -10,6 +11,8 @@ struct pm_engine {
     pm::TableOptions voicing;
     pm::SoundboardConfig board;
 };
+
+pm::Engine* pmEngineOf(pm_engine* engine) noexcept { return engine ? &engine->engine : nullptr; }
 
 namespace {
 static_assert(sizeof(pm_event) == sizeof(pm::Event), "pm_event must mirror pm::Event");
@@ -22,7 +25,7 @@ uint32_t pm_api_version(void) {
     return (PM_API_VERSION_MAJOR << 16) | (PM_API_VERSION_MINOR << 8) | PM_API_VERSION_PATCH;
 }
 
-const char* pm_version_string(void) { return "0.6.0 (M4, app host)"; }
+const char* pm_version_string(void) { return "0.7.0 (M4, app host, diagnostics, benchmark)"; }
 
 pm_engine* pm_engine_create(void) {
     pm_engine* e = new (std::nothrow) pm_engine();

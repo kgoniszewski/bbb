@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 6
+#define PM_API_VERSION_MINOR 7
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -242,6 +242,110 @@ void pm_host_get_load(const pm_host* host, pm_host_load* load);
 void pm_host_reset_load(pm_host* host);
 void pm_host_set_load_budget(pm_host* host, double fraction);
 void pm_host_get_counters(const pm_host* host, pm_host_counters* counters);
+
+/* ------------------------------------------------------------------------
+ * Load diagnostics (API 0.7): enough to explain a slow buffer without a
+ * profiler. Render times are wall-clock time spent in pm_host_render;
+ * loads are render time / the buffer's own period (frames / sample rate).
+ * p99 values come from fixed-bin histograms (0.25 % load bins; render-time
+ * bins about 1.5 % wide) and are the upper edge of the bin holding the 99th
+ * percentile. Everything is since the last pm_host_reset_load. */
+typedef struct pm_host_diagnostics {
+    double sample_rate;          /* prepared rate */
+    uint64_t buffers;
+    int32_t last_frames;         /* frames of the last render call */
+    int32_t min_frames;          /* smallest / largest frame count seen */
+    int32_t max_frames;
+    int32_t distinct_frame_counts; /* > 1: the callback is not called with a fixed size */
+    double last_period_us;       /* last_frames / sample rate */
+    double mean_us, p99_us, max_us;        /* render time per buffer */
+    double mean_load, p99_load, max_load;  /* fractions of the buffer period */
+    double recent_load;
+    double budget;
+    uint64_t over_budget;
+    /* The buffer with the highest load. */
+    uint64_t worst_index;        /* its number since the reset (1 = first) */
+    int32_t worst_frames;
+    int32_t worst_hammers_in_contact; /* hammers that touched a string in it */
+    int32_t worst_hammers_active;
+    int32_t worst_awake_modes;
+    int32_t worst_events;        /* events applied in it */
+    int32_t worst_sub_blocks;    /* segments the engine cut it into */
+    double worst_period_us;
+    double worst_render_us;
+    double worst_load;
+    double worst_cpu_us;         /* thread CPU time of that buffer; < 0 when not measured */
+    /* Thread CPU time (pm_host_set_cpu_timing): the largest wall-clock minus
+     * CPU time of any buffer, i.e. time the audio thread was not running
+     * (preemption); < 0 when not measured. */
+    double max_stall_us;
+    int32_t cpu_timing;          /* 1 while thread CPU time is measured */
+    int32_t reserved;
+} pm_host_diagnostics;
+
+void pm_host_get_diagnostics(const pm_host* host, pm_host_diagnostics* diagnostics);
+
+/* Off by default. When on, pm_host_render also reads the audio thread's CPU
+ * time (POSIX clock_gettime(CLOCK_THREAD_CPUTIME_ID), two calls per buffer:
+ * a kernel call that neither allocates nor waits on a lock, but a kernel
+ * call all the same, hence opt-in). Comparing it with the wall-clock time
+ * separates preemption from slow execution. Has no effect where the clock
+ * does not exist. Takes effect at the next buffer. */
+void pm_host_set_cpu_timing(pm_host* host, int enabled);
+
+/* ------------------------------------------------------------------------
+ * Build information (API 0.7): a static string describing how the engine
+ * was compiled (SIMD kernel, optimisation, NDEBUG, FMA contraction,
+ * compiler), for diagnostics. */
+const char* pm_build_info(void);
+
+/* ------------------------------------------------------------------------
+ * Offline benchmark (API 0.7): the scenarios of tools/bench/bench_engine
+ * (core/pm_bench/bench.h), run on the calling thread with a private engine
+ * as fast as it can, for measuring a device. Non-real-time: each item
+ * prepares its own engine (about a second) and then renders for 'seconds';
+ * call from a background thread. Items: the engine scenarios, then the
+ * hammer micro-benchmark per key (unless PM_BENCH_NO_HAMMER). */
+enum pm_bench_flags {
+    PM_BENCH_ALL_TIERS = 1,  /* also worst/cluster/bloom at Balanced and Eco */
+    PM_BENCH_NO_HAMMER = 2
+};
+
+enum pm_bench_kind {
+    PM_BENCH_SCENARIO = 0,
+    PM_BENCH_HAMMER = 1
+};
+
+typedef struct pm_bench_config {
+    double sample_rate;      /* <= 0: 48000 */
+    double seconds;          /* measured per scenario; <= 0: 3 */
+    int32_t block_frames;    /* frames per render call; <= 0: 64 */
+    int32_t tier;            /* pm_quality_tier of the board-on scenarios */
+    int32_t hammer_strikes;  /* per key; <= 0: 200 */
+    int32_t flags;           /* pm_bench_flags */
+} pm_bench_config;
+
+typedef struct pm_bench_result {
+    int32_t kind;            /* pm_bench_kind */
+    int32_t ok;              /* 0: the item could not be run */
+    double period_us;        /* block_frames / sample_rate */
+    /* PM_BENCH_SCENARIO: render time per buffer. */
+    double mean_us, p99_us, max_us;
+    double mean_load, p99_load, max_load; /* fractions of the period */
+    double first_100ms_load; /* mean over the first 100 ms measured */
+    double mean_awake_modes;
+    int32_t awake_modes_end;
+    /* PM_BENCH_HAMMER: one hammer alone, us per buffer (medians). */
+    int32_t key, strings, modes, oversampling;
+    double contact_us;       /* first buffer after the launch: in contact */
+    double life_us;          /* mean per buffer until the hammer is released */
+} pm_bench_result;
+
+int32_t pm_bench_item_count(const pm_bench_config* config);
+/* Static string; "" for an index out of range. */
+const char* pm_bench_item_name(const pm_bench_config* config, int32_t index);
+/* Returns 1 and fills result on success. */
+int pm_bench_run_item(const pm_bench_config* config, int32_t index, pm_bench_result* result);
 
 #ifdef __cplusplus
 }

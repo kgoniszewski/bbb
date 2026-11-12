@@ -103,8 +103,10 @@ struct ControlsSection: View {
 
 struct CPUMeterView: View {
     @EnvironmentObject var model: AppModel
+    @State private var copied = false
 
     var body: some View {
+        let d = model.diag
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("CPU: render time / buffer period").font(.headline)
@@ -114,10 +116,29 @@ struct CPUMeterView: View {
             }
             meterRow("Now", model.recentLoad)
             meterRow("Mean", model.meanLoad)
+            meterRow("p99", d.p99_load)
             meterRow("Max", model.maxLoad)
             Text(verbatim: "Buffers over \(Int((model.loadBudget * 100).rounded())) %: \(model.overBudget) of \(model.buffers)")
                 .font(.caption)
                 .monospacedDigit()
+            VStack(alignment: .leading, spacing: 2) {
+                Text(verbatim: "Render buffer: \(d.last_frames) frames = \(AppModel.us(d.last_period_us)); seen \(d.min_frames)...\(d.max_frames) frames, \(d.distinct_frame_counts) distinct size(s)")
+                Text(verbatim: "Render time: mean \(AppModel.us(d.mean_us)) (\(AppModel.pct(d.mean_load))), p99 \(AppModel.us(d.p99_us)) (\(AppModel.pct(d.p99_load))), max \(AppModel.us(d.max_us)) (\(AppModel.pct(d.max_load)))")
+                Text(verbatim: model.worstBufferText())
+                if d.cpu_timing == 1 {
+                    Text(verbatim: "Largest wall minus CPU time of a buffer (preemption): \(AppModel.us(d.max_stall_us))")
+                }
+            }
+            .font(.system(.caption, design: .monospaced))
+            HStack(spacing: 16) {
+                Toggle("Thread CPU time", isOn: Binding(get: { model.cpuTiming }, set: { model.setCpuTiming($0) }))
+                    .fixedSize()
+                Button(copied ? "Copied" : "Copy diagnostics") {
+                    MonitorView.copyToClipboard(model.diagnosticsText())
+                    copied = true
+                }
+                .buttonStyle(.bordered)
+            }
         }
     }
 

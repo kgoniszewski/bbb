@@ -40,6 +40,7 @@ final class AudioController {
     private var observers: [NSObjectProtocol] = []
     private var generation = 0  // invalidates completions of superseded prepares
     private var terminated = false  // set by shutdownForTermination(); drops all later queue work
+    private var suspended = false   // output stopped for the offline benchmark (suspendOutput)
 
     /// Owns every session and engine lifecycle call; all state above (and
     /// `status`) is touched only on this queue after init.
@@ -105,6 +106,33 @@ final class AudioController {
         }
     }
 
+    /// Stops audio output for the offline benchmark, so that it measures the
+    /// engine alone, and calls `completion` on the main thread once the render
+    /// callback has stopped. The session, the graph and the prepared engine
+    /// stay; notifications that would restart the output are held off until
+    /// `resumeOutput()`.
+    func suspendOutput(completion: @escaping () -> Void) {
+        onAudioQueue { me in
+            me.suspended = true
+            me.cancelPendingRouteWork()
+            me.generation += 1  // a prepare still in flight must not restart the engine
+            me.engine.stop()
+            me.status.running = false
+            me.status.message = "Paused for benchmark"
+            DispatchQueue.main.async { completion() }
+        }
+    }
+
+    /// Restarts the output after `suspendOutput` (re-preparing only if the
+    /// hardware sample rate changed meanwhile).
+    func resumeOutput() {
+        onAudioQueue { me in
+            guard me.suspended else { return }
+            me.suspended = false
+            me.reconfigure(reason: "Resuming after benchmark")
+        }
+    }
+
     /// Process exit (willTerminate), main thread. Stops the render callback
     /// with a bounded wait and disables the controller for good. The session
     /// is not deactivated (that can block while I/O winds down, and the OS
@@ -125,6 +153,7 @@ final class AudioController {
 
     /// audioQueue only.
     private func tearDown() {
+        suspended = false  // an explicit stop is not undone by resumeOutput()
         cancelPendingRouteWork()
         generation += 1  // a prepare still in flight must not restart the engine
         engine.stop()
@@ -187,6 +216,12 @@ final class AudioController {
         let myGeneration = generation
         engine.stop()
         status.running = false
+        if suspended {
+            // Benchmark running: stay stopped; resumeOutput() reconfigures.
+            readHardwareStatus()
+            status.message = "Paused for benchmark"
+            return
+        }
         status.message = reason
         #if os(macOS)
         setMacBufferFrames(AudioController.preferredFrames)

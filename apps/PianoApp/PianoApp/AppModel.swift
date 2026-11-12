@@ -47,6 +47,16 @@ final class AppModel: ObservableObject {
     @Published var renderFrames = 0
     @Published var activeHammers = 0
     @Published var awakeModes = 0
+    // Load diagnostics (percentiles, frame counts, the worst buffer)
+    @Published var diag = pm_host_diagnostics()
+    @Published var cpuTiming = false
+    // Offline benchmark (Benchmark tab)
+    @Published var benchRunning = false
+    @Published var benchProgress = ""
+    @Published var benchLines: [String] = []
+    @Published var benchAllTiers = false
+    private var benchHeader = ""
+    private let benchQueue = DispatchQueue(label: "piano.benchmark", qos: .userInteractive)
     // Controls
     @Published var sustainDown = false
     @Published var tier: QualityTier = .full
@@ -152,6 +162,7 @@ final class AppModel: ObservableObject {
         droppedEvents = counters.dropped_events + stats.dropped_events
         activeHammers = Int(stats.active_hammers)
         awakeModes = Int(stats.awake_modes)
+        diag = host.diagnostics()
         let mc = midiController
         monitor.paused = monitorStore.paused
         if monitor.drain(host: host, sourceName: { id in mc?.name(forSource: id) ?? "?" }) {
@@ -180,6 +191,157 @@ final class AppModel: ObservableObject {
     }
 
     func resetLoad() { host?.resetLoad() }
+
+    func setCpuTiming(_ on: Bool) {
+        cpuTiming = on
+        host?.setCpuTiming(on)
+        host?.resetLoad()  // keep the worst buffer comparable with its CPU time
+    }
+
+    // MARK: - Diagnostics text (Copy diagnostics)
+
+    /// Device, build and audio facts shared by the diagnostics and the benchmark export.
+    func environmentText() -> String {
+        var out = "build: \(EngineHost.buildInfo); API \(String(cString: pm_version_string()))\n"
+        let info = ProcessInfo.processInfo
+        var machine = "?"
+        var u = utsname()
+        if uname(&u) == 0 {
+            machine = withUnsafeBytes(of: &u.machine) { raw -> String in
+                guard let base = raw.baseAddress else { return "?" }
+                return String(cString: base.assumingMemoryBound(to: CChar.self))
+            }
+        }
+        out += "device: \(machine), \(info.operatingSystemVersionString), \(info.activeProcessorCount) cores"
+        if info.isiOSAppOnMac { out += ", iPad app on Mac" }
+        if info.isMacCatalystApp { out += ", Mac Catalyst" }
+        out += ", thermal state \(AppModel.thermalName(info.thermalState))"
+        if info.isLowPowerModeEnabled { out += ", low power mode" }
+        out += "\n"
+        return out
+    }
+
+    func diagnosticsText() -> String {
+        let d = diag
+        var out = "Piano diagnostics, \(Date())\n"
+        out += environmentText()
+        out += "audio: \(audio.message), \(String(format: "%.0f", audio.sampleRate)) Hz, I/O buffer \(audio.ioBufferFrames) frames"
+        out += String(format: ", output latency %.2f ms, route %@\n", audio.outputLatencyMs, audio.route)
+        out += "engine: tier \(tier.label), soundboard \(boardOn ? "on" : "off"), \(awakeModes) modes awake, \(activeHammers) hammers active\n"
+        out += "render calls: last \(d.last_frames) frames = \(AppModel.us(d.last_period_us)); "
+        out += "frames seen \(d.min_frames)...\(d.max_frames), \(d.distinct_frame_counts) distinct size(s)\n"
+        out += "since reset: \(d.buffers) buffers, over \(Int((d.budget * 100).rounded())) %: \(d.over_budget)\n"
+        out += "render time: mean \(AppModel.us(d.mean_us)) (\(AppModel.pct(d.mean_load))), "
+        out += "p99 \(AppModel.us(d.p99_us)) (\(AppModel.pct(d.p99_load))), "
+        out += "max \(AppModel.us(d.max_us)) (\(AppModel.pct(d.max_load)))\n"
+        out += worstBufferText() + "\n"
+        if d.cpu_timing == 1 {
+            out += "thread CPU time: on; largest wall minus CPU time of a buffer \(AppModel.us(d.max_stall_us))\n"
+        } else {
+            out += "thread CPU time: off\n"
+        }
+        out += "(loads are render time / each buffer's own period; p99 is the upper edge of a 0.25 % bin)\n"
+        return out
+    }
+
+    func worstBufferText() -> String {
+        let d = diag
+        guard d.worst_index > 0 else { return "worst buffer: -" }
+        var out = "worst buffer #\(d.worst_index): \(d.worst_frames) frames, \(AppModel.us(d.worst_render_us)) of "
+        out += "\(AppModel.us(d.worst_period_us)) (\(AppModel.pct(d.worst_load)))"
+        if d.worst_cpu_us >= 0 { out += ", CPU \(AppModel.us(d.worst_cpu_us))" }
+        out += "; \(d.worst_hammers_in_contact) hammers in contact (\(d.worst_hammers_active) active), "
+        out += "\(d.worst_awake_modes) modes awake, \(d.worst_events) events, \(d.worst_sub_blocks) sub-blocks"
+        return out
+    }
+
+    static func us(_ v: Double) -> String { String(format: "%.0f us", v) }
+    static func pct(_ v: Double) -> String { String(format: "%.1f %%", v * 100.0) }
+
+    static func thermalName(_ s: ProcessInfo.ThermalState) -> String {
+        switch s {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
+    }
+
+    // MARK: - Offline benchmark
+
+    /// Runs the bench_engine scenarios on a background thread (QoS
+    /// userInteractive) with audio output paused, so that the numbers are the
+    /// engine's alone. Results arrive line by line.
+    func runBenchmark() {
+        guard !benchRunning, host != nil else { return }
+        benchRunning = true
+        benchLines = []
+        benchProgress = "Pausing audio"
+        var config = pm_bench_config()
+        config.sample_rate = 48000
+        config.seconds = 3
+        config.block_frames = 64
+        config.tier = Int32(tier.rawValue)
+        config.hammer_strikes = 200
+        config.flags = benchAllTiers ? Int32(PM_BENCH_ALL_TIERS.rawValue) : 0
+        benchHeader = "Piano benchmark, \(Date())\n" + environmentText()
+        benchHeader += "fs 48000 Hz, 64-frame buffers (1333 us), board-on cases at tier \(tier.label), 3 s per case; audio paused during the run\n"
+        if let ac = audioController {
+            ac.suspendOutput { [weak self] in
+                self?.startBenchmark(config)
+            }
+        } else {
+            startBenchmark(config)
+        }
+    }
+
+    private func startBenchmark(_ config: pm_bench_config) {
+        var cfg = config
+        let count = Int(pm_bench_item_count(&cfg))
+        benchProgress = "0/\(count)"
+        benchQueue.async { [weak self] in
+            var c = config
+            for i in 0..<count {
+                let name = String(cString: pm_bench_item_name(&c, Int32(i)))
+                DispatchQueue.main.async {
+                    self?.benchProgress = "\(i + 1)/\(count): \(name)"
+                }
+                var r = pm_bench_result()
+                let ok = pm_bench_run_item(&c, Int32(i), &r) == 1
+                let line = AppModel.benchLine(name: name, result: r, ok: ok)
+                DispatchQueue.main.async {
+                    self?.benchLines.append(line)
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.benchRunning = false
+                self.benchProgress = "Done (\(count) items); audio resumed"
+                self.audioController?.resumeOutput()
+            }
+        }
+    }
+
+    static let benchColumns = "case".padding(toLength: 38, withPad: " ", startingAt: 0)
+        + "  mean us   p99 us   max us   mean %   p99 %   max %"
+
+    static func benchLine(name: String, result r: pm_bench_result, ok: Bool) -> String {
+        guard ok else { return name + ": failed" }
+        if r.kind == Int32(PM_BENCH_HAMMER.rawValue) {
+            return String(format: "%@ (%d strings, %d modes, R=%d): %.1f us in contact, %.1f us averaged over its life",
+                          name, r.strings, r.modes, r.oversampling, r.contact_us, r.life_us)
+        }
+        return name.padding(toLength: 38, withPad: " ", startingAt: 0)
+            + String(format: " %8.1f %8.1f %8.1f %8.2f %7.2f %7.2f", r.mean_us, r.p99_us, r.max_us,
+                     r.mean_load * 100, r.p99_load * 100, r.max_load * 100)
+    }
+
+    func benchmarkExport() -> String {
+        var out = benchHeader + AppModel.benchColumns + "\n"
+        for line in benchLines { out += line + "\n" }
+        return out
+    }
 
     /// Moves the on-screen keyboard (which starts on a C) by octaves, keeping
     /// `shown` octaves plus the top C inside the piano (C1 ... C8).

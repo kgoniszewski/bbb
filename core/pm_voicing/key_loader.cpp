@@ -445,6 +445,7 @@ void loadKeyModes(ModeBank& bank, ContactTables& contact, int seg, const KeyPara
                   const KeyModeSet& m, double fs) {
     const int m0 = bank.segmentFirstMode(seg);
     const int R = k.contactOversampling;
+    contact.beginSegment(bank, seg, m.strings, R);
     for (int i = 0; i < m.count; ++i) {
         const int b = m0 + bankIndex(m, i);
         cd wIn = 0.0;
