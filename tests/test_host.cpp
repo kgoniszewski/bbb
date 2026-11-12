@@ -442,7 +442,10 @@ TEST(worst_buffer_hammer_detail) {
         const std::uint8_t on[] = {0x90, n, 127};
         pm_host_midi_bytes(h, on, 3, 0, 1);
     }
-    for (int buf = 0; buf < 30; ++buf) pm_host_render(h, l.data(), r.data(), kBig, 0);
+    // Only the burst buffer is rendered after the reset, so it is the worst
+    // buffer by construction: the meter ranks buffers by measured wall time,
+    // and on a loaded machine a preempted later buffer could outrank it.
+    pm_host_render(h, l.data(), r.data(), kBig, 0);
     pm_host_diagnostics d;
     pm_host_worst_detail w;
     pm_host_phase_diagnostics pd;
@@ -455,6 +458,7 @@ TEST(worst_buffer_hammer_detail) {
                 static_cast<unsigned long long>(d.worst_index), pd.worst_note_ons, w.hammers_in_contact,
                 w.max_hammers_in_contact, w.hammer_contact_samples, d.worst_hammers_active, w.newton_evals,
                 w.fallback_solves, w.kernel_rebuilds, w.kernel_key_updates);
+    CHECK(d.buffers == 1 && d.worst_index == 1);
     CHECK(pd.worst_note_ons == 10);
     CHECK(w.hammers_in_contact == 10 && d.worst_hammers_in_contact == 10);
     CHECK(w.max_hammers_in_contact >= 5 && w.max_hammers_in_contact <= 10);
