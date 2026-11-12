@@ -139,6 +139,9 @@ final class EngineHost {
         return d
     }
 
+    /// The MIDI monitor ring is filled only while enabled.
+    func setMonitorEnabled(_ on: Bool) { pm_host_set_monitor_enabled(raw, on ? 1 : 0) }
+
     /// Thread CPU time per buffer (two kernel clock reads per buffer; off by default).
     func setCpuTiming(_ on: Bool) { pm_host_set_cpu_timing(raw, on ? 1 : 0) }
 

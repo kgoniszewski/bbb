@@ -1,6 +1,7 @@
 // MIDI monitor screen: a scrolling log of every message received (source,
 // group, channel, type, data, raw words, time since the previous message),
 // with pause, clear, copy and share. Used for the M32 capture session.
+// Messages are captured only while this screen is visible.
 import Foundation
 import SwiftUI
 #if canImport(UIKit)
@@ -63,6 +64,9 @@ struct MonitorView: View {
                 }
             }
         }
+        // MIDI is captured into the monitor only while this screen is shown.
+        .onAppear { model.setMonitorVisible(true) }
+        .onDisappear { model.setMonitorVisible(false) }
     }
 
     static func copyToClipboard(_ text: String) {

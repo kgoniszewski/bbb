@@ -11,8 +11,10 @@
 //   bloom:    sustain pedal down, a staccato four-note chord every 0.5 s
 //   board off: worst and cluster without the soundboard (A/B)
 //   hammer:   cost of one active hammer per buffer, per key, while in
-//             contact and averaged over its life (contact plus release
-//             wait), measured on the solver alone
+//             contact and averaged over its life (from the launch until
+//             hammerFinished: the release wait, or since the sample path's
+//             early release, until the hammer provably cannot return),
+//             measured on the solver alone
 //
 // Compiled twice: pm_bench (the real-time engine library, for the C API and
 // the app) and pm_bench_profile (with PM_PROFILE against the profiling

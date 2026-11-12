@@ -1,6 +1,12 @@
 // App state for the SwiftUI views. Main thread only. Owns the engine host,
 // the audio and MIDI controllers, and polls meters and the MIDI monitor ring
 // on a timer (20 Hz).
+//
+// UI cost. The meters live in their own ObservableObject (MeterStore), so a
+// meter update re-renders only the views that show meters, never the whole
+// Play screen or the keyboard; they are published at 10 Hz and only when a
+// value changed. The MIDI monitor ring is filled (on the MIDI thread) and
+// drained and formatted (here) only while the monitor screen is visible.
 import Combine
 import Foundation
 import PianoCore
@@ -9,6 +15,28 @@ import UIKit
 #elseif canImport(AppKit)
 import AppKit
 #endif
+
+/// Meter values, separate from AppModel so that only the views showing them
+/// re-render when they change (10 Hz while audio runs).
+final class MeterStore: ObservableObject {
+    @Published var meanLoad = 0.0
+    @Published var recentLoad = 0.0
+    @Published var maxLoad = 0.0
+    @Published var overBudget: UInt64 = 0
+    @Published var loadBudget = 0.7
+    @Published var buffers: UInt64 = 0
+    @Published var renderFrames = 0
+    @Published var activeHammers = 0
+    @Published var awakeModes = 0
+    @Published var midiMessages: UInt64 = 0
+    @Published var droppedEvents: UInt64 = 0
+    // Load diagnostics (percentiles, frame counts, the worst buffer)
+    @Published var diag = pm_host_diagnostics()
+    // Process CPU over the last second, fractions of one core (< 0: unknown).
+    @Published var processCpu = -1.0
+    @Published var mainThreadCpu = -1.0
+    @Published var audioRenderCpu = -1.0
+}
 
 /// The MIDI monitor's published lines, separate from AppModel so that the
 /// monitor screen re-renders only when lines arrive.
@@ -35,20 +63,8 @@ final class AppModel: ObservableObject {
     // MIDI
     @Published var sources: [MIDIController.Source] = []
     @Published var midiMessage = ""
-    @Published var midiMessages: UInt64 = 0
-    @Published var droppedEvents: UInt64 = 0
-    // CPU meter: fractions of the buffer period
-    @Published var meanLoad = 0.0
-    @Published var recentLoad = 0.0
-    @Published var maxLoad = 0.0
-    @Published var overBudget: UInt64 = 0
-    @Published var loadBudget = 0.7
-    @Published var buffers: UInt64 = 0
-    @Published var renderFrames = 0
-    @Published var activeHammers = 0
-    @Published var awakeModes = 0
-    // Load diagnostics (percentiles, frame counts, the worst buffer)
-    @Published var diag = pm_host_diagnostics()
+    // Meters (separately observed)
+    let meters = MeterStore()
     @Published var cpuTiming = false
     // Offline benchmark (Benchmark tab)
     @Published var benchRunning = false
@@ -70,6 +86,11 @@ final class AppModel: ObservableObject {
     private var midiController: MIDIController?
     private let monitor = MIDIMonitor()
     private var timer: Timer?
+    private var ticks = 0
+    private var monitorVisible = false
+    // Previous 1 Hz CPU sample: process CPU, main-thread CPU and audio render
+    // time (seconds), and the wall time (seconds).
+    private var cpuPrev: (process: Double, main: Double, render: Double, wall: Double)?
     private var started = false
     private var terminateObserver: NSObjectProtocol?
 
@@ -98,6 +119,7 @@ final class AppModel: ObservableObject {
             host.pushNow(PM_EVENT_UNA_CORDA, value: 0)
         }
         midiController = mc
+        host.setMonitorEnabled(false)  // until the monitor screen is shown
         tier = QualityTier(rawValue: Int(host.param(PM_PARAM_QUALITY_TIER))) ?? .full
         boardOn = host.param(PM_PARAM_SOUNDBOARD_ENABLED) >= 0.5
     }
@@ -148,26 +170,76 @@ final class AppModel: ObservableObject {
 
     private func tick() {
         guard let host = host else { return }
-        let load = host.load()
-        meanLoad = load.mean_load
-        recentLoad = load.recent_load
-        maxLoad = load.max_load
-        overBudget = load.over_budget
-        loadBudget = load.budget
-        buffers = load.buffers
-        renderFrames = Int(load.last_frames)
-        let counters = host.counters()
-        midiMessages = counters.midi_messages
-        let stats = host.stats()
-        droppedEvents = counters.dropped_events + stats.dropped_events
-        activeHammers = Int(stats.active_hammers)
-        awakeModes = Int(stats.awake_modes)
-        diag = host.diagnostics()
-        let mc = midiController
-        monitor.paused = monitorStore.paused
-        if monitor.drain(host: host, sourceName: { id in mc?.name(forSource: id) ?? "?" }) {
-            monitorStore.lines = monitor.lines
+        ticks += 1
+        if monitorVisible {
+            let mc = midiController
+            monitor.paused = monitorStore.paused
+            if monitor.drain(host: host, sourceName: { id in mc?.name(forSource: id) ?? "?" }) {
+                monitorStore.lines = monitor.lines
+            }
         }
+        // Meters at 10 Hz, process CPU at 1 Hz.
+        if ticks % 2 == 0 {
+            updateMeters(host)
+        }
+        if ticks % 20 == 0 {
+            updateProcessCpu(host)
+        }
+    }
+
+    /// Assigns only changed values, so unchanged meters cause no re-render.
+    private func updateMeters(_ host: EngineHost) {
+        let m = meters
+        let load = host.load()
+        if m.meanLoad != load.mean_load { m.meanLoad = load.mean_load }
+        if m.recentLoad != load.recent_load { m.recentLoad = load.recent_load }
+        if m.maxLoad != load.max_load { m.maxLoad = load.max_load }
+        if m.overBudget != load.over_budget { m.overBudget = load.over_budget }
+        if m.loadBudget != load.budget { m.loadBudget = load.budget }
+        if m.buffers != load.buffers { m.buffers = load.buffers }
+        if m.renderFrames != Int(load.last_frames) { m.renderFrames = Int(load.last_frames) }
+        let counters = host.counters()
+        let stats = host.stats()
+        let dropped = counters.dropped_events + stats.dropped_events
+        if m.midiMessages != counters.midi_messages { m.midiMessages = counters.midi_messages }
+        if m.droppedEvents != dropped { m.droppedEvents = dropped }
+        if m.activeHammers != Int(stats.active_hammers) { m.activeHammers = Int(stats.active_hammers) }
+        if m.awakeModes != Int(stats.awake_modes) { m.awakeModes = Int(stats.awake_modes) }
+        let d = host.diagnostics()
+        if d.buffers != m.diag.buffers || d.worst_index != m.diag.worst_index || d.cpu_timing != m.diag.cpu_timing {
+            m.diag = d
+        }
+    }
+
+    /// Process CPU (getrusage: all threads), main-thread CPU (this thread's
+    /// CPU clock) and audio render time (from the load meter) over the last
+    /// second, as fractions of one core. Called once a second on the main
+    /// thread; three cheap reads, nothing on the audio thread.
+    private func updateProcessCpu(_ host: EngineHost) {
+        var ru = rusage()
+        guard getrusage(RUSAGE_SELF, &ru) == 0 else { return }
+        let process = Double(ru.ru_utime.tv_sec) + Double(ru.ru_utime.tv_usec) * 1e-6
+            + Double(ru.ru_stime.tv_sec) + Double(ru.ru_stime.tv_usec) * 1e-6
+        let main = Double(clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)) * 1e-9
+        let d = host.diagnostics()
+        let render = d.mean_us * Double(d.buffers) * 1e-6  // since the last meter reset
+        let wall = ProcessInfo.processInfo.systemUptime
+        if let p = cpuPrev, wall > p.wall {
+            let dt = wall - p.wall
+            meters.processCpu = (process - p.process) / dt
+            meters.mainThreadCpu = (main - p.main) / dt
+            // A meter reset in between makes the render total go backwards.
+            meters.audioRenderCpu = render >= p.render ? (render - p.render) / dt : -1.0
+        }
+        cpuPrev = (process, main, render, wall)
+    }
+
+    /// The monitor screen calls this from onAppear / onDisappear: the MIDI
+    /// thread fills the monitor ring, and this model drains and formats it,
+    /// only while the screen is visible.
+    func setMonitorVisible(_ visible: Bool) {
+        monitorVisible = visible
+        host?.setMonitorEnabled(visible)
     }
 
     // MARK: - Actions
@@ -222,12 +294,12 @@ final class AppModel: ObservableObject {
     }
 
     func diagnosticsText() -> String {
-        let d = diag
+        let d = meters.diag
         var out = "Piano diagnostics, \(Date())\n"
         out += environmentText()
         out += "audio: \(audio.message), \(String(format: "%.0f", audio.sampleRate)) Hz, I/O buffer \(audio.ioBufferFrames) frames"
         out += String(format: ", output latency %.2f ms, route %@\n", audio.outputLatencyMs, audio.route)
-        out += "engine: tier \(tier.label), soundboard \(boardOn ? "on" : "off"), \(awakeModes) modes awake, \(activeHammers) hammers active\n"
+        out += "engine: tier \(tier.label), soundboard \(boardOn ? "on" : "off"), \(meters.awakeModes) modes awake, \(meters.activeHammers) hammers active\n"
         out += "render calls: last \(d.last_frames) frames = \(AppModel.us(d.last_period_us)); "
         out += "frames seen \(d.min_frames)...\(d.max_frames), \(d.distinct_frame_counts) distinct size(s)\n"
         out += "since reset: \(d.buffers) buffers, over \(Int((d.budget * 100).rounded())) %: \(d.over_budget)\n"
@@ -240,18 +312,33 @@ final class AppModel: ObservableObject {
         } else {
             out += "thread CPU time: off\n"
         }
+        out += processCpuText() + "\n"
         out += "(loads are render time / each buffer's own period; p99 is the upper edge of a 0.25 % bin)\n"
         return out
     }
 
     func worstBufferText() -> String {
-        let d = diag
+        let d = meters.diag
         guard d.worst_index > 0 else { return "worst buffer: -" }
         var out = "worst buffer #\(d.worst_index): \(d.worst_frames) frames, \(AppModel.us(d.worst_render_us)) of "
         out += "\(AppModel.us(d.worst_period_us)) (\(AppModel.pct(d.worst_load)))"
         if d.worst_cpu_us >= 0 { out += ", CPU \(AppModel.us(d.worst_cpu_us))" }
         out += "; \(d.worst_hammers_in_contact) hammers in contact (\(d.worst_hammers_active) active), "
         out += "\(d.worst_awake_modes) modes awake, \(d.worst_events) events, \(d.worst_sub_blocks) sub-blocks"
+        return out
+    }
+
+    /// Whole-process CPU over the last second, split into the audio render
+    /// (from the load meter), the main thread (UI) and the rest.
+    func processCpuText() -> String {
+        let m = meters
+        guard m.processCpu >= 0 else { return "process CPU: measuring..." }
+        var out = "process CPU (last second, % of one core): total \(AppModel.pct(m.processCpu))"
+        if m.audioRenderCpu >= 0 { out += ", audio render \(AppModel.pct(m.audioRenderCpu))" }
+        if m.mainThreadCpu >= 0 { out += ", main thread \(AppModel.pct(m.mainThreadCpu))" }
+        if m.audioRenderCpu >= 0 && m.mainThreadCpu >= 0 {
+            out += ", other threads \(AppModel.pct(max(0, m.processCpu - m.audioRenderCpu - m.mainThreadCpu)))"
+        }
         return out
     }
 
@@ -383,7 +470,7 @@ final class AppModel: ObservableObject {
         let names = sources.map { $0.name }.joined(separator: ", ")
         header += "\nsources: \(names.isEmpty ? "none" : names)"
         if let host = host {
-            header += "\ntimebase \(host.timebaseNumer)/\(host.timebaseDenom), messages \(midiMessages)"
+            header += "\ntimebase \(host.timebaseNumer)/\(host.timebaseDenom), messages \(meters.midiMessages)"
             let c = host.counters()
             header += ", malformed \(c.midi_malformed), monitor dropped \(c.monitor_dropped)"
         }

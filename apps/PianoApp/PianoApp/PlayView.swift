@@ -11,9 +11,9 @@ struct PlayView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    StatusSection()
+                    StatusSection(meters: model.meters)
                     ControlsSection()
-                    CPUMeterView()
+                    CPUMeterView(meters: model.meters)
                 }
                 .padding()
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -25,6 +25,7 @@ struct PlayView: View {
 
 struct StatusSection: View {
     @EnvironmentObject var model: AppModel
+    @ObservedObject var meters: MeterStore
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -32,10 +33,10 @@ struct StatusSection: View {
             row("Audio", model.audio.message + (model.audio.preparing ? " (preparing...)" : ""))
             row("Sample rate", model.audio.sampleRate > 0 ? String(format: "%.0f Hz", model.audio.sampleRate) : "-")
             row("I/O buffer", ioBufferText())
-            row("Render buffer", model.renderFrames > 0 ? "\(model.renderFrames) frames" : "-")
+            row("Render buffer", meters.renderFrames > 0 ? "\(meters.renderFrames) frames" : "-")
             row("Output", model.audio.route)
-            row("Engine", "\(model.awakeModes) modes awake, \(model.activeHammers) hammers")
-            row("MIDI", "\(model.midiMessages) messages, \(model.droppedEvents) dropped events")
+            row("Engine", "\(meters.awakeModes) modes awake, \(meters.activeHammers) hammers")
+            row("MIDI", "\(meters.midiMessages) messages, \(meters.droppedEvents) dropped events")
             if !model.midiMessage.isEmpty {
                 row("MIDI status", model.midiMessage)
             }
@@ -103,10 +104,11 @@ struct ControlsSection: View {
 
 struct CPUMeterView: View {
     @EnvironmentObject var model: AppModel
+    @ObservedObject var meters: MeterStore
     @State private var copied = false
 
     var body: some View {
-        let d = model.diag
+        let d = meters.diag
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("CPU: render time / buffer period").font(.headline)
@@ -114,17 +116,18 @@ struct CPUMeterView: View {
                 Button("Reset") { model.resetLoad() }
                     .buttonStyle(.bordered)
             }
-            meterRow("Now", model.recentLoad)
-            meterRow("Mean", model.meanLoad)
+            meterRow("Now", meters.recentLoad)
+            meterRow("Mean", meters.meanLoad)
             meterRow("p99", d.p99_load)
-            meterRow("Max", model.maxLoad)
-            Text(verbatim: "Buffers over \(Int((model.loadBudget * 100).rounded())) %: \(model.overBudget) of \(model.buffers)")
+            meterRow("Max", meters.maxLoad)
+            Text(verbatim: "Buffers over \(Int((meters.loadBudget * 100).rounded())) %: \(meters.overBudget) of \(meters.buffers)")
                 .font(.caption)
                 .monospacedDigit()
             VStack(alignment: .leading, spacing: 2) {
                 Text(verbatim: "Render buffer: \(d.last_frames) frames = \(AppModel.us(d.last_period_us)); seen \(d.min_frames)...\(d.max_frames) frames, \(d.distinct_frame_counts) distinct size(s)")
                 Text(verbatim: "Render time: mean \(AppModel.us(d.mean_us)) (\(AppModel.pct(d.mean_load))), p99 \(AppModel.us(d.p99_us)) (\(AppModel.pct(d.p99_load))), max \(AppModel.us(d.max_us)) (\(AppModel.pct(d.max_load)))")
                 Text(verbatim: model.worstBufferText())
+                Text(verbatim: model.processCpuText())
                 if d.cpu_timing == 1 {
                     Text(verbatim: "Largest wall minus CPU time of a buffer (preemption): \(AppModel.us(d.max_stall_us))")
                 }
@@ -143,7 +146,7 @@ struct CPUMeterView: View {
     }
 
     private func meterRow(_ label: String, _ value: Double) -> some View {
-        let color: Color = value > model.loadBudget ? .red : (value > 0.5 ? .orange : .green)
+        let color: Color = value > meters.loadBudget ? .red : (value > 0.5 ? .orange : .green)
         return HStack {
             Text(verbatim: label).frame(width: 50, alignment: .leading)
             ProgressView(value: max(0.0, min(value, 1.0)))

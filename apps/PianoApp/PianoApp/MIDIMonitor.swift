@@ -9,7 +9,8 @@ struct MonitorLine: Identifiable {
 }
 
 final class MIDIMonitor {
-    static let maxLines = 3000
+    static let maxLines = 2000
+    static let trimBatch = 500
 
     private(set) var lines: [MonitorLine] = []
     private var nextId = 0
@@ -30,7 +31,8 @@ final class MIDIMonitor {
             nextId += 1
             added = true
         }
-        if lines.count > MIDIMonitor.maxLines {
+        // Trimmed in batches: removeFirst moves the whole array.
+        if lines.count > MIDIMonitor.maxLines + MIDIMonitor.trimBatch {
             lines.removeFirst(lines.count - MIDIMonitor.maxLines)
         }
         return added

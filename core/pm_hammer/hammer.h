@@ -123,6 +123,7 @@ struct SampleResponse {
     double gOut[kMaxStrings][kMaxSampleOversampling] = {};  // output at the sample end per N on string t in substep q
     double gIn = 0.0;                                      // output per unit input u
     double gP[kMaxStrings] = {};                           // y_s at the sample end per unit input u
+    double pAbsIn[kMaxStrings] = {};  // sum (|Re p_s| + |Im p_s|)(|Re wIn| + |Im wIn|): bound of y_s per unit |u|
 };
 
 // Read-only description of one key's modes for the solver, plus pointers to
@@ -152,6 +153,7 @@ struct HammerKeyModes {
     const SampleResponse* resp = nullptr;
     int oversampling = 1;
     double h = 0.0;                 // substep, s
+    double invH = 0.0;              // 1 / h
     std::int64_t releaseSubsteps = 0;  // out of contact this long -> finished
     std::int64_t maxSubsteps = 0;      // hard lifetime limit
 };
@@ -166,6 +168,15 @@ struct HammerState {
     double fPrev[kMaxStrings] = {};     // elastic felt force
     double dxiPrev[kMaxStrings] = {};   // last change of the felt compression
     double dxiPrev2[kMaxStrings] = {};  // the one before
+    // Newton predictor: the last free compressions (and their last two
+    // changes) and de/d(free compression) at the last solve, per string.
+    double dFreePrev[kMaxStrings] = {};
+    double dDFreePrev[kMaxStrings] = {};
+    double dDFreePrev2[kMaxStrings] = {};
+    double sensPrev[kMaxStrings] = {};
+    int history = 0;                    // touching substeps in a row (predictor history)
+    // Constants of the launch's parameters (launchHammer).
+    double invMass = 0.0, halfH2InvMass = 0.0, feltPm1 = 0.0, feltInvP1 = 0.0;
     double yPrev[kMaxStrings] = {};     // y_s
     double fPend[kMaxStrings] = {};     // substep path: force of the last substep, not yet applied
     // Sample path: forces of the last sample's substeps ([s * R + q]) and its
@@ -174,6 +185,10 @@ struct HammerState {
     float uPend = 0.0f;
     bool pendForces = false;            // sample path: fPendS is not all zero
     bool pending = false;
+    // Sample path: the hammer has left and provably cannot reach the strings
+    // again (see hammerFinished); from then on only the modes run.
+    bool cleared = false;
+    std::int64_t clearCheckAt = 0;      // substep of the next clearance check
 
     // Statistics, from the last launch.
     double launchVelocity = 0.0;
@@ -250,6 +265,7 @@ double strikeDisplacement(const HammerKeyModes& m, int s = 0) noexcept;
 void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m,
                   double velocity) noexcept;
 
+// 'p' must be the parameters the hammer was launched with.
 // Advances hammer and the key's modes by n base samples, writing the key's
 // output (sum wOut Im w after each sample, like the bank) to out[0..n).
 // 'in' (may be null) is the sympathetic input per base sample. runHammer
@@ -263,8 +279,15 @@ void stepHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, 
 void flushHammer(HammerState& h, const HammerKeyModes& m) noexcept;
 
 // True once the hammer has been off the strings for longer than the key's
-// release time (or reached its lifetime limit): the bank may take the modes
-// back.
+// release time, or (sample path) as soon as it has left and provably cannot
+// reach them again, or it reached its lifetime limit: the bank may take the
+// modes back. The proof: with no force acting, the hammer moving away
+// (v <= 0) only recedes, and each string's strike-point displacement is
+// bounded by sum |proj_sj| |w_j| (|.| as |Re| + |Im|), which free decay and
+// the damper never increase; the bound is doubled and 1 um added as a margin
+// for the sympathetic input of the next few samples (orders of magnitude
+// smaller). Checked at most every 16 base samples while the hammer is off the
+// strings and moving away; it costs one pass over the key's modes.
 bool hammerFinished(const HammerState& h, const HammerKeyModes& m) noexcept;
 
 // Potential energy stored in one felt contact at total compression
