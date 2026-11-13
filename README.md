@@ -526,7 +526,7 @@ bloom per third octave, monotonic in the sympathetic gain),
 `test_half_pedal` (graded T60 against pedal position, no click on pedal
 moves, re-pedalling keeps energy; 30 notes under a pedal swept
 continuously for 4 s: bounded, within -80 dB of exact responses (measured
--112), at most the budget of exact responses per tick, every response and
+-107), at most the budget of exact responses per tick, every response and
 the zone kernel exact once the pedal rests, buffer-size invariant, decays
 with the pedal up, silenced by a panic mid-stroke; with the dampers at rest
 the output is bit-identical to exact responses) and `test_idle` (also: the

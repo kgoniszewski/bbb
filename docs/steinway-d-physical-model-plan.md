@@ -687,6 +687,30 @@ At ×1, 98 % of the buffers ran on CPU 4 and 100 % on performance cores, with no
 
 Conclusion: on the target device at 64 frames the I/O thread stays on a performance core, and the worst case meets both limits on the real audio thread: mean 19.6 % ≤ 50 % and worst buffer 48.8 % ≤ 70 %, with no overruns. Headroom: about 2× before the heaviest single buffer overruns (×2 max 86.7 %, ×3 the first overruns) and about 6× on the mean (×6 mean 1275 µs of 1333). This differs from the iPad app on a Mac at 512 frames (callbacks start on an efficiency core, ×1 mean 3.6× full speed, max 68.4 %, first overrun at ×2), which is why Mac numbers do not stand in for the device. Still open on the device: the CTest suites have not run on Apple silicon (only the engine itself has run there); no listening or crackle report from played input yet; the M32 capture session and the key-to-sound latency measurement are not done; only one 3 s run per scene on one device in nominal thermal state (no sustained or thermal test); the Balanced and Eco tiers and 128- and 256-frame buffers are not measured.
 
+*Measured on the target device, live playing (2026-11-13, API 0.12.0, tier Full, 48 kHz / 64 frames = 1333 µs):* 54011 buffers of played input on the real audio thread: mean 7.2 %, p99 22.2 %, none over 70 %, no audible crackles. The single worst buffer, 783 µs = 58.7 %, was above the benchmark's worst on the audio thread (48.8 %): 9252 modes awake, no note event, one hammer active (57 contact samples, 114 Newton evaluations), 65 damper updates, 512 coupled-group impulse responses recomputed, 2 full zone-kernel rebuilds, 2 sub-blocks, loop 87 members / 88 listeners: a sustain-pedal lift over sounding strings. Every damper amount that changed forced an exact recompute of the key's awake coupled groups' 32-tap responses inside the sub-blocks where the pedal moved (benchmark: up to about 590 per 64-frame buffer, 1900–2600 per 512-frame buffer), and a hammer launched or released in the same buffer changed the loop's member set, which rebuilt the whole zone kernel.
+
+*Fix (API 0.13, §1.6 note (4)):* exact responses are cached per damper amount and limited to 32 per control tick; beyond that, during a stroke, a precomputed second-order expansion in the damper amount stands in (error at most −99 dB re peak against exact responses, RMS −115 to −130 dB), the zone kernel takes the change of the expanded response, the exact responses return within the same budget once the damper is still (at rest everything is exact again, and below the budget the output is bit-identical to exact responses), and member-set changes update the zone kernel in place when the packed entries stay the same (full rebuilds in the pedal scenes at 64 frames: 201 → 2). Where the time went in the benchmark's version of the device buffer (pedal lift scene, 64 frames, NEON build, instructions per buffer under qemu-aarch64): of 6.00 M (still pedal: 5.67 M), response recompute 0.96 M (kernel 0.76 M plus re-sums), zone-kernel column re-sums 0.24 M, coefficient update of the awake modes 0.17 M, sub-block wake-ups of groups whose input bound the moving pedal crossed 0.37 M, plus the full rebuilds (0.15 M each) in the hammer buffers. Per-buffer instructions (M), worst buffer and mean of the top 1 % (in parentheses: the same scene with the pedal held down throughout):
+
+| Scene, 64 frames @ 48 kHz | Max before | Max after | Top 1 % before | Top 1 % after |
+|---|---|---|---|---|
+| Pedal lift | 6.00 (5.67) | 5.55 (5.58) | 5.67 (5.27) | 5.11 (5.17) |
+| Pedalling | 6.64 (6.06) | 6.23 (6.06) | 5.89 (5.38) | 5.47 (5.31) |
+| Pedalled chords | 6.88 (5.90) | 6.39 (5.91) | 5.95 (5.38) | 5.53 (5.31) |
+| Fresh-key burst | 7.28 (6.15) | 6.38 (6.00) | 5.63 (5.43) | 5.41 (5.33) |
+| Same-key burst | 7.36 (6.17) | 6.44 (6.05) | 5.45 (5.19) | 5.19 (5.11) |
+| Bloom | 5.75 | 5.66 | 5.23 | 5.17 |
+
+| Scene, 512 frames @ 44.1 kHz | Max before | Max after | Top 1 % before | Top 1 % after |
+|---|---|---|---|---|
+| Pedal lift | 45.95 (48.06) | 45.21 (46.93) | 44.74 (45.84) | 43.63 (44.93) |
+| Pedalling | 46.07 (42.04) | 42.53 (41.45) | 44.09 (40.64) | 41.56 (40.20) |
+| Pedalled chords | 45.82 (42.31) | 43.59 (41.74) | 44.82 (41.10) | 42.02 (40.58) |
+| Fresh-key burst | 45.95 (43.45) | 42.83 (42.83) | 43.11 (41.54) | 41.51 (40.99) |
+| Same-key burst | 44.63 (40.26) | 40.71 (39.58) | 40.95 (39.59) | 39.54 (38.99) |
+| Bloom | 40.65 | 40.19 | 40.18 | 39.68 |
+
+Means are unchanged (±0.5 %). Every scene's worst buffer fell; at 64 frames the pedal-motion worst buffer is now within 0.5–8 % of the still-pedal worst (it was 6–19 % above); what remains in the scenes where it is above (a pedal-down 80 ms after a five-note chord, so five hammers active in the same buffer) is the coefficient update of the awake modes (≈0.1 M), the expanded responses' changes added to the zone kernel (≈0.15 M), the budgeted exact responses for keys at rest (≈0.08 M) and more cull-pass work (≈0.05 M). By the instruction ratio the device's 58.7 % buffer would come to about 54 %; not yet measured on the device. Wall-clock numbers of the x86 container are too noisy for single buffers (preemption) and are not used here.
+
 Quality tiers (automatic, also selectable): **Full** (all of the above) → **Balanced** (2–3 normal modes per partial, partial cap 80, 8 bridge zones) → **Eco** (single polarization above partial 10, 32 kHz internal rate for the modal bank, FDN room only).
 
 *Implemented so far (M4):* the tiers set the band of partials fed back by the string–board loop: Full 5 kHz (the board's modal range), Balanced 2 kHz, Eco 1 kHz; partials above the band bake the full driving-point admittance and only drive the board. Balanced halves the fed-back modes (4,343 of 8,952) and changes the pedal bloom by at most 0.7 dB per third octave; Eco (2,235) by up to 1.3 dB (2.8 dB one second later, at 1.6 kHz); the resonance of a silently held key changes by less than 0.2 dB.

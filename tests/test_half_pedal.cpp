@@ -241,7 +241,7 @@ TEST(pedal_sweep_bounded_and_exact_at_rest) {
     CHECK(bud.approx > 10000);  // the sweep runs far over the budget
     CHECK(bud.maxRecomputesPerTick <= pm::Engine::kResponseBudget);
     CHECK(peakBud <= peak * 1.01);
-    CHECK_LE(maxDb, -80.0);  // measured about -105 dB
+    CHECK_LE(maxDb, -80.0);  // measured -107 dB
     CHECK(bud.approxAtRest == 0 && bud.kernelAtRest);
     CHECK(ex.approxAtRest == 0 && ex.kernelAtRest);
     CHECK(tail < sweep - 40.0);  // pedal up: the strings are damped
