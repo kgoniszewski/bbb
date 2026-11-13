@@ -148,6 +148,13 @@ inline void zonesToKeys(const KeyZone* kz, const float* zoneDisp, int keys, floa
 // those of the per-sample loop (soundboard_model.h, test_passivity).
 // h_k changes with the key's damper amount and awake set; it is recomputed
 // (about one free pass of the key's coupled modes) only when it changes.
+// G is then updated only in the columns (zone pairs, taps) of the keys whose
+// h_k changed, each column re-summed from zero over its member keys in the
+// same order as a full rebuild, so the result is bit-identical to one; the
+// whole kernel is rebuilt only when the member set, the gain or a tap gain
+// changes. (Wake-ups and cull decisions change awake sets, hence h_k, on
+// most sub-blocks of a sustained chord; a full rebuild there cost about as
+// much as everything else in the event phase.)
 //
 // Keys owned by a hammer solver (io[k].skip) are not part of G: the caller
 // steps them per sample with keyInput() and adds their force itself.
@@ -221,10 +228,23 @@ public:
 
     // Inspection: keys in the loop (awake coupled groups) during the last sub-block.
     int memberCount() const noexcept { return nMembers_; }
+    // Keys taking loop input during the last sub-block, and zone-kernel
+    // entries carried by the members.
+    int listenerCount() const noexcept { return nListen_; }
+    int activeEntryCount() const noexcept { return nAct_; }
     int entryCount() const noexcept { return nEnt_; }
+    // Full zone-kernel rebuilds so far (member set or gains changed).
+    std::uint64_t kernelRebuilds() const noexcept { return rebuilds_; }
+    // Keys whose kernel columns were updated in place so far (h_k changed).
+    std::uint64_t kernelKeyUpdates() const noexcept { return keyUpdates_; }
+    // Tests: rebuild the whole kernel on every change (the reference for the
+    // in-place update, which must match it bit for bit).
+    void setAlwaysRebuild(bool on) noexcept { alwaysRebuild_ = on; }
 
 private:
     void rebuildKernel() noexcept;
+    void updateColumns() noexcept;
+    float entryWeight(int k, int code) const noexcept;
 
     int keys_ = 0, zones_ = 0, taps_ = 0, nEnt_ = 0, entPad_ = 0;
     float tapGain_[kMaxTaps][kMaxKeys]{};
@@ -246,6 +266,20 @@ private:
     bool hasH_[kMaxKeys]{}, member_[kMaxKeys]{}, listen_[kMaxKeys]{}, newListener_[kMaxKeys]{};
     int members_[kMaxKeys]{}, listenList_[kMaxKeys]{};
     int nMembers_ = 0, nListen_ = 0;
+    std::uint64_t rebuilds_ = 0, keyUpdates_ = 0;
+    bool alwaysRebuild_ = false;
+    // In-place updates: keys whose h changed since the last kernel build,
+    // the packed column of every entry (-1: not used by the members), and
+    // per entry the keys that can contribute to it, ascending, with a code
+    // for the weight (0..3: zone pair q of the key; 4 + 2 t + a: tap t from
+    // the key's zone z0 + a).
+    int changed_[kMaxKeys]{};
+    int nChanged_ = 0;
+    int packed_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{};
+    bool colDirty_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{};
+    int entFirst_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones + 1]{};
+    int entKey_[kMaxKeys * (4 + 2 * kMaxTaps)]{};
+    std::uint8_t entCode_[kMaxKeys * (4 + 2 * kMaxTaps)]{};
     AlignedArray<float> G_;           // kMaxBlock x entPad
     AlignedArray<float> dE_;          // kMaxBlock x entPad: source displacement per entry
     AlignedArray<float> acc_;         // entPad

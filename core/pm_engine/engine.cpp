@@ -3,27 +3,27 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdint>
+#include <cstdio>
 #include <numbers>
 #include <vector>
 
 #include "pm_base/denormals.h"
 #include "pm_voicing/key_loader.h"
 
-// Per-phase timers (EngineProfile, engine.h): only in the profiling build
-// pm_engine_profile; in the real-time library these expand to nothing.
-#if defined(PM_PROFILE)
-#include <chrono>
-#define PM_PROF_START(t) auto t = std::chrono::steady_clock::now()
-#define PM_PROF_LAP(phase, t)                                                                       \
-    do {                                                                                          \
-        const auto pmNow = std::chrono::steady_clock::now();                                      \
-        prof_.us[EngineProfile::phase] += std::chrono::duration<double, std::micro>(pmNow - t).count(); \
-        t = pmNow;                                                                                \
+// Per-phase timers (EngineProfile, engine.h), active while phase timing is
+// on (setPhaseTiming). A
+// lap reads the clock and charges the time since the previous lap to a
+// phase; a mark restarts the interval without charging it (that time is
+// "other"). Off, each costs one predictable branch.
+#define PM_PROF_LAP(phase)                                \
+    do {                                                  \
+        if (profiling_) profLap(EngineProfile::phase);    \
     } while (0)
-#else
-#define PM_PROF_START(t) ((void)0)
-#define PM_PROF_LAP(phase, t) ((void)0)
-#endif
+#define PM_PROF_MARK()                                    \
+    do {                                                  \
+        if (profiling_) profT_ = ProfClock::now();        \
+    } while (0)
 
 namespace pm {
 
@@ -267,6 +267,7 @@ void Engine::resetState() noexcept {
     deferred_ = late_ = limited_ = nonFinite_ = 0;
     peakPre_ = 0.0f;
     peakHammers_ = 0;
+    quietRun_ = stableTicks_ = 0;
 }
 
 void Engine::setVelocityFunction(VelocityFn fn, const void* user) noexcept {
@@ -336,11 +337,7 @@ void Engine::drainQueue(const ClockMapping* clock) noexcept {
         if (e.timeBase == TimeBase::SampleTime) {
             when = static_cast<std::int64_t>(e.time);
         } else if (clock && clock->hostTicksPerSample > 0.0) {
-            // Signed difference: correct across counter wrap and for past events.
-            const auto dt = static_cast<std::int64_t>(e.time - clock->hostTimeAtBufferStart);
-            when = now + static_cast<std::int64_t>(
-                             std::floor(static_cast<double>(dt) / clock->hostTicksPerSample)) +
-                   latency;
+            when = now + hostTimeToFrameDelta(e.time, *clock) + latency;
         }
         if (when < now) {
             if (constant && e.timeBase == TimeBase::HostTime) ++late_;
@@ -351,6 +348,16 @@ void Engine::drainQueue(const ClockMapping* clock) noexcept {
 }
 
 void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
+    ++info_.events;
+    stableTicks_ = 0;
+    switch (e.type) {
+        case EventType::NoteOn: ++(e.value ? info_.noteOns : info_.noteOffs); break;
+        case EventType::NoteOff: ++info_.noteOffs; break;
+        case EventType::Sustain:
+        case EventType::Sostenuto:
+        case EventType::UnaCorda: ++info_.pedalEvents; break;
+        default: break;
+    }
     const int k = static_cast<int>(e.note) - kFirstMidiNote;
     const bool validKey = k >= 0 && k < kNumKeys;
     switch (static_cast<std::uint8_t>(e.type)) {
@@ -378,6 +385,12 @@ void Engine::applyEvent(const Event& e, std::int64_t now) noexcept {
         case static_cast<std::uint8_t>(EventType::Sustain): {
             // Continuous: the smoothed position restarts from its value at the
             // event's exact time (sampled on the control grid by controlTick).
+            // Every key joins the loop at the exact time of a pedal press,
+            // a time fixed relative to the music (waiting for the tick at
+            // which its damper lifts would tie the wake-ups to the control
+            // grid; keys whose dampers stay seated leave again at the next
+            // tick). Joining is cheap when nothing sounds: a key with no
+            // input to follow is not woken (CouplingLoop::begin).
             pedalFrom_ = pedalAt(now);
             pedalStart_ = now;
             const float next = e.value / 65535.0f;
@@ -446,6 +459,7 @@ void Engine::noteOn(int k, std::uint16_t vel, std::int64_t now) noexcept {
     // click-free since only the decay rate changes.
     if (now >= panicUntil_) {
         damp_[k] = Damper{0.0f, 0.0f, 0.0f, now, 0, false, false};
+        if (applied_[k] != 0.0f) ++damperUpdates_;
         applied_[k] = 0.0f;
         bank_.setSegmentDamper(k, 0.0f);
         joinLoop(k);
@@ -494,18 +508,38 @@ bool Engine::strike(int k, double velocity, std::int64_t now) noexcept {
             h.params.offset[unaString_[k]] += u * u * unaMiss_[k];
         h.params.K *= 1.0 - u * unaSoften_[k];
     }
-    const HammerKeyModes m = contact_.view(bank_, k);
-    launchHammer(h.state, h.params, m, velocity);
+    // Awake first: a sleeping group's coefficients are brought up to date
+    // with the damper when it wakes (mode_bank.h), and the solver reads them.
     bank_.wakeSegment(k);
+    const HammerKeyModes m = contact_.view(bank_, k);
+    harvestHammer(h);  // a re-strike: what the last strike did in this buffer
+    launchHammer(h.state, h.params, m, velocity);
+    h.contactMark = h.evalMark = 0;
+    h.fallbackMark = 0;
     const float knock = knockLevel_.load(std::memory_order_relaxed);
     if (boardOn_ && knock > 0.0f && nKnocks_ < kMaxKnocks)
         knocks_[nKnocks_++] = Knock{k, knock * static_cast<float>(velocity), 0};
     return true;
 }
 
+// Adds what hammer h did since it was last counted to this render's info.
+void Engine::harvestHammer(Hammer& h) noexcept {
+    const std::int64_t dc = h.state.contactSubsteps - h.contactMark;
+    if (dc > 0) {
+        ++info_.hammersInContact;
+        contactSamples_ += static_cast<double>(dc) / std::max(1, contact_.view(bank_, h.key).oversampling);
+    }
+    info_.newtonEvals += static_cast<int>(h.state.newtonEvals - h.evalMark);
+    info_.fallbackSolves += h.state.fallbackSolves - h.fallbackMark;
+    h.contactMark = h.state.contactSubsteps;
+    h.evalMark = h.state.newtonEvals;
+    h.fallbackMark = h.state.fallbackSolves;
+}
+
 void Engine::releaseHammer(int a, bool report) noexcept {
     const int slot = active_[a];
     Hammer& h = hammers_[slot];
+    harvestHammer(h);
     if (report) {
         const HammerKeyModes m = contact_.view(bank_, h.key);
         StrikeInfo info;
@@ -565,11 +599,19 @@ float Engine::keyAmplitude(int k) const noexcept {
     const float* zi = bank_.stateImData() + m0;
     const float* ds = dampShape_.data() + m0;
     // Squares only (no hypot): this runs for every key on every control tick
-    // while the pedal holds the dampers off.
-    // (n is a whole number of groups.)
+    // while the pedal holds the dampers off. (n is a whole number of groups.)
+    // Only awake groups: a culled group's state is exactly zero, so skipping
+    // it adds exactly what it would have added (+0) and the sum is
+    // bit-identical, at the cost of the awake modes only.
+    constexpr int G = ModeBank::kGroupSize;
+    static_assert(G % 4 == 0, "lanes of the partial sums must not depend on the group");
+    const int g0 = m0 / G;
     float s[4] = {};
-    for (int i = 0; i < n; i += 4)
-        for (int j = 0; j < 4; ++j) s[j] += (zr[i + j] * zr[i + j] + zi[i + j] * zi[i + j]) * (ds[i + j] * ds[i + j]);
+    for (int base = 0; base < n; base += G) {
+        if (!bank_.groupActive(g0 + base / G)) continue;
+        for (int i = base; i < base + G; i += 4)
+            for (int j = 0; j < 4; ++j) s[j] += (zr[i + j] * zr[i + j] + zi[i + j] * zi[i + j]) * (ds[i + j] * ds[i + j]);
+    }
     return std::sqrt(2.0f * ((s[0] + s[1]) + (s[2] + s[3])));
 }
 
@@ -595,6 +637,7 @@ float Engine::pedalFactor(int k) noexcept {
     }
     if (e <= 0.0f) return std::min(1.0f, kLightContact + (1.0f - kLightContact) * (-e / kFeltPress));
     if (damp_[k].cur <= 0.0f) return 0.0f;  // the key holds its damper up anyway
+    if (!bank_.segmentAwake(k)) return 0.0f;  // silent strings: amplitude 0
     const float a = keyAmplitude(k);
     if (a <= e) return 0.0f;
     return kLightContact * (2.0f / static_cast<float>(kPi)) * std::acos(e / a);
@@ -610,13 +653,21 @@ void Engine::joinLoop(int k) noexcept {
 
 float Engine::pedalAt(std::int64_t t) const noexcept {
     const double x = double(t - pedalStart_) / pedalTau_;
-    if (x > 40.0) return sustain_;
+    // Settled (within 2e-9 of the target) after 20 time constants: from
+    // then on the damper amounts stop changing and nothing is recomputed.
+    if (x > 20.0) return sustain_;
     return static_cast<float>(sustain_ + (pedalFrom_ - sustain_) * std::exp(-x));
 }
 
 // Runs on the absolute kSubBlock grid. Landing follows a raised-cosine felt
 // contact curve; lifting is linear.
 void Engine::controlTick(std::int64_t now) noexcept {
+    // Whether this tick changed (or could change) anything; see tickIsNoOp().
+    bool changed = panicUntil_ >= 0 || activeCount_ > 0 || bank_.activeGroups() > 0;
+    tickP0T_ = hpP0T_.load(std::memory_order_relaxed);
+    tickP0B_ = hpP0B_.load(std::memory_order_relaxed);
+    tickW_ = hpW_.load(std::memory_order_relaxed);
+    tickDampedCull_ = dampedCullDb_.load(std::memory_order_relaxed);
     if (panicUntil_ >= 0 && now >= panicUntil_) {
         panicUntil_ = -1;
         for (int k = 0; k < kNumKeys; ++k) retargetDamper(k, now, 1.0f);
@@ -625,13 +676,27 @@ void Engine::controlTick(std::int64_t now) noexcept {
     if (now < panicUntil_ && boardOn_)
         board_.scaleState(static_cast<float>(std::exp(-kPanicSigma * kSubBlock / fs_)));
     pedal_ = pedalAt(now);
+    changed = changed || pedal_ != sustain_ || pedal_ != pedalPrev_;
     const float speed = std::fabs(pedal_ - pedalPrev_) * static_cast<float>(fs_ / kSubBlock);
     pedalPrev_ = pedal_;
     int moved = 0, withDamper = 0;
     const float dampedCull = dampedCullDb_.load(std::memory_order_relaxed);
+    // A moving damper changes its key's coefficients and the impulse
+    // response the soundboard loop caches for it (about one free pass of
+    // the key's coupled modes over kSubBlock samples). A key's own damper
+    // motion (lift, landing after its note-off) applies on every tick, as
+    // does panic. What the sustain pedal moves (it moves every damper at
+    // once) applies on every second tick, for half of the keys on even
+    // ticks and the other half on odd ones (an absolute grid, so buffering
+    // does not matter): a pedal stroke recomputes at most half of the keys
+    // per tick, each sampled every 2 kSubBlock samples against a felt
+    // travel of 10-20 ms.
+    const std::int64_t tick = now / kSubBlock;
     for (int k = 0; k < kNumKeys; ++k) {
         Damper& d = damp_[k];
+        const bool ownMotion = d.ramping;  // including the tick on which the ramp ends
         if (d.ramping) {
+            changed = true;
             const double t = std::clamp(double(now - d.start) / d.len, 0.0, 1.0);
             const double s = d.landing ? 0.5 - 0.5 * std::cos(kPi * t) : t;
             d.cur = static_cast<float>(d.from + (d.to - d.from) * s);
@@ -640,23 +705,30 @@ void Engine::controlTick(std::int64_t now) noexcept {
                 d.ramping = false;
             }
         }
-        float a;
-        if (now < panicUntil_) a = d.cur;
-        else if (!hasDamper_[k] || d.cur <= 0.0f) a = 0.0f;
-        else a = d.cur * pedalFactor(k);
         if (hasDamper_[k]) {
             ++withDamper;
             moved += d.cur > 0.0f ? 1 : 0;
         }
-        if (a != applied_[k]) {
-            applied_[k] = a;
-            bank_.setSegmentDamper(k, a);
+        const bool due = ownMotion || now < panicUntil_ || ((tick + k) & 1) == 0;
+        if (due) {
+            float a;
+            if (now < panicUntil_) a = d.cur;
+            else if (!hasDamper_[k] || d.cur <= 0.0f) a = 0.0f;
+            else a = d.cur * pedalFactor(k);
+            if (a != applied_[k]) {
+                changed = true;
+                ++damperUpdates_;
+                applied_[k] = a;
+                bank_.setSegmentDamper(k, a);
+            }
         }
+        const float a = applied_[k];
         // Out of the loop only once the damper is fully seated and still (a
         // string just being damped keeps listening while it rings down);
         // back in at the exact time of the event that lifts it.
         const float off = boardOn_ && a >= 1.0f && !d.ramping ? dampedCull : 0.0f;
         if (off != cullOffsetApplied_[k]) {
+            changed = true;
             cullOffsetApplied_[k] = off;
             bank_.setSegmentCullOffset(k, 0.0f, off);
         }
@@ -665,11 +737,25 @@ void Engine::controlTick(std::int64_t now) noexcept {
     // dampers the pedal moves (those not already held up by their keys).
     const float level = liftNoiseLevel_.load(std::memory_order_relaxed);
     noiseAmp_ = boardOn_ && level > 0.0f && withDamper > 0 ? level * speed * float(moved) / float(withDamper) : 0.0f;
+    changed = changed || noiseAmp_ != 0.0f;
+    stableTicks_ = changed ? 0 : std::min(stableTicks_ + 1, 2);
+}
+
+// True when controlTick(now) would leave every piece of state as it is: the
+// last two ticks (one of each damper parity) changed nothing, no event has
+// been applied since, nothing sounds (so no key amplitude can change a
+// pedal factor) and the pedal-curve parameters are the ones those ticks used.
+bool Engine::tickIsNoOp() const noexcept {
+    return idleSleep_ && stableTicks_ >= 2 && activeCount_ == 0 && bank_.activeGroups() == 0 &&
+           tickP0T_ == hpP0T_.load(std::memory_order_relaxed) && tickP0B_ == hpP0B_.load(std::memory_order_relaxed) &&
+           tickW_ == hpW_.load(std::memory_order_relaxed) &&
+           tickDampedCull_ == dampedCullDb_.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------- render
 
 void Engine::readParams() noexcept {
+    idleSleep_ = idleOn_.load(std::memory_order_relaxed);
     const float w = std::clamp(width_.load(std::memory_order_relaxed), 0.0f, 1.0f);
     if (w != appliedWidth_) {
         appliedWidth_ = w;
@@ -703,7 +789,6 @@ void Engine::readParams() noexcept {
 // to the strings' state (CouplingLoop, pm_board/soundboard.h). Output into
 // mixL_/mixR_ (board) and hfL_/hfR_ (direct).
 void Engine::processBoard(int n) noexcept {
-    PM_PROF_START(tp);
     for (int a = 0; a < activeCount_; ++a) {
         const int k = hammers_[active_[a]].key;
         hView_[a] = contact_.view(bank_, k);
@@ -713,26 +798,36 @@ void Engine::processBoard(int n) noexcept {
     for (int a = 0; a < activeCount_; ++a) {
         const int k = hammers_[active_[a]].key;
         uPrev_[k] = bank_.coupledInputHistory(k);
+        info_.hammerSamples += n;
+        if (hView_[a].damped) info_.hammerDampedSamples += n;
     }
-    PM_PROF_LAP(Events, tp);
+    info_.loopMembers = std::max(info_.loopMembers, loop_.memberCount());
+    info_.loopListeners = std::max(info_.loopListeners, loop_.listenerCount());
+    info_.loopEntries = std::max(info_.loopEntries, loop_.activeEntryCount());
+    PM_PROF_LAP(Events);  // since the last lap: events, control tick, loop begin
     bank_.processSegmentsFree(io_.data(), n);
-    PM_PROF_LAP(FreePass, tp);
+    PM_PROF_LAP(FreePass);
     loop_.collect(bank_, io_.data(), n);
     const int* outZones = nullptr;
     const int nOut = loop_.outZones(outZones);
+    info_.outZones = std::max(info_.outZones, nOut);
 
     const int zones = board_.zoneCount();
     const float pi2 = 2.0f * static_cast<float>(kPi);
     for (int i = 0; i < n; ++i) {
         for (int z = 0; z < zones; ++z) zoneF_[z] = 0.0f;
         hfL_[i] = hfR_[i] = 0.0f;
-        PM_PROF_LAP(Board, tp);
+        // Per-sample laps only while hammers are active (two clock reads
+        // per sample); otherwise the whole loop is charged to the board.
+        if (activeCount_ > 0) PM_PROF_LAP(Board);
+        int touching = 0;
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
             const int k = h.key;
             const float u = loop_.keyInput(k, i);
             float f = 0.0f;
             stepHammer(h.state, h.params, hView_[a], &u, &f, 1);
+            touching += h.state.inContact ? 1 : 0;
             // A hammer owns all of its key's modes: the key's full taps apply.
             f -= statK0_[k] * u + statK1_[k] * uPrev_[k];
             uPrev_[k] = u;
@@ -744,7 +839,8 @@ void Engine::processBoard(int n) noexcept {
             zoneF_[kz.z0] += kz.w0 * fn;
             if (kz.w1 != 0.0f) zoneF_[kz.z0 + 1] += kz.w1 * fn;
         }
-        PM_PROF_LAP(Hammers, tp);
+        if (activeCount_ > 0) PM_PROF_LAP(Hammers);
+        if (touching > info_.maxHammersInContact) info_.maxHammersInContact = touching;
         float tap[2] = {0.0f, 0.0f};
         loop_.forces(i, zoneF_, tap);
         hfL_[i] += tap[0];
@@ -775,22 +871,50 @@ void Engine::processBoard(int n) noexcept {
         mixL_[i] = kBoardOutputGain * pick_[0];
         mixR_[i] = kBoardOutputGain * pick_[1];
     }
-    PM_PROF_LAP(Board, tp);
+    PM_PROF_LAP(Board);
     loop_.end(bank_, io_.data(), n);
-    PM_PROF_LAP(ForcedPass, tp);
+    PM_PROF_LAP(ForcedPass);
     bank_.endCoupled(io_.data(), n);
 }
 
 void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept {
+    ++info_.subBlocks;
     float* mL = mixL_.data();
     float* mR = mixR_.data();
+    bool idle = false;
     if (boardOn_) {
-        processBoard(n);
-        // Direct path, high-passed.
+        // Idle: no string mode awake, no hammer, the board asleep and
+        // nothing driving it. After two such sub-blocks every loop input
+        // and input history is exactly zero (the first may still carry the
+        // last displacement), so the bank, the loop and the board would
+        // compute zeros: skip them. Only the bank's cull grid advances. Any
+        // event or input ends it (a strike wakes a segment, a knock or
+        // damper noise drives the board), at the same sample whatever the
+        // buffering, since it is decided per sub-block.
+        const bool quiet = activeCount_ == 0 && bank_.activeGroups() == 0 && board_.asleep() && nKnocks_ == 0 &&
+                           noiseAmp_ == 0.0f;
+        idle = quiet && quietRun_ >= 2 && idleSleep_;
+        if (idle) {
+            ++info_.idleSubBlocks;
+            PM_PROF_LAP(Events);
+            bank_.endCoupled(io_.data(), n);
+            std::fill(mL, mL + n, 0.0f);
+            std::fill(mR, mR + n, 0.0f);
+            std::fill(hfL_.data(), hfL_.data() + n, 0.0f);
+            std::fill(hfR_.data(), hfR_.data() + n, 0.0f);
+        } else {
+            processBoard(n);
+        }
+        quietRun_ = quiet ? std::min(quietRun_ + 1, 2) : 0;
+        // Direct path, high-passed (skipped once its state has decayed to
+        // exactly zero on a zero input).
+        const bool hpIdle = idle && hpX_[0][0] == 0.0f && hpX_[0][1] == 0.0f && hpY_[0][0] == 0.0f &&
+                            hpY_[0][1] == 0.0f && hpX_[1][0] == 0.0f && hpX_[1][1] == 0.0f &&
+                            hpY_[1][0] == 0.0f && hpY_[1][1] == 0.0f;
         const float g = kBoardOutputGain * hfGain_;
         float* bus[2] = {hfL_.data(), hfR_.data()};
         float* mix[2] = {mL, mR};
-        for (int c = 0; c < 2; ++c)
+        for (int c = 0; c < 2 && !hpIdle; ++c)
             for (int i = 0; i < n; ++i) {
                 const float x = bus[c][i];
                 const float y = hpB_[0] * x + hpB_[1] * hpX_[c][0] + hpB_[2] * hpX_[c][1] - hpA_[0] * hpY_[c][0] -
@@ -809,16 +933,22 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
             mR[i] = mid - sd;
         }
     } else {
-        PM_PROF_START(tp);
+        PM_PROF_LAP(Events);
+        int touching = 0;
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
             const HammerKeyModes m = contact_.view(bank_, h.key);
+            info_.hammerSamples += n;
+            if (m.damped) info_.hammerDampedSamples += n;
+            const std::int64_t c0 = h.state.contactSubsteps;
             runHammer(h.state, h.params, m, io_[h.key].out, n);
             io_[h.key].skip = true;
+            touching += h.state.contactSubsteps > c0 ? 1 : 0;
         }
-        PM_PROF_LAP(Hammers, tp);
+        if (touching > info_.maxHammersInContact) info_.maxHammersInContact = touching;
+        PM_PROF_LAP(Hammers);
         bank_.processSegments(io_.data(), n);
-        PM_PROF_LAP(FreePass, tp);
+        PM_PROF_LAP(FreePass);
         std::fill(mL, mL + n, 0.0f);
         std::fill(mR, mR + n, 0.0f);
         for (int k = 0; k < kNumKeys; ++k) {
@@ -846,6 +976,14 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
     }
 
     const float gStep = 1.0f - std::exp(-1.0f / (0.01f * static_cast<float>(fs_)));
+    if (idle && dcX_[0] == 0.0f && dcX_[1] == 0.0f && dcY_[0] == 0.0f && dcY_[1] == 0.0f) {
+        // Silent input and settled filters: the output is exactly zero.
+        for (int i = 0; i < n; ++i) masterGain_ += (masterTarget_ - masterGain_) * gStep;
+        std::fill(left, left + n, 0.0f);
+        std::fill(right, right + n, 0.0f);
+        PM_PROF_MARK();
+        return;
+    }
     for (int i = 0; i < n; ++i) {
         masterGain_ += (masterTarget_ - masterGain_) * gStep;
         float ch[2] = {mL[i], mR[i]};
@@ -867,6 +1005,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
         left[i] = ch[0];
         right[i] = ch[1];
     }
+    PM_PROF_MARK();  // output stage, cull passes, hammer release: "other"
 }
 
 void Engine::render(float* left, float* right, int nFrames, const ClockMapping* clock) noexcept {
@@ -877,27 +1016,38 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
         return;
     }
     ScopedFlushDenormals ftz;
-#if defined(PM_PROFILE)
-    prof_ = EngineProfile{};
-    const auto tRender = std::chrono::steady_clock::now();
-#endif
-    PM_PROF_START(te);
+    info_.frames = nFrames;
+    info_.subBlocks = 0;
+    info_.idleSubBlocks = 0;
+    info_.events = info_.noteOns = info_.noteOffs = info_.pedalEvents = 0;
+    info_.hammersInContact = info_.maxHammersInContact = info_.hammerContactSamples = 0;
+    info_.newtonEvals = info_.fallbackSolves = 0;
+    info_.hammerSamples = info_.hammerDampedSamples = 0;
+    info_.loopMembers = info_.loopListeners = info_.loopEntries = info_.outZones = 0;
+    contactSamples_ = 0.0;
+    profiling_ = phaseTiming_.load(std::memory_order_relaxed);
+    ProfClock::time_point tRender{};
+    if (profiling_) {
+        prof_ = EngineProfile{};
+        tRender = profT_ = ProfClock::now();
+    }
+    const std::uint64_t damperUpdates0 = damperUpdates_;
+    const std::uint64_t responses0 = bank_.responseGroupsComputed(), rebuilds0 = loop_.kernelRebuilds(),
+                        keyUpdates0 = loop_.kernelKeyUpdates(), free0 = bank_.groupBlocksProcessed(),
+                        forced0 = bank_.forcedGroupBlocks();
     readParams();
     drainQueue(clock);
-    PM_PROF_LAP(Events, te);
 
     int pos = 0;
     while (pos < nFrames) {
         const std::int64_t now = static_cast<std::int64_t>(sampleTime_) + pos;
-        PM_PROF_START(tev);
         while (pendingCount_ > 0 && pending_[0].when <= now) {
             const Event e = pending_[0].e;
             --pendingCount_;
             for (int i = 0; i < pendingCount_; ++i) pending_[i] = pending_[i + 1];
             applyEvent(e, now);
         }
-        if (now % kSubBlock == 0) controlTick(now);
-        PM_PROF_LAP(Events, tev);
+        if (now % kSubBlock == 0 && !tickIsNoOp()) controlTick(now);
         std::int64_t len = std::min<std::int64_t>(nFrames - pos, kSubBlock - now % kSubBlock);
         if (pendingCount_ > 0) len = std::min<std::int64_t>(len, pending_[0].when - now);
         for (int a = 0; a < activeCount_; ++a) {
@@ -910,11 +1060,15 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     sampleTime_ += static_cast<std::uint64_t>(nFrames);
 
     int awakeGroups = 0, awakeModes = 0;
-    for (int g = 0; g < bank_.groupCount(); ++g)
+    for (int g = 0; g < bank_.groupCount() && bank_.activeGroups() > 0; ++g)
         if (bank_.groupActive(g)) {
             ++awakeGroups;
             awakeModes += groupModes_[g];
         }
+    for (int a = 0; a < activeCount_; ++a) harvestHammer(hammers_[active_[a]]);
+    info_.hammersActive = activeCount_;
+    info_.hammerContactSamples = static_cast<int>(contactSamples_ + 0.5);
+    info_.awakeModes = awakeModes;
     pub_.awakeGroups.store(awakeGroups, std::memory_order_relaxed);
     pub_.awakeModes.store(awakeModes, std::memory_order_relaxed);
     pub_.activeHammers.store(activeCount_, std::memory_order_relaxed);
@@ -924,9 +1078,78 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     pub_.limited.store(limited_, std::memory_order_relaxed);
     pub_.nonFinite.store(nonFinite_, std::memory_order_relaxed);
     pub_.peakPre.store(peakPre_, std::memory_order_relaxed);
-#if defined(PM_PROFILE)
-    prof_.totalUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - tRender).count();
-#endif
+    info_.damperUpdates = static_cast<int>(damperUpdates_ - damperUpdates0);
+    info_.responseGroups = static_cast<int>(bank_.responseGroupsComputed() - responses0);
+    info_.kernelRebuilds = static_cast<int>(loop_.kernelRebuilds() - rebuilds0);
+    info_.kernelKeyUpdates = static_cast<int>(loop_.kernelKeyUpdates() - keyUpdates0);
+    info_.freeGroupBlocks = static_cast<int>(bank_.groupBlocksProcessed() - free0);
+    info_.forcedGroupBlocks = static_cast<int>(bank_.forcedGroupBlocks() - forced0);
+    if (profiling_) {
+        // Time before the first sub-block (parameters, queue) and between
+        // sub-blocks without a lap is "other" (totalUs minus the phases).
+        prof_.totalUs = std::chrono::duration<double, std::micro>(ProfClock::now() - tRender).count();
+    }
+}
+
+int Engine::describe(char* buf, int size) const noexcept {
+    if (!buf || size <= 0) return 0;
+    int len = 0;
+    auto put = [&](const char* fmt, auto... args) {
+        if (len >= size - 1) return;
+        const int w = std::snprintf(buf + len, static_cast<std::size_t>(size - len), fmt, args...);
+        if (w > 0) len = std::min(size - 1, len + w);
+    };
+    // Where an array starts modulo 16 KiB (Apple silicon's L1 way size): two
+    // instances whose hot arrays fall differently can differ in L1 conflicts.
+    auto mod16k = [](const void* p) { return static_cast<int>(reinterpret_cast<std::uintptr_t>(p) % 16384u); };
+    static const char* const kTier[3] = {"full", "balanced", "eco"};
+    const int tier = static_cast<int>(boardCfg_.tier);
+    put("prepared %d\n", prepared_ ? 1 : 0);
+    put("sample_rate %.1f\n", fs_);
+    put("max_frames %d\n", maxFrames_);
+    put("sub_block %d\n", kSubBlock);
+    put("simd %s\n", simdKernelName());
+    put("board %d\n", boardOn_ ? 1 : 0);
+    put("tier %s\n", tier >= 0 && tier < 3 ? kTier[tier] : "?");
+    put("loop_cutoff_hz %.1f\n", boardOn_ ? loopCutoffForTier(boardCfg_.tier, boardCfg_.plate) : 0.0);
+    put("loop_cutoff_override_hz %.1f\n", boardCfg_.loopCutoffHz);
+    put("sympathetic_gain %.4f\n", static_cast<double>(symGain_));
+    put("board_modes %d\n", board_.modeCount());
+    put("board_zones %d\n", board_.zoneCount());
+    put("total_modes %d\n", totalModes_);
+    put("bank_groups %d\n", bank_.groupCount());
+    int coupled = 0;
+    for (int k = 0; k < kNumKeys; ++k) coupled += keyCoupled_[k];
+    put("coupled_modes %d\n", coupled);
+    put("culling %d\n", cullOn_.load(std::memory_order_relaxed) ? 1 : 0);
+    put("cull_threshold_db %.2f\n", static_cast<double>(cullDb_.load(std::memory_order_relaxed)));
+    put("cull_offset_db %.2f\n", static_cast<double>(cullOffsetDb_));
+    put("damped_cull_offset_db %.2f\n", static_cast<double>(dampedCullDb_.load(std::memory_order_relaxed)));
+    put("idle_sleep %d\n", idleOn_.load(std::memory_order_relaxed) ? 1 : 0);
+    put("knock_level %.4f\n", static_cast<double>(knockLevel_.load(std::memory_order_relaxed)));
+    put("damper_noise_level %.4f\n", static_cast<double>(liftNoiseLevel_.load(std::memory_order_relaxed)));
+    put("half_pedal %.3f %.3f %.3f\n", static_cast<double>(hpP0T_.load(std::memory_order_relaxed)),
+        static_cast<double>(hpP0B_.load(std::memory_order_relaxed)), static_cast<double>(hpW_.load(std::memory_order_relaxed)));
+    put("stereo_width %.3f\n", static_cast<double>(width_.load(std::memory_order_relaxed)));
+    put("master_gain_db %.2f\n", static_cast<double>(masterGainDb_.load(std::memory_order_relaxed)));
+    put("scheduling %d latency %d\n", schedMode_.load(std::memory_order_relaxed), latency_.load(std::memory_order_relaxed));
+    put("phase_timing %d\n", phaseTiming() ? 1 : 0);
+    put("velocity_m_per_s at 0.25/0.5/1.0: %.3f %.3f %.3f\n", hammerVelocityFor(0.25), hammerVelocityFor(0.5),
+        hammerVelocityFor(1.0));
+    put("key 40 modes %d coupled %d strings %d R %d\n", keyModes_[39], keyCoupled_[39], table_.keys[39].strings,
+        table_.keys[39].contactOversampling);
+    put("key49_f0_hz %.3f\n", table_.keys[48].f0);
+    put("layout mod 16 KiB: zr %d zi %d wOut %d wIn %d dampAm1 %d keyBuf %d\n", mod16k(bank_.stateReData()),
+        mod16k(bank_.stateImData()), mod16k(bank_.weightOutData()), mod16k(bank_.weightInReData()),
+        mod16k(bank_.damperFactorMinusOneData()), mod16k(keyBuf_.data()));
+    put("engine object %p (mod 16 KiB %d)\n", static_cast<const void*>(this), mod16k(this));
+    return len;
+}
+
+void Engine::profLap(int phase) noexcept {
+    const ProfClock::time_point t = ProfClock::now();
+    prof_.us[phase] += std::chrono::duration<double, std::micro>(t - profT_).count();
+    profT_ = t;
 }
 
 }  // namespace pm

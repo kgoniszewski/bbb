@@ -2,6 +2,7 @@
 
 #include <new>
 
+#include "pm_api/pm_api_internal.h"
 #include "pm_engine/engine.h"
 
 struct pm_engine {
@@ -10,6 +11,8 @@ struct pm_engine {
     pm::TableOptions voicing;
     pm::SoundboardConfig board;
 };
+
+pm::Engine* pmEngineOf(pm_engine* engine) noexcept { return engine ? &engine->engine : nullptr; }
 
 namespace {
 static_assert(sizeof(pm_event) == sizeof(pm::Event), "pm_event must mirror pm::Event");
@@ -22,7 +25,7 @@ uint32_t pm_api_version(void) {
     return (PM_API_VERSION_MAJOR << 16) | (PM_API_VERSION_MINOR << 8) | PM_API_VERSION_PATCH;
 }
 
-const char* pm_version_string(void) { return "0.5.0 (M4)"; }
+const char* pm_version_string(void) { return "0.10.0 (M4, app host, diagnostics, phase timing, speed probe, benchmark, pacing, audio-thread scenes)"; }
 
 pm_engine* pm_engine_create(void) {
     pm_engine* e = new (std::nothrow) pm_engine();
@@ -156,6 +159,13 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_DAMPED_CULL_OFFSET_DB: *value = e.dampedCullOffsetDb(); return 1;
         default: return 0;
     }
+}
+
+int32_t pm_engine_describe(const pm_engine* engine, char* buffer, int32_t size) {
+    if (!buffer || size <= 0) return 0;
+    buffer[0] = 0;
+    if (!engine) return 0;
+    return engine->engine.describe(buffer, size);
 }
 
 void pm_engine_get_stats(const pm_engine* engine, pm_stats* stats) {

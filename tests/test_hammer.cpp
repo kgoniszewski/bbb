@@ -302,3 +302,99 @@ TEST(fast_pow_accuracy) {
     std::printf("  fastPow: worst relative error %.2e over x in [1e-13, 7], p in [2, 3.6]\n", worst);
     CHECK_LE(worst, 1e-13);
 }
+
+// The sample path (one pass over the modes per base sample, table
+// oversampling R = 1, 2, 4) against the substep path (one pass per substep,
+// the original evaluation) on the same tables: the same scheme, so the key
+// output and the hammer agree to float rounding, with sympathetic input on
+// every sample and the damper landing during the contact.
+TEST(sample_path_matches_substep_path) {
+    for (int key : {1, 16, 28, 40, 52, 64, 76, 88}) {
+        for (double v : {kPP, kFF}) {
+            SingleKey a(tableKey(key), kFs), b(tableKey(key), kFs);
+            pm::ScopedFlushDenormals ftz;
+            a.strike(v);
+            b.strike(v);
+            const pm::HammerKeyModes ma = a.view();
+            const pm::HammerKeyModes mb0 = b.contact.substepView(b.bank, 0);
+            CHECK(ma.rec != nullptr && mb0.rec == nullptr);
+            double peak = 0.0, worst = 0.0;
+            std::uint32_t rng = 12345;
+            for (int i = 0; i < 1200; ++i) {
+                if (i == 40) {  // the damper starts to land during the contact
+                    a.bank.setSegmentDamper(0, 0.3f);
+                    b.bank.setSegmentDamper(0, 0.3f);
+                }
+                const pm::HammerKeyModes mav = a.view();
+                const pm::HammerKeyModes mbv = b.contact.substepView(b.bank, 0);
+                rng = rng * 1664525u + 1013904223u;
+                const float u = 1e-3f * (static_cast<float>(rng >> 8) / 16777216.0f - 0.5f);
+                float ya, yb;
+                pm::runHammer(a.hs, a.hp, mav, &ya, 1, &u);
+                pm::runHammer(b.hs, b.hp, mbv, &yb, 1, &u);
+                peak = std::max(peak, double(std::fabs(yb)));
+                worst = std::max(worst, double(std::fabs(ya - yb)));
+            }
+            const double db = 20.0 * std::log10(worst / peak + 1e-30);
+            std::printf("  key %2d (S=%d, R=%d) %s: contacts %d / %d, peak force %.2f / %.2f N, "
+                        "output difference %.1f dB re peak\n",
+                        key, a.modes.strings, ma.oversampling, v == kPP ? "pp" : "ff", a.hs.contacts,
+                        b.hs.contacts, a.hs.peakForce, b.hs.peakForce, db);
+            CHECK(a.hs.contacts == b.hs.contacts);
+            CHECK_NEAR(a.hs.peakForce, b.hs.peakForce, 1e-5 * b.hs.peakForce);
+            CHECK_LE(db, -100.0);
+        }
+    }
+}
+
+// Scalar double-precision reference of the sample pass: with the hammer
+// moving away (never in contact) the hammer path only advances the key's
+// modes, z <- c z + wIn u per sample, and outputs sum wOut Im z; checked
+// against that recursion in double from the exact coefficients, for R = 1,
+// 2 and 4 (every SIMD back-end runs the same kernel).
+TEST(sample_pass_matches_scalar_reference) {
+    for (int key : {16, 52, 88}) {
+        SingleKey k(tableKey(key), kFs);
+        pm::ScopedFlushDenormals ftz;
+        const int n = k.modes.count;
+        std::vector<std::complex<double>> z(static_cast<std::size_t>(n));
+        std::uint32_t rng = 777;
+        auto rnd = [&rng] {
+            rng = rng * 1664525u + 1013904223u;
+            return static_cast<double>(rng >> 8) / 16777216.0 - 0.5;
+        };
+        for (int i = 0; i < n; ++i) {
+            z[i] = {1e-6 * rnd(), 1e-6 * rnd()};
+            k.bank.setState(i, static_cast<float>(z[i].real()), static_cast<float>(z[i].imag()));
+            z[i] = {k.bank.stateRe(i), k.bank.stateIm(i)};
+        }
+        k.hp.offset[0] = k.hp.offset[1] = k.hp.offset[2] = 0.0;
+        k.strike(-1.0);  // launched moving away
+        const pm::HammerKeyModes m = k.view();
+        CHECK(m.rec != nullptr);
+        double worst = 0.0, peak = 0.0;
+        for (int s = 0; s < 400; ++s) {
+            const float u = static_cast<float>(1e-4 * rnd());
+            float y;
+            pm::runHammer(k.hs, k.hp, m, &y, 1, &u);
+            double ref = 0.0;
+            for (int i = 0; i < n; ++i) {
+                const std::complex<double> c = k.bank.coefficient(i);
+                z[i] = c * z[i] + std::complex<double>(k.bank.weightIn(i), k.bank.weightInIm(i)) * double(u);
+                ref += double(k.bank.weightOut(i)) * z[i].imag();
+            }
+            peak = std::max(peak, std::fabs(ref));
+            worst = std::max(worst, std::fabs(ref - double(y)));
+        }
+        double zerr = 0.0, zmax = 0.0;
+        for (int i = 0; i < n; ++i) {
+            zmax = std::max(zmax, std::abs(z[i]));
+            zerr = std::max(zerr, std::abs(z[i] - std::complex<double>(k.bank.stateRe(i), k.bank.stateIm(i))));
+        }
+        std::printf("  key %2d (R=%d): contacts %d, output error %.2e of peak, state error %.2e of max\n", key,
+                    m.oversampling, k.hs.contacts, worst / peak, zerr / zmax);
+        CHECK(k.hs.contacts == 0);
+        CHECK_LE(worst / peak, 1e-5);
+        CHECK_LE(zerr / zmax, 1e-5);
+    }
+}

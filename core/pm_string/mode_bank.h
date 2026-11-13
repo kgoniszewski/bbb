@@ -111,18 +111,20 @@ public:
     void clearState() noexcept;
 
     // RT. Sets the damper amount (>= 0) of segment s and recomputes the
-    // coefficients of its modes. Cheap (a short polynomial per mode); call it
-    // at control rate, only when the amount changes.
+    // coefficients of its awake modes (a short polynomial per mode); call it
+    // at control rate, only when the amount changes. Sleeping groups are
+    // brought up to date when they wake (their state is zero, so nothing
+    // reads their coefficients before), which makes a pedal movement cost
+    // nothing for the strings that are silent.
     void setSegmentDamper(int s, float amount) noexcept;
     float segmentDamper(int s) const noexcept { return segDamp_[s]; }
     // RT. Marks every group of segment s awake (after its state was written
     // directly through the state pointers below).
     void wakeSegment(int s) noexcept;
 
-    // The coefficient exactly as the kernels apply it.
-    std::complex<double> coefficient(int i) const noexcept {
-        return {1.0 + static_cast<double>(dr_[i]), static_cast<double>(ci_[i])};
-    }
+    // The coefficient exactly as the kernels apply it (for a sleeping
+    // group: as they will apply it when it wakes).
+    std::complex<double> coefficient(int i) const noexcept;
     float stateRe(int i) const noexcept { return zr_[i]; }
     float stateIm(int i) const noexcept { return zi_[i]; }
     float weightIn(int i) const noexcept { return wIn_[i]; }
@@ -138,7 +140,8 @@ public:
     const float* weightOutData() const noexcept { return wOut_.data(); }
     const float* weightInReData() const noexcept { return wIn_.data(); }
     const float* weightInImData() const noexcept { return wInIm_.data(); }
-    // exp(-d * sigmaDamp_n / fs) - 1 for the current damper amount d.
+    // exp(-d * sigmaDamp_n / fs) - 1 for the current damper amount d
+    // (up to date for awake groups only; see setSegmentDamper).
     const float* damperFactorMinusOneData() const noexcept { return dampAm1_.data(); }
 
     // thresholdDb is relative to an output amplitude of 1.0 (full scale).
@@ -237,11 +240,17 @@ public:
     // to sleep at the next cull pass.
     void wakeAllCoupled(int s, float u) noexcept;
 
-    int activeGroups() const noexcept;
+    int activeGroups() const noexcept { return activeCount_; }
+    // Any group of segment s awake (coupled or not).
+    bool segmentAwake(int s) const noexcept;
     bool groupActive(int g) const noexcept { return active_[g] != 0; }
     // Total number of (group x sub-block) kernel invocations so far; a silent
     // bank leaves it unchanged.
     std::uint64_t groupBlocksProcessed() const noexcept { return groupBlocks_; }
+    // Coupled groups whose impulse response coupledResponse() recomputed, so far.
+    std::uint64_t responseGroupsComputed() const noexcept { return responseGroups_; }
+    // Group x sub-block invocations of the forced kernel (applyCoupledInput), so far.
+    std::uint64_t forcedGroupBlocks() const noexcept { return forcedBlocks_; }
 
 private:
     int segFirstGroup(int s) const noexcept {
@@ -255,10 +264,16 @@ private:
     void wakeCoupled(int s, float inputBefore, const float* u, int n) noexcept;
     void setActive(int g, std::uint8_t on) noexcept {
         if (active_[g] == on) return;
+        if (on && groupStale_[g]) refreshGroup(g);
         active_[g] = on;
+        activeCount_ += on ? 1 : -1;
         const int s = groupSeg_[g];
         if (g < segFirstGroup(s) + segCoupled_[s]) ++segVersion_[s];
     }
+    // Applies the segment's damper amount to group g's coefficients.
+    void refreshGroup(int g) noexcept;
+    // After active_ was written directly: recount and refresh awake groups.
+    void syncActive() noexcept;
     void touchAll() noexcept {
         for (int s = 0; s < nSeg_; ++s) ++segVersion_[s];
     }
@@ -274,6 +289,7 @@ private:
     AlignedArray<float> dampAm1_;     // current damper factor - 1
     AlignedArray<float> groupInOut_;  // sum |wIn| |wOut| over the group
     AlignedArray<std::uint8_t> active_;
+    AlignedArray<std::uint8_t> groupStale_;  // coefficients lag the segment's damper amount
     AlignedArray<int> activeList_;
     AlignedArray<int> segGroups_;     // first group of each segment, plus end
     AlignedArray<float> segDamp_;     // damper amount per segment
@@ -300,7 +316,10 @@ private:
     bool cullEnabled_ = false;
     float cullThreshold_ = 1e-5f;
     int sinceCull_ = 0;
+    int activeCount_ = 0;
     std::uint64_t groupBlocks_ = 0;
+    std::uint64_t responseGroups_ = 0;
+    std::uint64_t forcedBlocks_ = 0;
 };
 
 }  // namespace pm

@@ -1,0 +1,104 @@
+# XcodeGen spec for the piano app (https://github.com/yonaskolb/XcodeGen).
+#   brew install xcodegen
+#   cd apps/PianoApp && xcodegen
+#   open PianoApp.xcodeproj
+# The generated PianoApp.xcodeproj is not committed (.gitignore); re-run
+# xcodegen after pulling changes that add or remove files.
+name: PianoApp
+
+options:
+  bundleIdPrefix: com.example.piano   # placeholder: change to your own reverse domain
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "17.0"
+    macOS: "14.0"
+
+packages:
+  PianoEngine:
+    path: ../..   # the repository root holds Package.swift
+
+settings:
+  base:
+    SWIFT_VERSION: "5.0"                  # Swift 5 language mode (no Swift 6 strict concurrency)
+    SWIFT_STRICT_CONCURRENCY: minimal
+    CLANG_CXX_LANGUAGE_STANDARD: c++20
+    DEVELOPMENT_TEAM: ""                  # pick your team in Signing & Capabilities
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.2.0"
+    CURRENT_PROJECT_VERSION: "1"
+
+targets:
+  PianoApp:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: PianoApp
+    dependencies:
+      - package: PianoEngine
+        product: PianoCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.app
+        PRODUCT_NAME: Piano
+        TARGETED_DEVICE_FAMILY: "2"       # iPad
+        SUPPORTS_MACCATALYST: NO
+    info:
+      path: Generated/Info-iOS.plist
+      properties:
+        CFBundleDisplayName: Piano
+        UIBackgroundModes: [audio]
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UIRequiresFullScreen: false
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+        UIStatusBarHidden: false
+
+  PianoAppMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: PianoApp
+    dependencies:
+      - package: PianoEngine
+        product: PianoCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.mac
+        PRODUCT_NAME: Piano
+        CODE_SIGN_IDENTITY: "-"           # sign to run locally; works without a team
+        ENABLE_HARDENED_RUNTIME: NO
+    info:
+      path: Generated/Info-macOS.plist
+      properties:
+        CFBundleDisplayName: Piano
+        LSApplicationCategoryType: public.app-category.music
+        NSHighResolutionCapable: true
+
+schemes:
+  PianoApp:
+    build:
+      targets:
+        PianoApp: all
+    run:
+      config: Release   # the render path is measured as shipped; use Debug only to debug Swift UI code
+    profile:
+      config: Release
+    archive:
+      config: Release
+  PianoAppMac:
+    build:
+      targets:
+        PianoAppMac: all
+    run:
+      config: Release
+    profile:
+      config: Release
+    archive:
+      config: Release

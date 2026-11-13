@@ -13,12 +13,33 @@ namespace pm {
 namespace {
 
 constexpr double kPi = std::numbers::pi;
+using cd = std::complex<double>;
 
-// Relative tolerance of the contact solves (on the compression). The energy
-// identity is off by about F times the residual per substep, i.e. by about
-// 1e-10 of the contact energy: far below what the tests resolve (1e-6),
-// while each extra Newton evaluation would cost S pow calls per substep.
-constexpr double kSolveTol = 1e-10;
+// Relative tolerance of the contact solves (on the compression). A residual
+// of 1e-8 of the compression changes the force by at most about 3e-8 of
+// itself, below the float rounding (6e-8) with which the force enters the
+// modal state; the energy identity is then off by about 1e-8 of the contact
+// energy per substep, far below what the tests resolve (1e-6). Rendered
+// output is the same as with 1e-10 to within float rounding (-130 dB rms re
+// peak against the previous solver; 1e-10 costs about 20 % more Newton
+// evaluations at ff, each S pow calls).
+constexpr double kSolveTol = 1e-8;
+
+
+// Sample-path record of one block of simd::kWidth modes, in vectors:
+//   B_tq (re, im) for t < S, q < R    2SR   pending forces
+//   wIn (re, im)                      2     pending input
+//   P_sr (re, im) for s < S, r < R    2SR   projections
+//   C^R (Re - 1, Im)                  2     rotation over the sample
+//   wOut                              1     output
+constexpr int recVectors(int S, int R) noexcept { return 4 * S * R + 5; }
+constexpr int recB(int k) noexcept { return 2 * k; }
+constexpr int recIn(int S, int R) noexcept { return 2 * S * R; }
+constexpr int recP(int S, int R, int k) noexcept { return 2 * S * R + 2 + 2 * k; }
+constexpr int recC(int S, int R) noexcept { return 4 * S * R + 2; }
+constexpr int recOut(int S, int R) noexcept { return 4 * S * R + 4; }
+
+// ------------------------------------------------------------ substep path
 
 // One substep: the pending force of the previous substep (if Pend) is added
 // and all modes are propagated, w <- C (w + sum_s b_s F_s); with In the
@@ -99,7 +120,6 @@ inline void applyDamper(const HammerKeyModes& m, bool pend, const double* force,
         accY[s] = zero();
         f[s] = set1(pend ? static_cast<float>(force[s]) : 0.0f);
     }
-    const vf one = set1(1.0f);
     for (int i = 0; i < m.count; i += kWidth) {
         vf zr = load(m.zr + i), zi = load(m.zi + i);
         if (pend) {
@@ -108,9 +128,12 @@ inline void applyDamper(const HammerKeyModes& m, bool pend, const double* force,
                 zi = fmadd(load(m.bIm[s] + i), f[s], zi);
             }
         }
-        const vf a = add(one, load(m.dampAm1 + i));
-        zr = mul(zr, a);
-        zi = mul(zi, a);
+        // z + (a - 1) z, as the bank applies the damper (dr form): a = 1 + am1
+        // rounded to float would misstate a damper rate of 1e-4 per sample
+        // by about 1e-3 of itself.
+        const vf am1 = load(m.dampAm1 + i);
+        zr = fmadd(am1, zr, zr);
+        zi = fmadd(am1, zi, zi);
         store(m.zr + i, zr);
         store(m.zi + i, zi);
         for (int s = 0; s < S; ++s)
@@ -119,13 +142,127 @@ inline void applyDamper(const HammerKeyModes& m, bool pend, const double* force,
     for (int s = 0; s < S; ++s) y[s] = hsum(accY[s]);
 }
 
+// ------------------------------------------------------------- sample path
+
+// One pass per base sample (see hammer.h). Pend: 0 nothing pending, 1 the
+// input only, 2 forces and input. fp[t * R + q]: pending forces; Y[s * R +
+// r]: free strike-point displacements at the end of substep r; oFree: the
+// output of the free state at the end of the sample.
+template <int S, int R, int Pend>
+inline void samplePass(const HammerKeyModes& m, const float* fp, float u, float* Y, float& oFree) noexcept {
+    using namespace simd;
+    constexpr int SR = S * R, W = kWidth, stride = recVectors(S, R) * W;
+    vf acc[SR], accO = zero();
+    [[maybe_unused]] vf f[SR];
+    for (int k = 0; k < SR; ++k) {
+        acc[k] = zero();
+        if constexpr (Pend == 2) f[k] = set1(fp[k]);
+    }
+    [[maybe_unused]] const vf uu = set1(u);
+    const float* rec = m.rec;
+    for (int i = 0; i < m.count; i += W, rec += stride) {
+        vf zr = load(m.zr + i), zi = load(m.zi + i);
+        if constexpr (Pend == 2) {
+            for (int k = 0; k < SR; ++k) {
+                zr = fmadd(load(rec + recB(k) * W), f[k], zr);
+                zi = fmadd(load(rec + (recB(k) + 1) * W), f[k], zi);
+            }
+        }
+        if constexpr (Pend >= 1) {
+            zr = fmadd(load(rec + recIn(S, R) * W), uu, zr);
+            zi = fmadd(load(rec + (recIn(S, R) + 1) * W), uu, zi);
+        }
+        for (int k = 0; k < SR; ++k)
+            acc[k] = fmadd(load(rec + recP(S, R, k) * W), zi, fmadd(load(rec + (recP(S, R, k) + 1) * W), zr, acc[k]));
+        const vf d = load(rec + recC(S, R) * W), c = load(rec + (recC(S, R) + 1) * W);
+        const vf nr = fnmadd(c, zi, fmadd(d, zr, zr));
+        const vf ni = fmadd(c, zr, fmadd(d, zi, zi));
+        store(m.zr + i, nr);
+        store(m.zi + i, ni);
+        accO = fmadd(load(rec + recOut(S, R) * W), ni, accO);
+    }
+    for (int k = 0; k < SR; ++k) Y[k] = hsum(acc[k]);
+    oFree = hsum(accO);
+}
+
+// Adds the pending forces (if forces) and input to the state.
+template <int S, int R>
+inline void flushSample(const HammerKeyModes& m, const float* fp, float u, bool forces) noexcept {
+    using namespace simd;
+    constexpr int SR = S * R, W = kWidth, stride = recVectors(S, R) * W;
+    vf f[SR];
+    for (int k = 0; k < SR; ++k) f[k] = set1(forces ? fp[k] : 0.0f);
+    const vf uu = set1(u);
+    const float* rec = m.rec;
+    for (int i = 0; i < m.count; i += W, rec += stride) {
+        vf zr = load(m.zr + i), zi = load(m.zi + i);
+        if (forces) {
+            for (int k = 0; k < SR; ++k) {
+                zr = fmadd(load(rec + recB(k) * W), f[k], zr);
+                zi = fmadd(load(rec + (recB(k) + 1) * W), f[k], zi);
+            }
+        }
+        zr = fmadd(load(rec + recIn(S, R) * W), uu, zr);
+        zi = fmadd(load(rec + (recIn(S, R) + 1) * W), uu, zi);
+        store(m.zr + i, zr);
+        store(m.zi + i, zi);
+    }
+}
+
+// The hammer has cleared the strings: the modes advance by one base sample
+// without projections (Pend: 0 nothing pending, 1 the input).
+template <int S, int R, int Pend>
+inline void freePass(const HammerKeyModes& m, float u, float& oFree) noexcept {
+    using namespace simd;
+    constexpr int W = kWidth, stride = recVectors(S, R) * W;
+    vf accO = zero();
+    [[maybe_unused]] const vf uu = set1(u);
+    const float* rec = m.rec;
+    for (int i = 0; i < m.count; i += W, rec += stride) {
+        vf zr = load(m.zr + i), zi = load(m.zi + i);
+        if constexpr (Pend >= 1) {
+            zr = fmadd(load(rec + recIn(S, R) * W), uu, zr);
+            zi = fmadd(load(rec + (recIn(S, R) + 1) * W), uu, zi);
+        }
+        const vf d = load(rec + recC(S, R) * W), c = load(rec + (recC(S, R) + 1) * W);
+        const vf nr = fnmadd(c, zi, fmadd(d, zr, zr));
+        const vf ni = fmadd(c, zr, fmadd(d, zi, zi));
+        store(m.zr + i, nr);
+        store(m.zi + i, ni);
+        accO = fmadd(load(rec + recOut(S, R) * W), ni, accO);
+    }
+    oFree = hsum(accO);
+}
+
+// Bound of each string's strike-point displacement from the current state,
+// sum (|Re p| + |Im p|)(|Re z| + |Im z|) (scalar: a rare check).
+template <int S>
+inline void strikeBound(const HammerKeyModes& m, double* A) noexcept {
+    for (int s = 0; s < S; ++s) {
+        double a = 0.0;
+        for (int i = 0; i < m.count; ++i)
+            a += (std::fabs(double(m.pRe[s][i])) + std::fabs(double(m.pIm[s][i]))) *
+                 (std::fabs(double(m.zr[i])) + std::fabs(double(m.zi[i])));
+        A[s] = a;
+    }
+}
+
+// --------------------------------------------------------------- the felt
+
 // Felt in series with the residual string compliance. With e the felt
 // compression, the total compression (hammer to modal string displacement)
 // is d(e) = e + cRes F(e), and the contact potential is
 // W = Phi(e) + cRes F^2 / 2, so that dW/dd = F. Everything is explicit in e,
-// which is therefore the unknown of the solve (one pow per evaluation).
+// which is therefore the unknown of the solve (one pow per evaluation, and
+// no division: F = (K e^(p-1)) e, dF/de = p K e^(p-1)).
 struct Felt {
     double K, p, mu, invH, cRes;
+    double pm1, invP1;  // p - 1, 1 / (p + 1)
+
+    Felt(double K_, double p_, double mu_, double invH_, double cRes_) noexcept
+        : K(K_), p(p_), mu(mu_), invH(invH_), cRes(cRes_), pm1(p_ - 1.0), invP1(1.0 / (p_ + 1.0)) {}
+    Felt(double K_, double p_, double mu_, double invH_, double cRes_, double pm1_, double invP1_) noexcept
+        : K(K_), p(p_), mu(mu_), invH(invH_), cRes(cRes_), pm1(pm1_), invP1(invP1_) {}
 
     struct Point {
         double e, d, W, F;
@@ -134,9 +271,9 @@ struct Felt {
 
     Point at(double e) const noexcept {
         if (e <= 0.0) return {e, e, 0.0, 0.0, 1.0, 0.0};
-        const double F = K * fastPow(e, p);
-        const double dF = p * F / e;
-        return {e, e + cRes * F, F * e / (p + 1.0) + 0.5 * cRes * F * F, F, 1.0 + cRes * dF, dF};
+        const double g = K * fastPow(e, pm1);
+        const double F = g * e, dF = p * g;
+        return {e, e + cRes * F, F * e * invP1 + 0.5 * cRes * F * F, F, 1.0 + cRes * dF, dF};
     }
     // Inverse of d(e), for the rare case where the total compression changes
     // outside the solve (damper scaling during contact). Convex and
@@ -166,8 +303,9 @@ inline double substepForce(const Felt& f, const Felt::Point& q1, const Felt::Poi
         G = 0.5 * (q1.F + q0.F);  // midpoint, O(dd^2)
         dG = 0.5 * q1.dF / q1.dD;
     } else {
-        G = (q1.W - q0.W) / dd;
-        dG = (q1.F - G) / dd;
+        const double inv = 1.0 / dd;
+        G = (q1.W - q0.W) * inv;
+        dG = (q1.F - G) * inv;
     }
     const double hc = 1.0 + f.mu * dd * f.invH;
     const double F = G * hc;
@@ -179,10 +317,10 @@ inline double substepForce(const Felt& f, const Felt::Point& q1, const Felt::Poi
     return F;
 }
 
-// One string, scalar: solves r(e) = d(e) - dFree + A F(e) = 0 for the
-// end-of-substep felt compression e. r is increasing in e (W is convex in d,
-// d increasing in e), so the root is unique; it lies in
-// [min(dFree - A F(dFree), 0), dFree].
+// One string, scalar, bracketed: solves r(e) = d(e) - dFree + A F(e) = 0 for
+// the end-of-substep felt compression e. r is increasing in e (W is convex in
+// d, d increasing in e), so the root is unique; it lies in
+// [min(dFree - A F(dFree), 0), dFree]. The fallback of the Newton solve.
 inline Felt::Point solveContact(const Felt& felt, double dFree, const Felt::Point& q0, double A,
                                 double guess, double& Fout) noexcept {
     double dF;
@@ -213,61 +351,146 @@ inline Felt::Point solveContact(const Felt& felt, double dFree, const Felt::Poin
     return q;
 }
 
-// Solves J x = r in place for S <= 3 by Gaussian elimination with partial
-// pivoting. Returns false if J is singular.
+// Solves J x = r in place for S <= 3 (Cramer's rule: one division). The
+// contact Jacobian has a positive diagonal that dominates its columns
+// (G_ss >> |G_st|, h^2/2M), so no pivoting is needed. Returns false if J is
+// singular or not finite.
 template <int S>
-inline bool solveSmall(double (&J)[S][S], double (&r)[S]) noexcept {
-    for (int c = 0; c < S; ++c) {
-        int p = c;
-        for (int i = c + 1; i < S; ++i)
-            if (std::fabs(J[i][c]) > std::fabs(J[p][c])) p = i;
-        if (!(std::fabs(J[p][c]) > 0.0)) return false;
-        if (p != c) {
-            for (int j = 0; j < S; ++j) std::swap(J[p][j], J[c][j]);
-            std::swap(r[p], r[c]);
-        }
-        for (int i = c + 1; i < S; ++i) {
-            const double f = J[i][c] / J[c][c];
-            for (int j = c; j < S; ++j) J[i][j] -= f * J[c][j];
-            r[i] -= f * r[c];
-        }
+inline bool solveSmall(const double (&J)[S][S], double (&r)[S]) noexcept {
+    if constexpr (S == 1) {
+        if (!(std::fabs(J[0][0]) > 0.0)) return false;
+        r[0] /= J[0][0];
+        return std::isfinite(r[0]);
+    } else if constexpr (S == 2) {
+        const double det = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+        if (!(std::fabs(det) > 0.0)) return false;
+        const double inv = 1.0 / det;
+        const double x0 = (r[0] * J[1][1] - r[1] * J[0][1]) * inv;
+        const double x1 = (J[0][0] * r[1] - J[1][0] * r[0]) * inv;
+        r[0] = x0;
+        r[1] = x1;
+        return std::isfinite(x0) && std::isfinite(x1);
+    } else {
+        const double c00 = J[1][1] * J[2][2] - J[1][2] * J[2][1];
+        const double c01 = J[1][2] * J[2][0] - J[1][0] * J[2][2];
+        const double c02 = J[1][0] * J[2][1] - J[1][1] * J[2][0];
+        const double det = J[0][0] * c00 + J[0][1] * c01 + J[0][2] * c02;
+        if (!(std::fabs(det) > 0.0)) return false;
+        const double inv = 1.0 / det;
+        const double c10 = J[0][2] * J[2][1] - J[0][1] * J[2][2];
+        const double c11 = J[0][0] * J[2][2] - J[0][2] * J[2][0];
+        const double c12 = J[0][1] * J[2][0] - J[0][0] * J[2][1];
+        const double c20 = J[0][1] * J[1][2] - J[0][2] * J[1][1];
+        const double c21 = J[0][2] * J[1][0] - J[0][0] * J[1][2];
+        const double c22 = J[0][0] * J[1][1] - J[0][1] * J[1][0];
+        const double x0 = (c00 * r[0] + c10 * r[1] + c20 * r[2]) * inv;
+        const double x1 = (c01 * r[0] + c11 * r[1] + c21 * r[2]) * inv;
+        const double x2 = (c02 * r[0] + c12 * r[1] + c22 * r[2]) * inv;
+        r[0] = x0;
+        r[1] = x1;
+        r[2] = x2;
+        return std::isfinite(x0) && std::isfinite(x1) && std::isfinite(x2);
     }
-    for (int c = S - 1; c >= 0; --c) {
-        double s = r[c];
-        for (int j = c + 1; j < S; ++j) s -= J[c][j] * r[j];
-        r[c] = s / J[c][c];
-    }
+}
+
+// x^q from x0^q (g0 = x0^q, accurate) for x close to x0: the binomial series
+// of (1 + t)^q, t = x / x0 - 1, five terms (relative error below 1e-16 for
+// |t| <= 1e-3; larger steps use fastPow). The Newton iterates of one substep
+// differ by far less than that, so only the first evaluation of a substep
+// needs the table-driven power.
+inline bool powNear(double x, double x0, double invX0, double g0, double q, double& out) noexcept {
+    const double t = (x - x0) * invX0;
+    if (!(std::fabs(t) <= 1e-3)) return false;
+    const double c2 = q * (q - 1.0) * 0.5, c3 = c2 * (q - 2.0) * (1.0 / 3.0), c4 = c3 * (q - 3.0) * 0.25,
+                 c5 = c4 * (q - 4.0) * 0.2;
+    out = g0 * (1.0 + t * (q + t * (c2 + t * (c3 + t * (c4 + t * c5)))));
     return true;
 }
 
-// S strings: r_s(e) = d_s(e_s) - dFree_s + Ah sum_t F_t + sum_t G_st F_t = 0.
+// S strings: r_s(e) = d_s(e_s) - dFree_s + Ah sum_t F_t + sum_t G_st F_t = 0,
+// Newton's method; the bracketed nested solve if it has not converged after
+// 12 steps. Evaluations work on plain per-string arrays (no Point copies) and
+// reuse the previous iterate's power (powNear).
 template <int S>
 inline void solveContacts(const Felt& felt, const double* dFree, const Felt::Point* q0, double Ah,
                           const double (&G)[kMaxStrings][kMaxStrings], const double* guess,
-                          Felt::Point* q1, double* F, int& fallbacks) noexcept {
+                          Felt::Point* q1, double* F, double* jDiag, int& fallbacks,
+                          std::int64_t& evals) noexcept {
     double scale = 0.0;
-    for (int s = 0; s < S; ++s) scale = std::max({scale, std::fabs(dFree[s]), std::fabs(q0[s].d)});
+    for (int s = 0; s < S; ++s) scale = std::max(scale, std::max(std::fabs(dFree[s]), std::fabs(q0[s].d)));
     const double tol = kSolveTol * scale;
+    const double muInvH = felt.mu * felt.invH;
     double e[S], dF[S], r[S];
-    for (int s = 0; s < S; ++s) e[s] = std::min(guess[s], dFree[s]);
+    double gPrev[S] = {}, ePrev[S] = {}, invEPrev[S] = {};  // last evaluated power K e^(p-1) and its point
+    for (int s = 0; s < S; ++s) {
+        e[s] = std::min(guess[s], dFree[s]);
+        ePrev[s] = 0.0;
+    }
     for (int it = 0; it < 12; ++it) {
+        ++evals;
         double P = 0.0;
         for (int s = 0; s < S; ++s) {
-            q1[s] = felt.at(e[s]);
-            F[s] = substepForce(felt, q1[s], q0[s], dF[s]);
+            const double es = e[s];
+            Felt::Point& q = q1[s];
+            q.e = es;
+            if (es <= 0.0) {
+                q.d = es;
+                q.W = q.F = q.dF = 0.0;
+                q.dD = 1.0;
+            } else {
+                double g;
+                if (!(ePrev[s] > 0.0 && powNear(es, ePrev[s], invEPrev[s], gPrev[s], felt.pm1, g))) {
+                    g = felt.K * fastPow(es, felt.pm1);
+                    ePrev[s] = es;
+                    invEPrev[s] = 1.0 / es;
+                    gPrev[s] = g;
+                }
+                const double f = g * es, cf = felt.cRes * f;
+                q.F = f;
+                q.dF = felt.p * g;
+                q.d = es + cf;
+                q.W = f * es * felt.invP1 + 0.5 * cf * f;
+                q.dD = 1.0 + felt.cRes * q.dF;
+            }
+            // Discrete gradient of W between the total compressions, times
+            // the Hunt-Crossley factor (substepForce, inlined).
+            const Felt::Point& o = q0[s];
+            const double dd = q.d - o.d;
+            double Gd, dG;
+            if (std::fabs(dd) <= 1e-7 * std::max(std::fabs(q.d), std::fabs(o.d))) {
+                Gd = 0.5 * (q.F + o.F);
+                dG = 0.5 * q.dF / q.dD;
+            } else {
+                const double inv = 1.0 / dd;
+                Gd = (q.W - o.W) * inv;
+                dG = (q.F - Gd) * inv;
+            }
+            const double hc = 1.0 + muInvH * dd;
+            const double fs = Gd * hc;
+            if (fs > 0.0) {
+                F[s] = fs;
+                dF[s] = (dG * hc + Gd * muInvH) * q.dD;
+            } else {
+                F[s] = 0.0;
+                dF[s] = 0.0;
+            }
             P += F[s];
         }
         double worst = 0.0;
         for (int s = 0; s < S; ++s) {
-            double g = 0.0;
+            double g = Ah * P;
             for (int t = 0; t < S; ++t) g += G[s][t] * F[t];
-            r[s] = q1[s].d - dFree[s] + Ah * P + g;
+            r[s] = q1[s].d - dFree[s] + g;
             worst = std::max(worst, std::fabs(r[s]));
         }
         if (worst <= tol) return;
         double J[S][S];
         for (int s = 0; s < S; ++s)
-            for (int t = 0; t < S; ++t) J[s][t] = (s == t ? q1[s].dD : 0.0) + (Ah + G[s][t]) * dF[t];
+            for (int t = 0; t < S; ++t) J[s][t] = (Ah + G[s][t]) * dF[t];
+        for (int s = 0; s < S; ++s) {
+            J[s][s] += q1[s].dD;
+            jDiag[s] = J[s][s];
+        }
         if (!solveSmall<S>(J, r)) break;
         for (int s = 0; s < S; ++s) e[s] -= r[s];
     }
@@ -295,25 +518,124 @@ inline void solveContacts(const Felt& felt, const double* dFree, const Felt::Poi
     forcesFor(0.5 * (lo + hi));
 }
 
+// The hammer and felt side of a substep, shared by both paths: given the
+// strings' free strike-point displacements at the end of the substep, solve
+// the contact, move the hammer, keep the statistics.
 template <int S>
-void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in, float* out,
-                int n) noexcept {
-    const Felt felt{p.K, p.p, p.mu, 1.0 / m.h, m.cRes};
-    const double invM = 1.0 / p.mass;
-    const double Ah = 0.5 * m.h * m.h * invM;
+struct ContactStep {
+    Felt felt;
+    double invM, Ah, h;
+    Felt::Point q0[S];
+
+    ContactStep(const HammerState& st, const HammerParams& p, const HammerKeyModes& m) noexcept
+        : felt(p.K, p.p, p.mu, m.invH, m.cRes, st.feltPm1, st.feltInvP1), invM(st.invMass),
+          Ah(st.halfH2InvMass), h(m.h) {
+        for (int s = 0; s < S; ++s) q0[s] = {st.feltPrev[s], st.xiPrev[s], st.wPrev[s], st.fPrev[s], 1.0, 0.0};
+    }
+    void save(HammerState& st) const noexcept {
+        for (int s = 0; s < S; ++s) {
+            st.xiPrev[s] = q0[s].d;
+            st.feltPrev[s] = q0[s].e;
+            st.wPrev[s] = q0[s].W;
+            st.fPrev[s] = q0[s].F;
+        }
+    }
+    // Damper scaling moved the strings by y - yPrev outside the solve.
+    void damped(HammerState& st, const double* y) noexcept {
+        for (int s = 0; s < S; ++s) {
+            q0[s] = felt.fromTotal(q0[s].d + st.yPrev[s] - y[s]);
+            st.yPrev[s] = y[s];
+        }
+    }
+
+    // Returns the total force; F[s] the force on string s.
+    double run(HammerState& st, const HammerParams& p, const double (&G)[kMaxStrings][kMaxStrings],
+               const double* yfree, double* F) noexcept {
+        const double xt = st.x + st.v * h;
+        double dFree[S];
+        bool touching = false;
+        for (int s = 0; s < S; ++s) {
+            dFree[s] = xt - p.offset[s] - yfree[s];
+            touching = touching || dFree[s] > 0.0 || q0[s].d > 0.0;
+        }
+        Felt::Point q1[S];
+        double P = 0.0;
+        if (touching) {
+            // Predictor: quadratic extrapolation of the felt compression,
+            // corrected by the part of the free compression that its own
+            // quadratic extrapolation misses (the strings' reflected waves)
+            // times de/d(free compression) of the last solve. With it the
+            // first Newton step nearly always meets the tolerance (about 2.1
+            // evaluations per substep instead of 2.6).
+            double guess[S], jDiag[S];
+            for (int s = 0; s < S; ++s) {
+                guess[s] = q0[s].e + 2.0 * st.dxiPrev[s] - st.dxiPrev2[s];
+                jDiag[s] = 0.0;
+                if (st.history >= 3 && st.sensPrev[s] > 0.0)
+                    guess[s] += (dFree[s] - (st.dFreePrev[s] + 2.0 * st.dDFreePrev[s] - st.dDFreePrev2[s])) *
+                                st.sensPrev[s];
+            }
+            solveContacts<S>(felt, dFree, q0, Ah, G, guess, q1, F, jDiag, st.fallbackSolves, st.newtonEvals);
+            for (int s = 0; s < S; ++s) {
+                P += F[s];
+                st.sensPrev[s] = jDiag[s] > 0.0 ? 1.0 / jDiag[s] : 0.0;
+            }
+            ++st.history;
+        } else {
+            st.history = 0;
+            for (int s = 0; s < S; ++s) {
+                F[s] = 0.0;
+                q1[s] = felt.at(dFree[s]);
+            }
+        }
+        for (int s = 0; s < S; ++s) {
+            st.dDFreePrev2[s] = st.dDFreePrev[s];
+            st.dDFreePrev[s] = dFree[s] - st.dFreePrev[s];
+            st.dFreePrev[s] = dFree[s];
+        }
+        st.x = xt - Ah * P;
+        st.v -= h * P * invM;
+        for (int s = 0; s < S; ++s) {
+            double y = yfree[s];
+            for (int t = 0; t < S; ++t) y += G[s][t] * F[t];
+            if (F[s] > 0.0) {
+                st.workOnString += F[s] * (y - st.yPrev[s]);
+                st.feltLoss += F[s] * (q1[s].d - q0[s].d) - (q1[s].W - q0[s].W);
+            }
+            st.yPrev[s] = y;
+            st.dxiPrev2[s] = st.dxiPrev[s];
+            st.dxiPrev[s] = q1[s].e - q0[s].e;
+            q0[s] = q1[s];
+        }
+        if (P > 0.0) {
+            st.peakForce = std::max(st.peakForce, P);
+            if (!st.inContact) {
+                ++st.contacts;
+                if (st.firstContact < 0) st.firstContact = st.substeps;
+            }
+            st.inContact = true;
+            st.lastContact = st.substeps;
+            ++st.contactSubsteps;
+        } else {
+            st.inContact = false;
+        }
+        ++st.substeps;
+        return P;
+    }
+};
+
+template <int S>
+void runSubstepT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in, float* out,
+                 int n) noexcept {
+    ContactStep<S> cs(h, p, m);
     const int R = m.oversampling;
     const bool hasIn = in != nullptr && m.wInRe != nullptr;
-    Felt::Point q0[S];
-    for (int s = 0; s < S; ++s) q0[s] = {h.feltPrev[s], h.xiPrev[s], h.wPrev[s], h.fPrev[s], 1.0, 0.0};
     for (int k = 0; k < n; ++k) {
         if (m.damped) {
             double y[S];
             applyDamper<S>(m, h.pending, h.fPend, y);
             h.pending = false;
-            for (int s = 0; s < S; ++s) {
-                q0[s] = felt.fromTotal(q0[s].d + h.yPrev[s] - y[s]);
-                h.yPrev[s] = y[s];
-            }
+            cs.damped(h, y);
         }
         float ofree = 0.0f;
         double F[S] = {};
@@ -324,74 +646,142 @@ void runHammerT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, 
             propagateAny<S>(m, h.pending, h.fPend, inNow, inNow ? in[k] : 0.0f, last, yf, of);
             h.pending = false;
             if (last) ofree = of;
-            const double xt = h.x + h.v * m.h;
-            double dFree[S];
-            bool touching = false;
-            for (int s = 0; s < S; ++s) {
-                dFree[s] = xt - p.offset[s] - yf[s];
-                touching = touching || dFree[s] > 0.0 || q0[s].d > 0.0;
+            double yfree[S];
+            for (int s = 0; s < S; ++s) yfree[s] = yf[s];
+            if (cs.run(h, p, m.G, yfree, F) > 0.0) {
+                for (int s = 0; s < S; ++s) h.fPend[s] = F[s];
+                h.pending = true;
             }
-            Felt::Point q1[S];
-            double P = 0.0;
-            if (touching) {
-                // Quadratic extrapolation of the felt compression: with it one
-                // Newton step usually meets the tolerance.
-                double guess[S];
-                for (int s = 0; s < S; ++s) guess[s] = q0[s].e + 2.0 * h.dxiPrev[s] - h.dxiPrev2[s];
-                if constexpr (S == 1) {
-                    q1[0] = solveContact(felt, dFree[0], q0[0], Ah + m.G[0][0], guess[0], F[0]);
-                } else {
-                    solveContacts<S>(felt, dFree, q0, Ah, m.G, guess, q1, F, h.fallbackSolves);
-                }
-                for (int s = 0; s < S; ++s) P += F[s];
-                if (P > 0.0) {
-                    for (int s = 0; s < S; ++s) h.fPend[s] = F[s];
-                    h.pending = true;
-                }
-            } else {
-                for (int s = 0; s < S; ++s) {
-                    F[s] = 0.0;
-                    q1[s] = felt.at(dFree[s]);
-                }
-            }
-            h.x = xt - Ah * P;
-            h.v -= m.h * P * invM;
-            for (int s = 0; s < S; ++s) {
-                double y = yf[s];
-                for (int t = 0; t < S; ++t) y += m.G[s][t] * F[t];
-                if (F[s] > 0.0) {
-                    h.workOnString += F[s] * (y - h.yPrev[s]);
-                    h.feltLoss += F[s] * (q1[s].d - q0[s].d) - (q1[s].W - q0[s].W);
-                }
-                h.yPrev[s] = y;
-                h.dxiPrev2[s] = h.dxiPrev[s];
-                h.dxiPrev[s] = q1[s].e - q0[s].e;
-                q0[s] = q1[s];
-            }
-            if (P > 0.0) {
-                h.peakForce = std::max(h.peakForce, P);
-                if (!h.inContact) {
-                    ++h.contacts;
-                    if (h.firstContact < 0) h.firstContact = h.substeps;
-                }
-                h.inContact = true;
-                h.lastContact = h.substeps;
-                ++h.contactSubsteps;
-            } else {
-                h.inContact = false;
-            }
-            ++h.substeps;
         }
         double o = ofree;
         for (int s = 0; s < S; ++s) o += m.gOut[s] * F[s];
         out[k] = static_cast<float>(o);
     }
-    for (int s = 0; s < S; ++s) {
-        h.xiPrev[s] = q0[s].d;
-        h.feltPrev[s] = q0[s].e;
-        h.wPrev[s] = q0[s].W;
-        h.fPrev[s] = q0[s].F;
+    cs.save(h);
+}
+
+template <int S, int R>
+void flushSampleAny(HammerState& h, const HammerKeyModes& m) noexcept {
+    flushSample<S, R>(m, h.fPendS, h.uPend, h.pendForces);
+    h.pending = false;
+}
+
+template <int S, int R>
+void runSampleT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in, float* out,
+                int n) noexcept {
+    ContactStep<S> cs(h, p, m);
+    const SampleResponse& sr = *m.resp;
+    double G[kMaxStrings][kMaxStrings] = {};
+    for (int s = 0; s < S; ++s)
+        for (int t = 0; t < S; ++t) G[s][t] = sr.h[s][t][0];
+    for (int k = 0; k < n; ++k) {
+        if (m.damped) {
+            if (h.pending) flushSampleAny<S, R>(h, m);
+            double y[S];
+            applyDamper<S>(m, false, nullptr, y);
+            cs.damped(h, y);
+        }
+        if (!h.cleared && h.history == 0 && !h.inContact && !(h.pending && h.pendForces) && h.v <= 0.0 && h.lastContact >= 0 &&
+            h.substeps >= h.clearCheckAt) {
+            h.clearCheckAt = h.substeps + 16 * R;
+            double A[S];
+            strikeBound<S>(m, A);
+            bool clear = true;
+            for (int s = 0; s < S; ++s) {
+                const double a = A[s] + (h.pending ? sr.pAbsIn[s] * std::fabs(double(h.uPend)) : 0.0);
+                clear = clear && h.x - p.offset[s] + 2.0 * a + 1e-6 < 0.0;
+            }
+            h.cleared = clear;
+        }
+        if (h.cleared) {
+            float oFree;
+            if (h.pending) freePass<S, R, 1>(m, h.uPend, oFree);
+            else freePass<S, R, 0>(m, 0.0f, oFree);
+            h.pending = false;
+            const float u = in != nullptr ? in[k] : 0.0f;
+            h.x += h.v * (R * m.h);
+            h.substeps += R;
+            out[k] = static_cast<float>(static_cast<double>(oFree) + sr.gIn * u);
+            if (u != 0.0f) {
+                h.pending = true;
+                h.pendForces = false;
+                h.uPend = u;
+            }
+            continue;
+        }
+        float Y[S * R], oFree;
+        if (!h.pending) samplePass<S, R, 0>(m, h.fPendS, 0.0f, Y, oFree);
+        else if (!h.pendForces) samplePass<S, R, 1>(m, h.fPendS, h.uPend, Y, oFree);
+        else samplePass<S, R, 2>(m, h.fPendS, h.uPend, Y, oFree);
+        h.pending = false;
+        const float u = in != nullptr ? in[k] : 0.0f;
+        double F[S][R] = {};
+        bool any = false;
+        for (int r = 0; r < R; ++r) {
+            double yfree[S];
+            for (int s = 0; s < S; ++s) {
+                double y = Y[s * R + r];
+                for (int q = 0; q < r; ++q)
+                    for (int t = 0; t < S; ++t) y += sr.h[s][t][r - q] * F[t][q];
+                if (r == R - 1) y += sr.gP[s] * u;
+                yfree[s] = y;
+            }
+            double Fr[S];
+            if (cs.run(h, p, G, yfree, Fr) > 0.0) any = true;
+            for (int s = 0; s < S; ++s) F[s][r] = Fr[s];
+        }
+        double o = static_cast<double>(oFree) + sr.gIn * u;
+        if (any)
+            for (int s = 0; s < S; ++s)
+                for (int r = 0; r < R; ++r) o += sr.gOut[s][r] * F[s][r];
+        out[k] = static_cast<float>(o);
+        if (any || u != 0.0f) {
+            h.pending = true;
+            h.pendForces = any;
+            for (int s = 0; s < S; ++s)
+                for (int r = 0; r < R; ++r) h.fPendS[s * R + r] = static_cast<float>(F[s][r]);
+            h.uPend = u;
+        }
     }
+    cs.save(h);
+}
+
+template <int S>
+void runT(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in, float* out,
+          int n) noexcept {
+    if (m.rec && m.resp) {
+        switch (m.oversampling) {
+            case 1: runSampleT<S, 1>(h, p, m, in, out, n); return;
+            case 2: runSampleT<S, 2>(h, p, m, in, out, n); return;
+            case 3: runSampleT<S, 3>(h, p, m, in, out, n); return;
+            case 4: runSampleT<S, 4>(h, p, m, in, out, n); return;
+            default: break;
+        }
+    }
+    runSubstepT<S>(h, p, m, in, out, n);
+}
+
+template <int S>
+void flushT(HammerState& h, const HammerKeyModes& m) noexcept {
+    if (m.rec && m.resp) {
+        switch (m.oversampling) {
+            case 1: flushSampleAny<S, 1>(h, m); return;
+            case 2: flushSampleAny<S, 2>(h, m); return;
+            case 3: flushSampleAny<S, 3>(h, m); return;
+            case 4: flushSampleAny<S, 4>(h, m); return;
+            default: break;
+        }
+    }
+    applyForce<S>(m, h.fPend);
+    h.pending = false;
+}
+
+// C = exp(lambda t) as (Re(C) - 1, Im(C)), without cancellation.
+cd expMinusOne(cd lambda, double t) noexcept {
+    const double sigma = -lambda.real(), theta = lambda.imag() * t;
+    const double rm1 = std::expm1(-sigma * t);
+    const double half = std::sin(0.5 * theta);
+    return {rm1 * std::cos(theta) - 2.0 * half * half, (1.0 + rm1) * std::sin(theta)};
 }
 
 }  // namespace
@@ -403,30 +793,76 @@ bool ContactTables::allocate(int modeCapacity, int segments) noexcept {
     for (int s = 0; s < kMaxStrings; ++s)
         ok = ok && pRe_[s].allocate(n) && pIm_[s].allocate(n) && bRe_[s].allocate(n) &&
              bIm_[s].allocate(n);
+    rec_.clear();
+    rec_.resize(static_cast<std::size_t>(std::max(segments, 1)));
+    cur_ = -1;
     return ok;
+}
+
+bool ContactTables::beginSegment(const ModeBank& bank, int s, int strings, int oversampling) noexcept {
+    cur_ = -1;
+    if (s < 0 || static_cast<std::size_t>(s) >= rec_.size()) return false;
+    rec_[s].release();
+    seg_[s].hasRec = false;
+    seg_[s].resp = SampleResponse{};
+    const int S = std::clamp(strings, 1, kMaxStrings);
+    if (oversampling < 1 || oversampling > kMaxSampleOversampling) return true;  // substep path
+    const int count = bank.segmentModeCount(s);
+    const int blocks = (count + simd::kWidth - 1) / simd::kWidth;
+    const std::size_t floats = static_cast<std::size_t>(blocks) * recVectors(S, oversampling) * simd::kWidth;
+    if (!rec_[s].allocate(floats)) return false;
+    cur_ = s;
+    curFirst_ = bank.segmentFirstMode(s);
+    curCount_ = count;
+    curStrings_ = S;
+    curR_ = oversampling;
+    return true;
 }
 
 void ContactTables::setMode(int i, std::complex<double> lambda, int strings,
                             const std::complex<double>* proj, const std::complex<double>* input,
                             double fs, int oversampling) noexcept {
     const double h = 1.0 / (fs * oversampling);
-    const double sigma = -lambda.real(), omega = lambda.imag();
-    const double theta = omega * h;
-    const double rm1 = std::expm1(-sigma * h);
-    const double half = std::sin(0.5 * theta);
-    const double cRe1 = rm1 * std::cos(theta) - 2.0 * half * half;  // Re(C) - 1
-    const double cIm = (1.0 + rm1) * std::sin(theta);
-    const std::complex<double> cm1(cRe1, cIm);
-    dSub_[i] = static_cast<float>(cRe1);
-    sSub_[i] = static_cast<float>(cIm);
+    const cd cm1 = expMinusOne(lambda, h);  // C - 1
+    dSub_[i] = static_cast<float>(cm1.real());
+    sSub_[i] = static_cast<float>(cm1.imag());
+    cd b[kMaxStrings];
     for (int s = 0; s < kMaxStrings; ++s) {
         const bool used = s < strings;
-        const std::complex<double> b = used ? input[s] * cm1 / lambda : 0.0;
-        bRe_[s][i] = static_cast<float>(b.real());
-        bIm_[s][i] = static_cast<float>(b.imag());
+        b[s] = used ? input[s] * cm1 / lambda : 0.0;
+        bRe_[s][i] = static_cast<float>(b[s].real());
+        bIm_[s][i] = static_cast<float>(b[s].imag());
         pRe_[s][i] = used ? static_cast<float>(proj[s].real()) : 0.0f;
         pIm_[s][i] = used ? static_cast<float>(proj[s].imag()) : 0.0f;
     }
+
+    // Sample path: this mode's lane of its block's record, and its share of
+    // the key's strike-point responses.
+    if (cur_ < 0 || i < curFirst_ || i >= curFirst_ + curCount_) return;
+    const int S = curStrings_, R = curR_;
+    if (oversampling != R || strings != S) return;
+    const int W = simd::kWidth, j = i - curFirst_;
+    float* r = rec_[cur_].data() + static_cast<std::size_t>(j / W) * recVectors(S, R) * W + j % W;
+    cd Cpow[kMaxSampleOversampling + 1];  // C^k
+    Cpow[0] = 1.0;
+    for (int k = 1; k <= R; ++k) Cpow[k] = 1.0 + expMinusOne(lambda, k * h);
+    for (int s = 0; s < S; ++s)
+        for (int q = 0; q < R; ++q) {
+            const int k = s * R + q;
+            const cd B = Cpow[R - 1 - q] * b[s];
+            const cd P = proj[s] * Cpow[q + 1];
+            r[recB(k) * W] = static_cast<float>(B.real());
+            r[(recB(k) + 1) * W] = static_cast<float>(B.imag());
+            r[recP(S, R, k) * W] = static_cast<float>(P.real());
+            r[(recP(S, R, k) + 1) * W] = static_cast<float>(P.imag());
+        }
+    const cd cr = expMinusOne(lambda, R * h);
+    r[recC(S, R) * W] = static_cast<float>(cr.real());
+    r[(recC(S, R) + 1) * W] = static_cast<float>(cr.imag());
+    SampleResponse& resp = seg_[cur_].resp;
+    for (int s = 0; s < S; ++s)
+        for (int t = 0; t < S; ++t)
+            for (int d = 0; d < R; ++d) resp.h[s][t][d] += (proj[s] * Cpow[d] * b[t]).imag();
 }
 
 void ContactTables::setMode(int i, double freqHz, double sigma, double phi, double modalMass,
@@ -460,9 +896,47 @@ void ContactTables::finishSegment(const ModeBank& bank, int s, int strings, doub
                 sg.G[a][t] += double(pRe_[a][i]) * bIm_[t][i] + double(pIm_[a][i]) * bRe_[t][i];
         }
     }
+
+    // Sample path: the bank's weights into the record, and the output and
+    // input responses from the float coefficients the pass applies.
+    const bool rec = cur_ == s && curStrings_ == sg.strings && curR_ == oversampling;
+    cur_ = -1;
+    if (!rec) {
+        rec_[s].release();
+        sg.hasRec = false;
+        return;
+    }
+    const int S = sg.strings, R = oversampling, W = simd::kWidth;
+    SampleResponse& resp = sg.resp;
+    for (int i = m0; i < m1; ++i) {
+        const int j = i - m0;
+        float* r = rec_[s].data() + static_cast<std::size_t>(j / W) * recVectors(S, R) * W + j % W;
+        const float wo = bank.weightOut(i), wr = bank.weightIn(i), wi = bank.weightInIm(i);
+        r[recIn(S, R) * W] = wr;
+        r[(recIn(S, R) + 1) * W] = wi;
+        r[recOut(S, R) * W] = wo;
+        for (int k = 0; k < S * R; ++k) resp.gOut[k / R][k % R] += double(wo) * r[(recB(k) + 1) * W];
+        resp.gIn += double(wo) * wi;
+        for (int a = 0; a < S; ++a) {
+            resp.gP[a] += double(pRe_[a][i]) * wi + double(pIm_[a][i]) * wr;
+            resp.pAbsIn[a] += (std::fabs(double(pRe_[a][i])) + std::fabs(double(pIm_[a][i]))) *
+                              (std::fabs(double(wr)) + std::fabs(double(wi)));
+        }
+    }
+    sg.hasRec = true;
 }
 
 HammerKeyModes ContactTables::view(ModeBank& bank, int s) const noexcept {
+    HammerKeyModes m = substepView(bank, s);
+    const Seg& sg = seg_[s];
+    if (sg.hasRec) {
+        m.rec = rec_[s].data();
+        m.resp = &sg.resp;
+    }
+    return m;
+}
+
+HammerKeyModes ContactTables::substepView(ModeBank& bank, int s) const noexcept {
     const Seg& sg = seg_[s];
     const int m0 = bank.segmentFirstMode(s);
     HammerKeyModes m;
@@ -488,6 +962,7 @@ HammerKeyModes ContactTables::view(ModeBank& bank, int s) const noexcept {
     m.cRes = sg.cRes;
     m.oversampling = sg.oversampling;
     m.h = sg.h;
+    m.invH = sg.h > 0.0 ? 1.0 / sg.h : 0.0;
     m.releaseSubsteps = sg.release;
     m.maxSubsteps = sg.maxSteps;
     return m;
@@ -500,7 +975,7 @@ double strikeDisplacement(const HammerKeyModes& m, int s) noexcept {
 }
 
 double contactPotential(const HammerParams& p, const HammerKeyModes& m, double d) noexcept {
-    const Felt felt{p.K, p.p, p.mu, 1.0 / m.h, m.cRes};
+    const Felt felt(p.K, p.p, p.mu, 1.0 / m.h, m.cRes);
     return felt.fromTotal(d).W;
 }
 
@@ -533,6 +1008,14 @@ void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m
         h.dxiPrev2[s] = velocity * m.h;
         h.yPrev[s] = used ? y[s] : 0.0;
     }
+    h.history = 0;
+    h.cleared = false;
+    h.clearCheckAt = 0;
+    for (int s = 0; s < kMaxStrings; ++s) h.sensPrev[s] = 0.0;
+    h.invMass = 1.0 / p.mass;
+    h.halfH2InvMass = 0.5 * m.h * m.h / p.mass;
+    h.feltPm1 = p.p - 1.0;
+    h.feltInvP1 = 1.0 / (p.p + 1.0);
     h.launchVelocity = velocity;
     h.kineticEnergy0 = 0.5 * p.mass * velocity * velocity;
     h.feltLoss = 0.0;
@@ -544,25 +1027,25 @@ void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m
     h.contacts = 0;
     h.inContact = false;
     h.fallbackSolves = 0;
+    h.newtonEvals = 0;
 }
 
 void stepHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, const float* in,
                 float* out, int n) noexcept {
     switch (m.strings) {
-        case 3: runHammerT<3>(h, p, m, in, out, n); break;
-        case 2: runHammerT<2>(h, p, m, in, out, n); break;
-        default: runHammerT<1>(h, p, m, in, out, n); break;
+        case 3: runT<3>(h, p, m, in, out, n); break;
+        case 2: runT<2>(h, p, m, in, out, n); break;
+        default: runT<1>(h, p, m, in, out, n); break;
     }
 }
 
 void flushHammer(HammerState& h, const HammerKeyModes& m) noexcept {
     if (!h.pending) return;
     switch (m.strings) {
-        case 3: applyForce<3>(m, h.fPend); break;
-        case 2: applyForce<2>(m, h.fPend); break;
-        default: applyForce<1>(m, h.fPend); break;
+        case 3: flushT<3>(h, m); break;
+        case 2: flushT<2>(h, m); break;
+        default: flushT<1>(h, m); break;
     }
-    h.pending = false;
 }
 
 void runHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, float* out, int n,
@@ -572,7 +1055,7 @@ void runHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, f
 }
 
 bool hammerFinished(const HammerState& h, const HammerKeyModes& m) noexcept {
-    if (h.substeps >= m.maxSubsteps) return true;
+    if (h.substeps >= m.maxSubsteps || h.cleared) return true;
     return h.lastContact >= 0 && !h.inContact && h.substeps - h.lastContact > m.releaseSubsteps;
 }
 

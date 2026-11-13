@@ -38,13 +38,35 @@
 //    safeguarded Newton per string, ignoring the off-diagonal of G) is the
 //    fallback if Newton has not converged after 12 steps; it is counted.
 //
-// Fused passes. Each substep's force is not applied in a pass of its own:
-// it is kept pending and added to the state at the start of the next
-// substep's propagation (w <- C (w + b F)), which is the same arithmetic
-// with one pass over the modes per substep instead of two. stepHammer()
-// leaves the last force pending in the HammerState between calls (the
-// engine calls it once per sample); runHammer() and flushHammer() apply it.
-// Anything that reads the key's state directly must flush first.
+// Two evaluation paths, the same scheme (exactly, up to float rounding):
+//
+//  * Sample path (R <= kMaxSampleOversampling, the table's 1, 2 and 4):
+//    one pass over the key's modes per base sample, not one per substep.
+//    Within a sample of R substeps everything the solver needs is linear in
+//    the state at the sample's start z and in the sample's forces:
+//        y_s(r) = Im(P_sr z) + sum_t sum_{q<=r} h_st[r-q] F_t(q)   (+ the input, below)
+//        z'     = C^R z + sum_{t,q} B_tq F_t(q) + wIn u
+//    with P_sr = proj_s C^(r+1), B_tq = C^(R-1-q) b_t (per mode, float) and
+//    the strike-point responses h_st[d] = sum_j Im(proj_sj C_j^d b_tj)
+//    (h_st[0] = G_st; double, per key). The pass adds the previous sample's
+//    pending forces and input (B, wIn), projects onto the R x S strike
+//    points (P), rotates by C^R and sums the free output; the scalar solver
+//    then runs the R substeps with the short convolution h, and the
+//    sample's forces stay pending for the next pass. The output is the
+//    pass's free sum plus sum gOut_tq F_t(q) + gIn u. Each mode is loaded
+//    and stored once per sample from one interleaved record per block of
+//    SIMD-width modes (B, wIn, P, C^R, wOut), instead of R times from
+//    4S + 4 separate arrays.
+//  * Substep path (any other R, e.g. the 16x reference of the convergence
+//    test, or tables without the record): one pass per substep. Each
+//    substep's force is kept pending and added to the state at the start of
+//    the next substep's propagation (w <- C (w + b F)), the same arithmetic
+//    with one pass over the modes per substep instead of two.
+//
+// stepHammer() leaves the last forces pending in the HammerState between
+// calls (the engine calls it once per sample); runHammer() and
+// flushHammer() apply them. Anything that reads the key's state directly
+// must flush first.
 //
 // Sympathetic input (soundboard loop). With m.wInRe/wInIm set and an input
 // u[k] per base sample, the key's modes also receive wIn u[k] at the end of
@@ -75,6 +97,7 @@
 
 #include <complex>
 #include <cstdint>
+#include <vector>
 
 #include "pm_base/aligned.h"
 #include "pm_string/mode_bank.h"
@@ -82,6 +105,8 @@
 namespace pm {
 
 inline constexpr int kMaxStrings = 3;
+// Largest contact oversampling handled by the sample path (see above).
+inline constexpr int kMaxSampleOversampling = 4;
 
 struct HammerParams {
     double mass = 2.97e-3;  // kg, the whole hammer
@@ -90,6 +115,15 @@ struct HammerParams {
     double mu = 0.0;        // s / m, Hunt-Crossley damping
     int strings = 1;
     double offset[kMaxStrings] = {};  // m, string s is reached when x - y_s > offset_s
+};
+
+// Per-key constants of the sample path (double; see above).
+struct SampleResponse {
+    double h[kMaxStrings][kMaxStrings][kMaxSampleOversampling] = {};  // h[s][t][d], m/N
+    double gOut[kMaxStrings][kMaxSampleOversampling] = {};  // output at the sample end per N on string t in substep q
+    double gIn = 0.0;                                      // output per unit input u
+    double gP[kMaxStrings] = {};                           // y_s at the sample end per unit input u
+    double pAbsIn[kMaxStrings] = {};  // sum (|Re p_s| + |Im p_s|)(|Re wIn| + |Im wIn|): bound of y_s per unit |u|
 };
 
 // Read-only description of one key's modes for the solver, plus pointers to
@@ -114,8 +148,12 @@ struct HammerKeyModes {
     double G[kMaxStrings][kMaxStrings] = {};  // metres per newton, see above
     double gOut[kMaxStrings] = {};  // sum wOut Im(b_s): output units per newton
     double cRes = 0.0;              // residual compliance of omitted modes, m/N
+    // Sample path: interleaved record (null: substep path) and its constants.
+    const float* rec = nullptr;
+    const SampleResponse* resp = nullptr;
     int oversampling = 1;
     double h = 0.0;                 // substep, s
+    double invH = 0.0;              // 1 / h
     std::int64_t releaseSubsteps = 0;  // out of contact this long -> finished
     std::int64_t maxSubsteps = 0;      // hard lifetime limit
 };
@@ -130,9 +168,27 @@ struct HammerState {
     double fPrev[kMaxStrings] = {};     // elastic felt force
     double dxiPrev[kMaxStrings] = {};   // last change of the felt compression
     double dxiPrev2[kMaxStrings] = {};  // the one before
+    // Newton predictor: the last free compressions (and their last two
+    // changes) and de/d(free compression) at the last solve, per string.
+    double dFreePrev[kMaxStrings] = {};
+    double dDFreePrev[kMaxStrings] = {};
+    double dDFreePrev2[kMaxStrings] = {};
+    double sensPrev[kMaxStrings] = {};
+    int history = 0;                    // touching substeps in a row (predictor history)
+    // Constants of the launch's parameters (launchHammer).
+    double invMass = 0.0, halfH2InvMass = 0.0, feltPm1 = 0.0, feltInvP1 = 0.0;
     double yPrev[kMaxStrings] = {};     // y_s
-    double fPend[kMaxStrings] = {};     // force of the last substep, not yet applied
+    double fPend[kMaxStrings] = {};     // substep path: force of the last substep, not yet applied
+    // Sample path: forces of the last sample's substeps ([s * R + q]) and its
+    // input, not yet applied.
+    float fPendS[kMaxStrings * kMaxSampleOversampling] = {};
+    float uPend = 0.0f;
+    bool pendForces = false;            // sample path: fPendS is not all zero
     bool pending = false;
+    // Sample path: the hammer has left and provably cannot reach the strings
+    // again (see hammerFinished); from then on only the modes run.
+    bool cleared = false;
+    std::int64_t clearCheckAt = 0;      // substep of the next clearance check
 
     // Statistics, from the last launch.
     double launchVelocity = 0.0;
@@ -146,6 +202,7 @@ struct HammerState {
     int contacts = 0;            // separate contact episodes (any string touching)
     bool inContact = false;
     int fallbackSolves = 0;      // substeps solved by the nested fallback
+    std::int64_t newtonEvals = 0;  // Newton evaluations (S felt forces each), for load diagnostics
 };
 
 // Per-mode contact coefficients for every key of a segmented bank, parallel
@@ -153,6 +210,11 @@ struct HammerState {
 class ContactTables {
 public:
     bool allocate(int modeCapacity, int segments) noexcept;
+
+    // Optional, before the modes of segment s are set: with R <= 
+    // kMaxSampleOversampling, setMode() then also fills the segment's
+    // sample-path record (otherwise the key uses the substep path).
+    bool beginSegment(const ModeBank& bank, int s, int strings, int oversampling) noexcept;
 
     // Mode i of the bank: complex rate lambda = -sigma + j omega (1/s), the
     // strike-point projection proj[s] and the force input input[s] (1/(N s))
@@ -172,6 +234,8 @@ public:
 
     // RT.
     HammerKeyModes view(ModeBank& bank, int s) const noexcept;
+    // Tests: views of segment s without its sample-path record.
+    HammerKeyModes substepView(ModeBank& bank, int s) const noexcept;
 
 private:
     AlignedArray<float> dSub_, sSub_;
@@ -182,8 +246,14 @@ private:
         double h = 0.0, cRes = 0.0;
         int oversampling = 1, strings = 1;
         std::int64_t release = 0, maxSteps = 0;
+        bool hasRec = false;
+        SampleResponse resp;
     };
     AlignedArray<Seg> seg_;
+    // Sample-path records, one per segment (empty: substep path), and the
+    // segment being set up by beginSegment().
+    std::vector<AlignedArray<float>> rec_;
+    int cur_ = -1, curFirst_ = 0, curCount_ = 0, curStrings_ = 1, curR_ = 1;
 };
 
 // String s displacement at the strike point, sum_j Im(proj_sj w_j).
@@ -196,6 +266,7 @@ double strikeDisplacement(const HammerKeyModes& m, int s = 0) noexcept;
 void launchHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m,
                   double velocity) noexcept;
 
+// 'p' must be the parameters the hammer was launched with.
 // Advances hammer and the key's modes by n base samples, writing the key's
 // output (sum wOut Im w after each sample, like the bank) to out[0..n).
 // 'in' (may be null) is the sympathetic input per base sample. runHammer
@@ -209,8 +280,15 @@ void stepHammer(HammerState& h, const HammerParams& p, const HammerKeyModes& m, 
 void flushHammer(HammerState& h, const HammerKeyModes& m) noexcept;
 
 // True once the hammer has been off the strings for longer than the key's
-// release time (or reached its lifetime limit): the bank may take the modes
-// back.
+// release time, or (sample path) as soon as it has left and provably cannot
+// reach them again, or it reached its lifetime limit: the bank may take the
+// modes back. The proof: with no force acting, the hammer moving away
+// (v <= 0) only recedes, and each string's strike-point displacement is
+// bounded by sum |proj_sj| |w_j| (|.| as |Re| + |Im|), which free decay and
+// the damper never increase; the bound is doubled and 1 um added as a margin
+// for the sympathetic input of the next few samples (orders of magnitude
+// smaller). Checked at most every 16 base samples while the hammer is off the
+// strings and moving away; it costs one pass over the key's modes.
 bool hammerFinished(const HammerState& h, const HammerKeyModes& m) noexcept;
 
 // Potential energy stored in one felt contact at total compression

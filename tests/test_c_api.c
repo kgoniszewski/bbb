@@ -91,6 +91,109 @@ int main(void) {
     EXPECT(st.awake_modes > 0 && st.awake_modes <= st.total_modes);
     pm_engine_destroy(eng);
     pm_engine_destroy(NULL);
+
+    /* App host (API 0.6), from C: MIDI bytes in, audio out, meters. */
+    {
+        pm_host* h = pm_host_create();
+        pm_host_load load;
+        pm_host_counters hc;
+        pm_midi_monitor_entry me;
+        const uint8_t on[3] = {0x90, 60, 100};
+        const uint32_t ump = 0x20B04000u; /* CC64 = 0 */
+        EXPECT(h != NULL);
+        pm_host_set_timebase(h, 125, 3);
+        EXPECT(pm_engine_set_param(pm_host_engine(h), PM_PARAM_SOUNDBOARD_ENABLED, 0.0) == 1);
+        EXPECT(pm_host_prepare(h, 48000.0, 256) == 1 && pm_host_is_prepared(h) == 1);
+        pm_host_midi_bytes(h, on, 3, 0, 1);
+        pm_host_midi_ump(h, &ump, 1, 0, 1);
+        EXPECT(pm_host_monitor_pop(h, &me) == 1 && me.kind == PM_MIDI_NOTE_ON && me.data1 == 60);
+        peak = 0.0f;
+        for (b = 0; b < 20; ++b) {
+            pm_host_render(h, left, right, 256, 0);
+            for (i = 0; i < 256; ++i)
+                if (fabsf(left[i]) > peak) peak = fabsf(left[i]);
+        }
+        EXPECT(peak > 0.001f);
+        pm_host_get_load(h, &load);
+        EXPECT(load.buffers == 20 && load.budget > 0.0);
+        pm_host_get_counters(h, &hc);
+        EXPECT(hc.midi_messages == 2 && hc.midi_events == 2);
+        /* Diagnostics (API 0.7). */
+        {
+            pm_host_diagnostics d;
+            pm_host_set_cpu_timing(h, 1);
+            pm_host_render(h, left, right, 100, 0);
+            pm_host_get_diagnostics(h, &d);
+            EXPECT(d.buffers == 21 && d.last_frames == 100 && d.min_frames == 100 && d.max_frames == 256);
+            EXPECT(d.distinct_frame_counts == 2 && d.sample_rate == 48000.0);
+            EXPECT(d.max_us >= d.p99_us && d.p99_us > 0.0 && d.mean_us > 0.0);
+            EXPECT(d.worst_index >= 1 && d.worst_frames > 0 && d.worst_load == d.max_load);
+            EXPECT(d.worst_hammers_active >= 0 && d.worst_sub_blocks >= 1);
+            printf("  diagnostics: mean %.1f us, p99 %.1f us, max %.1f us (%d frames, %d sub-blocks), "
+                   "cpu timing %d, stall %.1f us\n",
+                   d.mean_us, d.p99_us, d.max_us, d.worst_frames, d.worst_sub_blocks, d.cpu_timing,
+                   d.max_stall_us);
+            pm_host_reset_load(h);
+            pm_host_get_diagnostics(h, &d);
+            EXPECT(d.buffers == 0);
+        }
+        pm_host_destroy(h);
+    }
+
+    /* Build information and the offline benchmark (API 0.7). */
+    {
+        pm_bench_config bc = {0};
+        pm_bench_result br;
+        const char* info = pm_build_info();
+        EXPECT(info != NULL && info[0] != 0);
+        printf("  build: %s\n", info);
+        /* 15 scenarios (7, then 8 of live playing: 4 in API 0.8, hammer
+         * burst and pedalled chords in 0.9, fresh- and same-key bursts in
+         * 0.10) + 8 hammer keys; the 6 tier cases go before the live ones. */
+        EXPECT(pm_bench_item_count(&bc) == 23);
+        bc.flags = PM_BENCH_ALL_TIERS;
+        EXPECT(pm_bench_item_count(&bc) == 29);
+        EXPECT(pm_bench_item_name(&bc, 13)[0] == 'l'); /* legato */
+        bc.flags = PM_BENCH_NO_HAMMER;
+        EXPECT(pm_bench_item_count(&bc) == 15);
+        EXPECT(pm_bench_item_name(&bc, 15)[0] == 0);
+        EXPECT(pm_bench_item_name(&bc, 8)[0] == 'p');  /* pedalling */
+        EXPECT(pm_bench_item_name(&bc, 11)[0] == 'h'); /* hammer burst */
+        EXPECT(pm_bench_item_name(&bc, 13)[0] == 'f'); /* fresh-key burst */
+        EXPECT(pm_bench_item_name(&bc, 14)[0] == 's'); /* same-key burst */
+        EXPECT(pm_bench_item_scene(&bc, 13) == 10 && pm_bench_item_scene(&bc, 15) == -1);
+        bc.flags = 0;
+        EXPECT(pm_bench_item_name(&bc, 3)[0] == 'c');  /* cluster */
+        EXPECT(pm_bench_item_name(&bc, 18)[0] == 'h'); /* hammer, key 40 */
+        bc.hammer_strikes = 3;
+        EXPECT(pm_bench_run_item(&bc, 18, &br) == 1);
+        EXPECT(br.ok == 1 && br.kind == PM_BENCH_HAMMER && br.key == 40 && br.strings == 3 &&
+               br.oversampling == 2 && br.contact_us > 0.0 && br.life_us > 0.0);
+        bc.seconds = 0.05;
+        EXPECT(pm_bench_run_item(&bc, 6, &br) == 1); /* cluster, board off */
+        EXPECT(br.ok == 1 && br.kind == PM_BENCH_SCENARIO && br.max_us >= br.p99_us && br.p99_us > 0.0);
+        EXPECT(br.mean_load > 0.0 && fabs(br.period_us - 1e6 * 64 / 48000.0) < 1e-9);
+        printf("  bench item 6: mean %.1f us, p99 %.1f us, max %.1f us\n", br.mean_us, br.p99_us, br.max_us);
+        EXPECT(br.has_phases == 0 && br.paced == 0 && br.worst.free_group_blocks > 0);
+        {
+            char conf[4096];
+            EXPECT(pm_bench_last_config(conf, (int32_t)sizeof conf) > 100);
+        }
+        EXPECT(pm_bench_run_item(&bc, 99, &br) == 0);
+    }
+
+    /* Speed probe (API 0.9): the reference measurement on this thread. */
+    {
+        pm_speed_probe_stats ps;
+        const double med = pm_speed_probe_run_us(31, &ps);
+        printf("  speed probe on this thread: min %.2f / median %.2f / max %.2f us\n", ps.min_us, ps.median_us, ps.max_us);
+        EXPECT(ps.runs == 31 && med == ps.median_us);
+        EXPECT(ps.min_us > 0.0 && ps.min_us <= ps.median_us && ps.median_us <= ps.max_us);
+        EXPECT(ps.min_us < 1000.0 && ps.checksum != 0.0f);
+        pm_host_set_speed_probe(NULL, 1);
+        pm_host_get_speed_probe(NULL, &ps);
+        pm_host_get_worst_detail(NULL, NULL);
+    }
     printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

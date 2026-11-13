@@ -1,16 +1,8 @@
 // Engine benchmark (M4): % of one core at 48 kHz in 64-frame buffers, with
 // the soundboard coupling loop (the "board off" lines are the A/B mode).
-//
-//   worst:    all 88 keys struck (1 ms apart) and held, sustain pedal down
-//   no-cull:  the same with culling disabled (every mode of every key)
-//   typical:  a four-note chord re-struck every 0.5 s and released, pedal up
-//   cluster:  a 12-note cluster (C3..B3 plus C5..B5 alternating) struck ff
-//             every 100 ms: 12 hammers in contact at once, repeatedly
-//   bloom:    sustain pedal down, a staccato four-note chord every 0.5 s: every
-//             string free to resonate through the bridge (sympathetic case)
-//   hammer:   cost of one active hammer per 64-frame buffer, per key, while
-//             in contact and averaged over its life (contact plus release
-//             wait), measured on the solver alone
+// The scenarios live in core/pm_bench (bench.h), shared with the app's
+// Benchmark screen (C API pm_bench_*), which runs the same cases on the
+// device without the per-phase breakdown.
 //
 // Board-on cases run at the quality tier given by --tier (default full);
 // --tiers runs the pedal-down and cluster cases at every tier.
@@ -20,130 +12,69 @@
 // (those at or above p99) and the mean over all buffers, split into event
 // handling (incl. control tick, wake-ups, impulse-response cache), hammer
 // solves, the bank's free pass, the forced pass, zone kernel + board step,
-// and the rest (output, filters, cull passes). The engine is linked from its
-// profiling build (pm_engine_profile, PM_PROFILE): about 130 clock reads
-// per 64-frame buffer with the board on, 10 without, included in all times.
+// and the rest (output, filters, cull passes). The breakdown uses the
+// engine's run-time phase timing (Engine::setPhaseTiming, the same switch as
+// the app's): about five clock reads per 32-frame sub-block plus two per
+// sample while a hammer is active, included in all times. --timing off runs
+// without it (no breakdown), --timing both runs every case both ways and
+// prints the difference, which is what the timers cost.
+//
+// First line: the speed probe (pm_host/speed_probe.h) on this thread, the
+// reference the app compares its audio thread with. Then, per case, the
+// most expensive buffer's hammer and kernel detail.
+//
+// Pacing (bench.h): --paced sleeps to each buffer's real-time deadline
+// between render calls (only the render call is timed); --paced-evict N also
+// walks an N MiB scratch buffer between buffers (default 32). --compare runs
+// every case back to back, paced busy-waiting, paced sleeping, paced
+// sleeping with eviction and paced busy-waiting with eviction, and prints
+// them side by side (mean / p99 / max, the mean phase split, the speed
+// probe before the render calls). --only S
+// restricts the cases to those whose name contains S.
 //
 //   bench_engine [--seconds 3] [--block 64] [--fs 48000] [--tier full|balanced|eco] [--tiers]
+//                [--timing on|off|both] [--paced] [--paced-evict MiB] [--compare] [--only text]
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <vector>
 
-#include "pm_base/denormals.h"
-
-#include "pm_engine/engine.h"
-#include "pm_voicing/key_loader.h"
-
-namespace {
-
-using Clock = std::chrono::steady_clock;
-
-pm::Event ev(std::uint64_t t, pm::EventType type, int note, int v7) {
-    pm::Event e;
-    e.time = t;
-    e.type = type;
-    e.timeBase = pm::TimeBase::SampleTime;
-    e.note = static_cast<std::uint8_t>(note);
-    e.value = pm::value16FromMidi7(v7);
-    return e;
-}
-
-constexpr int kPhases = pm::EngineProfile::kPhases;
-
-struct Phases {
-    double us[kPhases + 1] = {};  // the engine's phases, then the rest
-    double total = 0.0;
-};
-
-struct Result {
-    double avgPercent, p99Percent, maxPercent;
-    double first100msPercent;  // average over the first 100 ms measured
-    int awakeModesEnd;
-    double meanAwakeModes;
-    Phases maxBuf, top1, all;  // per-phase breakdown
-    int maxIndex = 0, topCount = 0;
-};
-
-Phases phasesOf(const pm::EngineProfile& p) {
-    Phases r;
-    double sum = 0.0;
-    for (int i = 0; i < kPhases; ++i) {
-        r.us[i] = p.us[i];
-        sum += p.us[i];
-    }
-    r.us[kPhases] = std::max(0.0, p.totalUs - sum);
-    r.total = p.totalUs;
-    return r;
-}
-
-void accumulate(Phases& acc, const Phases& p, double w) {
-    for (int i = 0; i <= kPhases; ++i) acc.us[i] += w * p.us[i];
-    acc.total += w * p.total;
-}
-
-// Renders 'warm' seconds unmeasured, then 'seconds' measured. 'events'
-// returns the events due in [t0, t1).
-template <typename Events>
-Result run(pm::Engine& eng, double fs, int block, double warm, double seconds, Events events) {
-    std::vector<float> l(static_cast<std::size_t>(block)), r(static_cast<std::size_t>(block));
-    const int warmBlocks = static_cast<int>(warm * fs / block);
-    const int blocks = static_cast<int>(seconds * fs / block);
-    std::uint64_t t = 0;
-    auto step = [&](double* dt) {
-        for (const pm::Event& e : events(t, t + block)) eng.pushEvent(e);
-        const auto a = Clock::now();
-        eng.render(l.data(), r.data(), block, nullptr);
-        if (dt) *dt = std::chrono::duration<double>(Clock::now() - a).count();
-        t += static_cast<std::uint64_t>(block);
-    };
-    for (int b = 0; b < warmBlocks; ++b) step(nullptr);
-    Result res{};
-    const double period = block / fs;
-    const int firstBlocks = std::max(1, static_cast<int>(0.1 * fs / block));
-    std::vector<double> dts(static_cast<std::size_t>(blocks));
-    std::vector<Phases> ph(static_cast<std::size_t>(blocks));
-    double total = 0.0, first = 0.0, awake = 0.0;
-    for (int b = 0; b < blocks; ++b) {
-        step(&dts[b]);
-        ph[b] = phasesOf(eng.profile());
-        total += dts[b];
-        if (b < firstBlocks) first += dts[b];
-        awake += eng.stats().awakeModes;
-    }
-    res.meanAwakeModes = awake / blocks;
-    res.first100msPercent = 100.0 * first / (firstBlocks * period);
-    // Breakdown, ranked by the engine's own render time (the same buffers
-    // as the timing above to within the timer overhead).
-    std::vector<int> order(static_cast<std::size_t>(blocks));
-    for (int b = 0; b < blocks; ++b) order[b] = b;
-    std::sort(order.begin(), order.end(), [&](int a, int b) { return ph[a].total > ph[b].total; });
-    res.maxIndex = order[0];
-    res.maxBuf = ph[order[0]];
-    res.topCount = std::max(1, blocks - static_cast<int>(0.99 * (blocks - 1)));
-    for (int i = 0; i < res.topCount; ++i) accumulate(res.top1, ph[order[i]], 1.0 / res.topCount);
-    for (int b = 0; b < blocks; ++b) accumulate(res.all, ph[b], 1.0 / blocks);
-    std::sort(dts.begin(), dts.end());
-    res.avgPercent = 100.0 * total / (blocks * period);
-    res.p99Percent = 100.0 * dts[static_cast<std::size_t>(0.99 * (blocks - 1))] / period;
-    res.maxPercent = 100.0 * dts.back() / period;
-    res.awakeModesEnd = eng.stats().awakeModes;
-    return res;
-}
-
-}  // namespace
+#include "pm_bench/bench.h"
+#include "pm_host/speed_probe.h"
 
 int main(int argc, char** argv) {
-    double seconds = 3.0, fs = 48000.0;
-    int block = 64;
-    pm::QualityTier tier = pm::QualityTier::Full;
-    bool allTiers = false;
+    pm::bench::Config cfg;
+    int timingMode = 1;  // 0 off, 1 on, 2 both
+    bool compare = false;
+    std::string only;
     for (int i = 1; i < argc; i += 2) {
         if (!std::strcmp(argv[i], "--tiers")) {
-            allTiers = true;
+            cfg.allTiers = true;
             --i;
+            continue;
+        }
+        if (!std::strcmp(argv[i], "--paced")) {
+            cfg.paced = true;
+            --i;
+            continue;
+        }
+        if (!std::strcmp(argv[i], "--compare")) {
+            compare = true;
+            --i;
+            continue;
+        }
+        if (!std::strcmp(argv[i], "--paced-evict")) {
+            cfg.paced = true;
+            cfg.evictBytes = pm::bench::kDefaultEvictBytes;
+            if (i + 1 < argc && argv[i + 1][0] != '-') cfg.evictBytes = static_cast<std::size_t>(std::atof(argv[i + 1]) * 1048576.0);
+            else --i;
+            continue;
+        }
+        if (!std::strcmp(argv[i], "--only") && i + 1 < argc) {
+            only = argv[i + 1];
             continue;
         }
         if (i + 1 >= argc) {
@@ -152,184 +83,203 @@ int main(int argc, char** argv) {
         }
         const double v = std::atof(argv[i + 1]);
         if (!std::strcmp(argv[i], "--tier")) {
-            if (!std::strcmp(argv[i + 1], "full")) tier = pm::QualityTier::Full;
-            else if (!std::strcmp(argv[i + 1], "balanced")) tier = pm::QualityTier::Balanced;
-            else if (!std::strcmp(argv[i + 1], "eco")) tier = pm::QualityTier::Eco;
+            if (!std::strcmp(argv[i + 1], "full")) cfg.tier = pm::QualityTier::Full;
+            else if (!std::strcmp(argv[i + 1], "balanced")) cfg.tier = pm::QualityTier::Balanced;
+            else if (!std::strcmp(argv[i + 1], "eco")) cfg.tier = pm::QualityTier::Eco;
             else {
                 std::fprintf(stderr, "unknown tier %s\n", argv[i + 1]);
                 return 2;
             }
-        } else if (!std::strcmp(argv[i], "--seconds")) seconds = v;
-        else if (!std::strcmp(argv[i], "--block")) block = static_cast<int>(v);
-        else if (!std::strcmp(argv[i], "--fs")) fs = v;
+        } else if (!std::strcmp(argv[i], "--timing")) {
+            if (!std::strcmp(argv[i + 1], "on")) timingMode = 1;
+            else if (!std::strcmp(argv[i + 1], "off")) timingMode = 0;
+            else if (!std::strcmp(argv[i + 1], "both")) timingMode = 2;
+            else {
+                std::fprintf(stderr, "unknown timing mode %s\n", argv[i + 1]);
+                return 2;
+            }
+        } else if (!std::strcmp(argv[i], "--seconds")) cfg.seconds = v;
+        else if (!std::strcmp(argv[i], "--block")) cfg.block = static_cast<int>(v);
+        else if (!std::strcmp(argv[i], "--fs")) cfg.sampleRate = v;
         else {
             std::fprintf(stderr, "unknown option %s\n", argv[i]);
             return 2;
         }
     }
+    const double fs = cfg.sampleRate;
+    const int block = cfg.block;
 
-    auto allKeys = [](std::uint64_t t0, std::uint64_t t1) {
-        std::vector<pm::Event> out;
-        if (t0 == 0) out.push_back(ev(0, pm::EventType::Sustain, 0, 127));
-        for (int n = 21; n <= 108; ++n) {
-            const std::uint64_t t = static_cast<std::uint64_t>(n - 21) * 48;  // 1 ms apart
-            if (t >= t0 && t < t1) out.push_back(ev(t, pm::EventType::NoteOn, n, 110));
-        }
-        return out;
-    };
-    const std::uint64_t period = static_cast<std::uint64_t>(0.5 * fs);
-    auto chord = [period](std::uint64_t t0, std::uint64_t t1) {
-        std::vector<pm::Event> out;
-        const int notes[4] = {48, 60, 64, 67};
-        for (std::uint64_t base = (t0 / period) * period; base < t1; base += period) {
-            for (int n : notes) {
-                if (base >= t0) out.push_back(ev(base, pm::EventType::NoteOn, n, 80));
-                const std::uint64_t off = base + period * 3 / 4;
-                if (off >= t0 && off < t1) out.push_back(ev(off, pm::EventType::NoteOff, n, 64));
-            }
-        }
-        return out;
-    };
-
-    const std::uint64_t clusterPeriod = static_cast<std::uint64_t>(0.1 * fs);
-    auto cluster = [clusterPeriod](std::uint64_t t0, std::uint64_t t1) {
-        std::vector<pm::Event> out;
-        for (std::uint64_t base = (t0 / clusterPeriod) * clusterPeriod; base < t1; base += clusterPeriod) {
-            if (base < t0) continue;
-            const int first = (base / clusterPeriod) % 2 ? 72 : 48;
-            for (int n = first; n < first + 12; ++n) out.push_back(ev(base, pm::EventType::NoteOn, n, 120));
-            for (int n = first; n < first + 12; ++n)
-                out.push_back(ev(base + clusterPeriod / 2, pm::EventType::NoteOff, n, 64));
-        }
-        return out;
-    };
-
-    auto bloom = [period](std::uint64_t t0, std::uint64_t t1) {
-        std::vector<pm::Event> out;
-        if (t0 == 0) out.push_back(ev(0, pm::EventType::Sustain, 0, 127));
-        const int notes[4] = {48, 60, 64, 67};
-        for (std::uint64_t base = (t0 / period) * period; base < t1; base += period)
-            for (int n : notes) {
-                if (base >= t0) out.push_back(ev(base, pm::EventType::NoteOn, n, 90));
-                const std::uint64_t off = base + period / 5;
-                if (off >= t0 && off < t1) out.push_back(ev(off, pm::EventType::NoteOff, n, 64));
-            }
-        return out;
-    };
-
-    pm::Engine eng;
-    if (!eng.prepare(fs, block)) return 1;
+    auto eng = std::make_unique<pm::Engine>();
+    if (!eng->prepare(fs, block)) return 1;
     std::printf("engine benchmark: fs %.0f Hz, block %d, kernel %s, %.1f s measured; %d normal modes "
                 "in %d groups of %d\n",
-                fs, block, pm::simdKernelName(), seconds, eng.stats().totalModes, eng.stats().groups,
+                fs, block, pm::simdKernelName(), cfg.seconds, eng->stats().totalModes, eng->stats().groups,
                 pm::ModeBank::kGroupSize);
-    struct Case {
-        const char* name;
-        bool cull;
-        int scene;  // 0 worst, 1 typical, 2 cluster, 3 bloom
-        bool board;
-        pm::QualityTier tier;
-    };
-    std::vector<Case> cases = {Case{"worst (88 keys held, pedal)", true, 0, true, tier},
-                               Case{"worst, culling off", false, 0, true, tier},
-                               Case{"typical (4-note chord, pedal up)", true, 1, true, tier},
-                               Case{"cluster (12 notes ff every 100 ms)", true, 2, true, tier},
-                               Case{"bloom (pedal down, staccato chords)", true, 3, true, tier},
-                               Case{"worst, board off (A/B)", true, 0, false, tier},
-                               Case{"cluster, board off (A/B)", true, 2, false, tier}};
-    if (allTiers)
-        for (pm::QualityTier t : {pm::QualityTier::Balanced, pm::QualityTier::Eco}) {
-            const bool b = t == pm::QualityTier::Balanced;
-            cases.push_back(Case{b ? "worst, balanced" : "worst, eco", true, 0, true, t});
-            cases.push_back(Case{b ? "cluster, balanced" : "cluster, eco", true, 2, true, t});
-            cases.push_back(Case{b ? "bloom, balanced" : "bloom, eco", true, 3, true, t});
+    {
+        std::vector<double> t(501);
+        float sink = 0.0f;
+        for (double& x : t) {
+            float r = 0.0f;
+            x = pm::host::timeSpeedProbe(&r);
+            sink += r;
         }
+        std::sort(t.begin(), t.end());
+        std::printf("  speed probe on this thread: min %.2f / median %.2f us (checksum %g)\n", t[0], t[t.size() / 2],
+                    static_cast<double>(sink));
+    }
+    {
+        char desc[4096];
+        eng->describe(desc, sizeof desc);
+        std::printf("  engine configuration (as prepared here; the app prints its own for a diff):\n");
+        for (char* line = std::strtok(desc, "\n"); line; line = std::strtok(nullptr, "\n")) std::printf("    %s\n", line);
+    }
     const char* tierName[3] = {"full", "balanced", "eco"};
-    std::printf("  board-on cases at tier %s unless named\n", tierName[static_cast<int>(tier)]);
-    std::vector<Result> results;
-    for (const Case& c : cases) {
-        eng.setCulling(c.cull, -100.0f);
-        pm::SoundboardConfig bc;
-        bc.enabled = c.board;
-        bc.tier = c.tier;
-        eng.setSoundboardConfig(bc);
-        if (!eng.prepare(fs, block)) return 1;
-        // The worst cases are measured from the first strike, so the max
-        // includes the burst of 88 hammers (1 ms apart, pool of 32).
-        const Result r = c.scene == 0   ? run(eng, fs, block, 0.0, seconds, allKeys)
-                         : c.scene == 1 ? run(eng, fs, block, 0.5, seconds, chord)
-                         : c.scene == 2 ? run(eng, fs, block, 0.5, seconds, cluster)
-                                        : run(eng, fs, block, 0.5, seconds, bloom);
+    auto selected = [&](int i) { return only.empty() || std::string(pm::bench::caseAt(cfg, i).name).find(only) != std::string::npos; };
+    if (compare) {
+        // Back to back vs paced vs paced with eviction, phase timing on.
+        const std::size_t evict = cfg.evictBytes ? cfg.evictBytes : pm::bench::kDefaultEvictBytes;
+        std::printf("  back to back (b2b) vs paced to real-time deadlines, busy-waiting (spin) or sleeping (sleep), and\n"
+                    "  sleeping or spinning with a %.0f MiB eviction walk between buffers (evict, sp+ev); render time per\n"
+                    "  %d-frame buffer, us (period %.0f us); phase timing on\n",
+                    evict / 1048576.0, block, 1e6 * block / fs);
+        std::printf("    %-37s %-6s %8s %8s %8s %4s | %7s %7s %7s %7s %7s %7s | %6s %6s | %6s\n", "case", "mode", "mean",
+                    "p99", "max", "over", "events", "hammer", "free", "forced", "board", "other", "us/hs", "us/hc", "probe");
+        const int nCases = pm::bench::caseCount(cfg);
+        for (int i = 0; i < nCases; ++i) {
+            if (!selected(i)) continue;
+            const pm::bench::Case c = pm::bench::caseAt(cfg, i);
+            constexpr int kModes = 5;
+            static const char* const kMode[kModes] = {"b2b", "spin", "sleep", "evict", "sp+ev"};
+            pm::bench::ScenarioResult r[kModes];
+            for (int m = 0; m < kModes; ++m) {
+                pm::bench::Config run = cfg;
+                run.phaseTiming = true;
+                run.paced = m > 0;
+                run.spin = m == 1 || m == 4;
+                run.evictBytes = m >= 3 ? evict : 0;
+                run.probeEvery = 4;
+                if (!pm::bench::runScenario(run, c, *eng, r[m])) return 1;
+            }
+            for (int m = 0; m < kModes; ++m) {
+                std::printf("    %-37s %-6s %8.1f %8.1f %8.1f %4d |", m == 0 ? c.name : "", kMode[m], r[m].meanUs, r[m].p99Us,
+                            r[m].maxUs, r[m].overruns);
+                for (int p = 0; p < pm::bench::kPhaseCount; ++p) std::printf(" %7.1f", r[m].all.us[p]);
+                std::printf(" | %6.3f %6.3f | %6.2f\n", r[m].hammerUsPerSample, r[m].hammerUsPerContactSample,
+                            r[m].probeMedianUs);
+            }
+            for (int m = 1; m < kModes; ++m) {
+                std::printf("    %-37s %-6s %8.2f %8.2f %8.2f      |", "", "ratio", r[m].meanUs / r[0].meanUs,
+                            r[m].p99Us / r[0].p99Us, r[m].maxUs / r[0].maxUs);
+                for (int p = 0; p < pm::bench::kPhaseCount; ++p)
+                    std::printf(" %7.2f", r[0].all.us[p] > 0.5 ? r[m].all.us[p] / r[0].all.us[p] : 0.0);
+                std::printf(" | %13s | %6.2f  (%s / b2b)\n", "", r[0].probeMedianUs > 0 ? r[m].probeMedianUs / r[0].probeMedianUs : 0.0,
+                            kMode[m]);
+            }
+        }
+        std::printf("  (over: buffers longer than the period; us/hs: hammers phase per hammer-sample stepped, us/hc:\n"
+                    "   per hammer-sample in contact; phases are means over all buffers; probe: median of the speed\n"
+                    "   probe run right before every 4th render call, untimed, as the app's host does)\n");
+        return 0;
+    }
+    std::printf("  board-on cases at tier %s unless named; phase timing %s; %s\n", tierName[static_cast<int>(cfg.tier)],
+                timingMode == 0 ? "off" : (timingMode == 1 ? "on" : "off, then on"),
+                !cfg.paced ? "buffers back to back" : (cfg.evictBytes ? "paced to real time, eviction walk between buffers" : "paced to real time"));
+    const int nCases = pm::bench::caseCount(cfg);
+    std::vector<pm::bench::ScenarioResult> results(static_cast<std::size_t>(nCases));
+    std::vector<pm::bench::ScenarioResult> untimed(static_cast<std::size_t>(nCases));
+    for (int i = 0; i < nCases; ++i) {
+        if (!selected(i)) continue;
+        const pm::bench::Case c = pm::bench::caseAt(cfg, i);
+        pm::bench::ScenarioResult& r = results[static_cast<std::size_t>(i)];
+        if (timingMode == 2) {
+            pm::bench::Config off = cfg;
+            off.phaseTiming = false;
+            if (!pm::bench::runScenario(off, c, *eng, untimed[static_cast<std::size_t>(i)])) return 1;
+        }
+        pm::bench::Config run = cfg;
+        run.phaseTiming = timingMode != 0;
+        if (!pm::bench::runScenario(run, c, *eng, r)) return 1;
         std::printf("  %-35s %6.2f %% of one core; first 100 ms %6.2f %%; buffers p99 %6.2f %%, "
                     "max %6.2f %%; awake modes mean %5.0f, at end %5d\n",
                     c.name, r.avgPercent, r.first100msPercent, r.p99Percent, r.maxPercent,
                     r.meanAwakeModes, r.awakeModesEnd);
-        results.push_back(r);
+    }
+    if (timingMode == 2) {
+        std::printf("  phase timing off vs on, us per buffer (mean / p99 / max):\n");
+        for (int i = 0; i < nCases; ++i) {
+            if (!selected(i)) continue;
+            const pm::bench::ScenarioResult& a = untimed[static_cast<std::size_t>(i)];
+            const pm::bench::ScenarioResult& b = results[static_cast<std::size_t>(i)];
+            std::printf("    %-35s off %7.1f / %7.1f / %7.1f   on %7.1f / %7.1f / %7.1f   mean +%.1f %%\n",
+                        pm::bench::caseAt(cfg, i).name, a.meanUs, a.p99Us, a.maxUs, b.meanUs, b.p99Us, b.maxUs,
+                        a.meanUs > 0.0 ? 100.0 * (b.meanUs / a.meanUs - 1.0) : 0.0);
+        }
     }
     std::printf("  (awake modes exclude group padding; with culling on, partials more than 100 dB\n"
                 "   down are never processed. The max of a single buffer includes any preemption\n"
                 "   by the OS.)\n");
 
-    std::printf("  per-phase breakdown, us per %d-frame buffer (%.0f us = 100 %% of one core):\n"
-                "    %-35s %-14s %7s %7s %7s %7s %7s %7s %8s\n",
-                block, 1e6 * block / fs, "case", "buffers", "events", "hammer", "free", "forced", "board",
-                "other", "total");
-    for (std::size_t i = 0; i < cases.size(); ++i) {
-        const Result& r = results[i];
-        char label[3][32];
-        std::snprintf(label[0], sizeof label[0], "max (#%d)", r.maxIndex);
-        std::snprintf(label[1], sizeof label[1], "top 1%% (%d)", r.topCount);
-        std::snprintf(label[2], sizeof label[2], "mean");
-        const Phases* rows[3] = {&r.maxBuf, &r.top1, &r.all};
-        for (int j = 0; j < 3; ++j) {
-            std::printf("    %-35s %-14s", j == 0 ? cases[i].name : "", label[j]);
-            for (int p = 0; p <= kPhases; ++p) std::printf(" %7.1f", rows[j]->us[p]);
-            std::printf(" %8.1f\n", rows[j]->total);
-        }
+    std::printf("  most expensive buffer: hammers that touched a string / most at once / contact samples,\n"
+                "  Newton evaluations / fallbacks; zone kernel per buffer on average: full rebuilds, key updates\n");
+    for (int i = 0; i < nCases; ++i) {
+        if (!selected(i)) continue;
+        const pm::bench::ScenarioResult& r = results[static_cast<std::size_t>(i)];
+        const pm::bench::BufferDetail& d = r.maxDetail;
+        std::printf("    %-35s hammers %2d / %2d / %5d, Newton %6d / %d; kernel %.2f rebuilds, %.2f key updates\n",
+                    pm::bench::caseAt(cfg, i).name, d.hammersInContact, d.maxHammersInContact, d.hammerContactSamples,
+                    d.newtonEvals, d.fallbackSolves, r.kernelRebuildsPerBuffer, r.kernelKeyUpdatesPerBuffer);
     }
-    std::printf("  (events: event handling, control tick, wake-ups, impulse-response cache and kernel\n"
-                "   updates; hammer: contact solves; free: the bank's block pass (board off: the whole\n"
-                "   bank); forced: input added to the coupled modes; board: zone kernel, noise, knocks\n"
-                "   and board step; other: output, filters, limiter, cull passes, hammer release.)\n");
+    std::printf("  work counts: most expensive buffer (hammer-samples stepped / with damper on; group-blocks free /\n"
+                "  forced; loop members / listeners / kernel entries / zones read) | means per buffer (free / forced\n"
+                "  group-blocks, members, listeners) | hammers phase per hammer-sample stepped / in contact (us);\n"
+                "  hammer-samples over the run: stepped / with the damper on / in contact\n");
+    for (int i = 0; i < nCases; ++i) {
+        if (!selected(i)) continue;
+        const pm::bench::ScenarioResult& r = results[static_cast<std::size_t>(i)];
+        const pm::bench::BufferDetail& d = r.maxDetail;
+        std::printf("    %-35s %5d / %5d; %6d / %6d; %2d / %2d / %3d / %2d | %7.0f / %7.0f, %4.1f, %4.1f | %.3f / %.3f;"
+                    " %ld / %ld / %ld\n",
+                    pm::bench::caseAt(cfg, i).name, d.hammerSamples, d.hammerDampedSamples, d.freeGroupBlocks,
+                    d.forcedGroupBlocks, d.loopMembers, d.loopListeners, d.loopEntries, d.outZones,
+                    r.freeGroupBlocksPerBuffer, r.forcedGroupBlocksPerBuffer, r.loopMembersMean, r.loopListenersMean,
+                    r.hammerUsPerSample, r.hammerUsPerContactSample, r.hammerSamples, r.hammerDampedSamples,
+                    r.hammerContactSamples);
+    }
 
-    // One hammer alone, per key: median over 200 strikes at mf.
-    std::printf("  hammer solver, one hammer, us per %d-frame buffer (median of 200 mf strikes):\n", block);
-    pm::PianoTable table;
-    pm::buildPianoTable(table);
-    for (int key : {1, 16, 28, 40, 52, 64, 76, 88}) {
-        const pm::KeyParams& kp = table.keys[key - 1];
-        const pm::KeyModeSet ms = pm::computeKeyModes(kp, fs);
-        pm::ModeBank bank;
-        pm::ContactTables contact;
-        const int n = pm::keyBankModes(ms);
-        if (!bank.allocateSegments(&n, 1) || !contact.allocate(bank.capacity(), 1)) return 1;
-        pm::loadKeyModes(bank, contact, 0, kp, ms, fs);
-        bank.setSegmentDamper(0, 0.0f);
-        const pm::HammerParams hp = pm::hammerParams(kp);
-        std::vector<double> firstBuf, life;
-        std::vector<float> out(static_cast<std::size_t>(block));
-        pm::ScopedFlushDenormals ftz;
-        for (int rep = 0; rep < 200; ++rep) {
-            bank.clearState();
-            pm::HammerState hs;
-            const pm::HammerKeyModes m = contact.view(bank, 0);
-            pm::launchHammer(hs, hp, m, 2.2);
-            double tot = 0.0;
-            int b = 0;
-            while (!pm::hammerFinished(hs, m)) {
-                const auto a = Clock::now();
-                pm::runHammer(hs, hp, m, out.data(), block);
-                const double dt = std::chrono::duration<double>(Clock::now() - a).count();
-                if (b == 0) firstBuf.push_back(dt);
-                tot += dt;
-                ++b;
+    if (timingMode != 0) {
+        std::printf("  per-phase breakdown, us per %d-frame buffer (%.0f us = 100 %% of one core):\n"
+                    "    %-35s %-14s %7s %7s %7s %7s %7s %7s %8s\n",
+                    block, 1e6 * block / fs, "case", "buffers", "events", "hammer", "free", "forced", "board",
+                    "other", "total");
+        for (int i = 0; i < nCases; ++i) {
+            if (!selected(i)) continue;
+            const pm::bench::ScenarioResult& r = results[static_cast<std::size_t>(i)];
+            char label[3][32];
+            std::snprintf(label[0], sizeof label[0], "max (#%d)", r.maxIndex);
+            std::snprintf(label[1], sizeof label[1], "top 1%% (%d)", r.topCount);
+            std::snprintf(label[2], sizeof label[2], "mean");
+            const pm::bench::Phases* rows[3] = {&r.maxBuf, &r.top1, &r.all};
+            for (int j = 0; j < 3; ++j) {
+                std::printf("    %-35s %-14s", j == 0 ? pm::bench::caseAt(cfg, i).name : "", label[j]);
+                for (int p = 0; p < pm::bench::kPhaseCount; ++p) std::printf(" %7.1f", rows[j]->us[p]);
+                std::printf(" %8.1f\n", rows[j]->total);
             }
-            life.push_back(tot / b);
         }
-        std::sort(firstBuf.begin(), firstBuf.end());
-        std::sort(life.begin(), life.end());
+        std::printf("  (events: event handling, control tick, wake-ups, impulse-response cache and kernel\n"
+                    "   updates; hammer: contact solves; free: the bank's block pass (board off: the whole\n"
+                    "   bank); forced: input added to the coupled modes; board: zone kernel, noise, knocks\n"
+                    "   and board step; other: output, filters, limiter, cull passes, hammer release.)\n");
+    }
+
+    if (!only.empty()) return 0;
+    // One hammer alone, per key: median over the strikes at mf.
+    std::printf("  hammer solver, one hammer, us per %d-frame buffer (median of %d mf strikes):\n", block,
+                cfg.hammerStrikes);
+    for (int key : pm::bench::kHammerKeys) {
+        pm::bench::HammerResult h;
+        if (!pm::bench::runHammer(cfg, key, h)) return 1;
         std::printf("    key %2d (%d strings, %4d modes, R=%d): %6.1f in contact, %6.1f averaged over its life\n",
-                    key, ms.strings, ms.count, kp.contactOversampling, 1e6 * firstBuf[100], 1e6 * life[100]);
+                    h.key, h.strings, h.modes, h.oversampling, h.contactUs, h.lifeUs);
     }
     return 0;
 }
