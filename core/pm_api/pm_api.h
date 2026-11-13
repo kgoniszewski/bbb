@@ -580,9 +580,9 @@ void pm_bench_last_probe_split(pm_speed_probe_split* split);
  * until that buffer's real-time deadline, may be negative after an
  * overrun), PM_PACE_BUFFER_DONE after it (before the sleep; ns = 0) and
  * PM_PACE_END after the last buffer. Lets the app run the paced loop in the
- * scheduling class of an audio thread (time-constraint policy, an audio
- * work interval with each buffer's deadline) without platform code in the
- * engine. The hook's own time is outside the timed render call. NULL
+ * scheduling class of an audio thread (e.g. time-constraint policy; a
+ * host in C could also start a work interval with each buffer's deadline)
+ * without platform code in the engine. The hook's own time is outside the timed render call. NULL
  * removes it. Per thread. */
 enum pm_pace_event {
     PM_PACE_BEGIN = 0,

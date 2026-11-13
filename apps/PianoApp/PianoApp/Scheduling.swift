@@ -10,21 +10,20 @@
 // empirically (an efficiency core is several times slower on the
 // throughput-bound part).
 //
-// PacedRealtime: puts the benchmark's paced loop into the scheduling class
-// of an audio I/O thread (pm_bench_set_pace_hook): Mach time-constraint
-// policy with the buffer period, and an audio work interval
-// (AudioWorkIntervalCreate) joined by the thread, started with each buffer's
-// deadline and finished after its render call, so that the performance
-// controller sees deadlines as it does for the real I/O thread. Only for the
-// paced loop: the engine's prepare (about a second of CPU) and back-to-back
-// runs stay at the thread's normal QoS, since a real-time thread that
-// computes far beyond its declared computation time is demoted by the
-// kernel.
-import AudioToolbox
+// PacedRealtime: puts the benchmark's paced loop on the Mach time-constraint
+// (real-time) thread policy with the buffer period (pm_bench_set_pace_hook),
+// restored to the standard policy after the loop. There is NO workgroup or
+// work-interval deadline: the os_workgroup C API and AudioWorkIntervalCreate
+// are not importable from Swift, so the performance controller does not see
+// per-buffer deadlines as it does for the real audio I/O thread (which runs
+// in the output device's workgroup). Only "Run all on audio thread" measures
+// the I/O thread's real scheduling. Only for the paced loop: the engine's
+// prepare (about a second of CPU) and back-to-back runs stay at the thread's
+// normal QoS, since a real-time thread that computes far beyond its declared
+// computation time is demoted by the kernel.
 import Darwin
 import Foundation
 import PianoCore
-import os
 
 struct CoreLayout {
     struct Level {
@@ -114,7 +113,7 @@ struct CoreLayout {
         for (cpu, n) in buffers.enumerated() where n > 0 {
             perCpu.append(String(format: "%@ %.0f %%", label(cpu), 100.0 * Double(n) / total))
             let key = level(of: cpu)?.letter ?? "?"
-            let acc = byLevel[key] ?? (0, 0)
+            let acc: (n: Double, us: Double) = byLevel[key] ?? (n: 0, us: 0)
             byLevel[key] = (acc.n + Double(n), acc.us + Double(n) * meanUs[cpu])
         }
         var line = indent + "render calls by CPU (core types assumed: lowest CPU numbers = slowest cores): "
@@ -165,24 +164,20 @@ func probeSplitText(_ s: pm_speed_probe_split, reference r: pm_speed_probe_split
     return out
 }
 
-/// Runs the benchmark's paced loop in an audio thread's scheduling class
-/// (see the file comment). Install on the benchmark thread before running
-/// items; every paced item then calls back here. Not thread-safe: one
-/// benchmark thread.
+/// Runs the benchmark's paced loop on a time-constraint thread policy (see
+/// the file comment). Install on the benchmark thread before running items;
+/// every paced item then calls back here. Not thread-safe: one benchmark
+/// thread.
 final class PacedRealtime {
     /// What happened, for the benchmark header (main thread reads it after the run).
     private(set) var notes: [String] = []
-    private var interval: os_workgroup_interval_t?
-    private var token = os_workgroup_join_token_s()
-    private var joined = false
     private var realtime = false
-    private var startFailures = 0
     private let numer: UInt32
     private let denom: UInt32
 
     init() {
         var tb = mach_timebase_info_data_t()
-        mach_timebase_info(&tb)
+        _ = mach_timebase_info(&tb)
         numer = tb.numer == 0 ? 1 : tb.numer
         denom = tb.denom == 0 ? 1 : tb.denom
     }
@@ -195,76 +190,61 @@ final class PacedRealtime {
         pm_bench_set_pace_hook(nil, nil)
     }
 
-    private static let hook: pm_pace_hook = { ctx, event, ns in
+    // A C function pointer: must not capture anything; the instance comes
+    // back through ctx.
+    private static let hook: pm_pace_hook = { (ctx: UnsafeMutableRawPointer?, event: Int32, ns: Int64) -> Void in
         guard let ctx = ctx else { return }
-        Unmanaged<PacedRealtime>.fromOpaque(ctx).takeUnretainedValue().handle(event: event, ns: ns)
-    }
-
-    private func ticks(ns: Double) -> UInt64 {
-        return UInt64(max(0, ns) * Double(denom) / Double(numer))
-    }
-
-    private func handle(event: Int32, ns: Int64) {
-        switch event {
-        case Int32(PM_PACE_BEGIN.rawValue):
-            begin(periodNs: ns)
-        case Int32(PM_PACE_BUFFER.rawValue):
-            if joined, let wg = interval {
-                let now = mach_absolute_time()
-                if os_workgroup_interval_start(wg, now, now + ticks(ns: Double(ns)), nil) != 0 { startFailures += 1 }
-            }
-        case Int32(PM_PACE_BUFFER_DONE.rawValue):
-            if joined, let wg = interval { _ = os_workgroup_interval_finish(wg, nil) }
-        case Int32(PM_PACE_END.rawValue):
-            end()
-        default:
-            break
+        let me = Unmanaged<PacedRealtime>.fromOpaque(ctx).takeUnretainedValue()
+        if event == Int32(PM_PACE_BEGIN.rawValue) {
+            me.begin(periodNs: ns)
+        } else if event == Int32(PM_PACE_END.rawValue) {
+            me.end()
         }
+        // PM_PACE_BUFFER / PM_PACE_BUFFER_DONE: nothing (no work interval).
+    }
+
+    private func ticks(ns: Double) -> UInt32 {
+        let t = max(0, ns) * Double(denom) / Double(numer)
+        return t >= Double(UInt32.max) ? UInt32.max : UInt32(t)
     }
 
     private func begin(periodNs: Int64) {
-        startFailures = 0
         let period = Double(periodNs)
         // Computation half the period, constraint the period: the shape of
         // an audio I/O thread's policy.
-        var policy = thread_time_constraint_policy_data_t(
-            period: UInt32(clamping: ticks(ns: period)),
-            computation: UInt32(clamping: ticks(ns: 0.5 * period)),
-            constraint: UInt32(clamping: ticks(ns: period)),
-            preemptible: 1)
+        var policy = thread_time_constraint_policy_data_t()
+        policy.period = ticks(ns: period)
+        policy.computation = ticks(ns: 0.5 * period)
+        policy.constraint = ticks(ns: period)
+        policy.preemptible = 1
+        // THREAD_TIME_CONSTRAINT_POLICY_COUNT is a macro Swift does not import.
         let count = mach_msg_type_number_t(MemoryLayout<thread_time_constraint_policy_data_t>.size / MemoryLayout<integer_t>.size)
-        let kr = withUnsafeMutablePointer(to: &policy) { p in
+        let thread: thread_act_t = pthread_mach_thread_np(pthread_self())
+        let kr: kern_return_t = withUnsafeMutablePointer(to: &policy) { p in
             p.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { q in
-                thread_policy_set(pthread_mach_thread_np(pthread_self()), thread_policy_flavor_t(THREAD_TIME_CONSTRAINT_POLICY), q, count)
+                thread_policy_set(thread, thread_policy_flavor_t(THREAD_TIME_CONSTRAINT_POLICY), q, count)
             }
         }
         realtime = kr == KERN_SUCCESS
-        if !realtime { note("time-constraint policy refused (kern_return \(kr))") }
-        if interval == nil {
-            let wg: os_workgroup_interval_t? = AudioWorkIntervalCreate("piano.benchmark.paced", OS_CLOCK_MACH_ABSOLUTE_TIME, nil)
-            interval = wg
-            if wg == nil { note("AudioWorkIntervalCreate returned nil") }
+        if realtime {
+            note("paced loop on a time-constraint thread policy (no workgroup deadline)")
+        } else {
+            note("time-constraint policy refused (kern_return \(kr))")
         }
-        if let wg = interval {
-            let err = os_workgroup_join(wg, &token)
-            joined = err == 0
-            if !joined { note("joining the audio work interval failed (errno \(err))") }
-        }
-        if realtime && joined { note("paced loop on a time-constraint thread in its own audio work interval") }
     }
 
     private func end() {
-        if joined, let wg = interval {
-            os_workgroup_leave(wg, &token)
-            joined = false
+        guard realtime else { return }
+        realtime = false
+        var standard = thread_standard_policy_data_t()
+        let thread: thread_act_t = pthread_mach_thread_np(pthread_self())
+        // THREAD_STANDARD_POLICY_COUNT is 0: the policy has no parameters.
+        let kr: kern_return_t = withUnsafeMutablePointer(to: &standard) { p in
+            p.withMemoryRebound(to: integer_t.self, capacity: 1) { q in
+                thread_policy_set(thread, thread_policy_flavor_t(THREAD_STANDARD_POLICY), q, 0)
+            }
         }
-        if startFailures > 0 { note("\(startFailures) work-interval starts failed") }
-        if realtime {
-            var none: integer_t = 0
-            let kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), thread_policy_flavor_t(THREAD_STANDARD_POLICY), &none, 0)
-            if kr != KERN_SUCCESS { note("returning to the standard policy failed (kern_return \(kr))") }
-            realtime = false
-        }
+        if kr != KERN_SUCCESS { note("returning to the standard policy failed (kern_return \(kr))") }
     }
 
     private func note(_ s: String) {

@@ -166,9 +166,9 @@ final class AppModel: ObservableObject {
     @Published var benchEvict = false
     /// Phase timing during the scenarios (the live meter's phase split uses it too).
     @Published var benchPhases = true
-    /// Paced runs in an audio thread's scheduling class: time-constraint
-    /// policy and an audio work interval with each buffer's deadline
-    /// (PacedRealtime). Off: the benchmark thread's normal QoS (userInteractive).
+    /// Paced runs on the Mach time-constraint (real-time) thread policy
+    /// (PacedRealtime), without a workgroup deadline (not available from
+    /// Swift). Off: the benchmark thread's normal QoS (userInteractive).
     @Published var benchRealtime = true
     /// Scenario run on the audio thread ("Run on audio thread"), an index into sceneNames.
     @Published var sceneItem = 0
@@ -681,7 +681,7 @@ final class AppModel: ObservableObject {
         benchHeader += "benchmark thread: a dedicated thread at QoS userInteractive"
         if benchPaced || benchEvict {
             benchHeader += benchRealtime
-                ? "; paced loop on a time-constraint (real-time) policy in its own audio work interval with each buffer's deadline, as an audio I/O thread"
+                ? "; paced loop on a time-constraint (real-time) thread policy, but without a workgroup deadline (NOT the audio I/O thread's scheduling: no per-buffer deadlines reach the performance controller)"
                 : "; paced loop at that QoS (NOT an audio thread's scheduling class: no real-time policy, no workgroup deadlines)"
         }
         benchHeader += ". Audio-thread rows: the real Core Audio I/O thread (real-time, in the output device's workgroup).\n"

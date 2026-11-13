@@ -735,17 +735,18 @@ now), on the clipboard.
 Switches: **Paced** sleeps to each buffer's real-time deadline between
 render calls, as an audio thread waits for its callback (only the render
 call is timed); **Evict** also walks 32 MiB between buffers (other work on
-the core); **Real-time paced** (on by default) runs the paced loop in an
-audio I/O thread's scheduling class: Mach time-constraint policy (period
-the buffer, computation half of it) and an audio work interval
-(`AudioWorkIntervalCreate`) joined by the thread, started with each
-buffer's deadline before the render call and finished after it, through
-the C API's pacing hook (`pm_bench_set_pace_hook`); the thread returns to
-the standard policy after the paced loop (the engine's prepare runs
-outside it). Without it the paced loop runs at the thread's QoS, which is
-not an audio thread's class at all, so its numbers say nothing about the
-audio thread. Even with it the thread is not the I/O thread (not in the
-output device's workgroup); only the audio-thread rows measure playing; **Phases** (on by default) runs with phase timing, and each
+the core); **Real-time paced** (on by default) runs the paced loop on the
+Mach time-constraint (real-time) thread policy (period the buffer,
+computation half of it), set and cleared through the C API's pacing hook
+(`pm_bench_set_pace_hook`); the thread returns to the standard policy
+after the paced loop (the engine's prepare runs outside it). There is no
+workgroup deadline: the `os_workgroup` C API and `AudioWorkIntervalCreate`
+cannot be used from Swift, so unlike the audio I/O thread (which Core
+Audio runs in the output device's workgroup with each cycle's deadline)
+the performance controller sees no per-buffer deadlines. Without the
+switch the paced loop runs at the thread's QoS, not a real-time class at
+all. Either way only the audio-thread rows ("Run all on audio thread")
+reflect the real I/O thread's scheduling and measure playing; **Phases** (on by default) runs with phase timing, and each
 scenario row is then followed by its phase split (mean, top 1 %, most
 expensive buffer) and its work counts (per buffer: awake modes, free and
 forced group-blocks, loop members and listeners, zone-kernel rebuilds and
