@@ -28,8 +28,8 @@ final class AudioController {
         var running = false
         var preparing = false
         var message = "Starting"
-        /// macOS: what was asked of the output device and its answer
-        /// (supported range, errors); empty where the system decides (iOS).
+        /// What was asked of the output device (macOS) or the audio session
+        /// (iOS) and what was granted (supported range, errors).
         var ioRequest = ""
     }
 
@@ -187,6 +187,25 @@ final class AudioController {
         } catch {
             status.message = "Audio session activation failed: \(error.localizedDescription)"
         }
+        // Some routes apply the I/O buffer preference only to an active
+        // session: ask once more if the grant is larger, then record what
+        // was asked and granted (the diagnostics show it).
+        let wantDuration = Double(AudioController.preferredFrames) / AudioController.preferredSampleRate
+        var notes: [String] = []
+        if session.ioBufferDuration > wantDuration * 1.05 {
+            do {
+                try session.setPreferredIOBufferDuration(wantDuration)
+            } catch {
+                notes.append("buffer preference refused: \(error.localizedDescription)")
+            }
+        }
+        var request = String(format: "requested %.0f Hz / %d frames (%.2f ms); granted %.0f Hz / %.0f frames (%.2f ms)",
+                             AudioController.preferredSampleRate, AudioController.preferredFrames, wantDuration * 1000,
+                             session.sampleRate, (session.ioBufferDuration * session.sampleRate).rounded(),
+                             session.ioBufferDuration * 1000)
+        if ProcessInfo.processInfo.isiOSAppOnMac { request += "; an iPad app on a Mac gets the Mac output device's settings" }
+        if !notes.isEmpty { request += "; " + notes.joined(separator: "; ") }
+        status.ioRequest = request
         #endif
     }
 

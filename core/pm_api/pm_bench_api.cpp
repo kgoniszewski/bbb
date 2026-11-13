@@ -23,12 +23,21 @@ pm::bench::Config toConfig(const pm_bench_config* c) {
     k.phaseTiming = (c->flags & PM_BENCH_PHASE_TIMING) != 0;
     k.paced = (c->flags & (PM_BENCH_PACED | PM_BENCH_PACED_EVICT)) != 0;
     k.evictBytes = (c->flags & PM_BENCH_PACED_EVICT) != 0 ? pm::bench::kDefaultEvictBytes : 0;
+    k.probeEvery = (c->flags & PM_BENCH_SPEED_PROBE) != 0 ? 8 : 0;
     return k;
 }
 
 // The last scenario's engine configuration, per thread (the app runs the
 // benchmark on one background thread).
 thread_local char tLastConfig[4096] = {};
+thread_local pm::host::CpuUsage tLastCpu;
+thread_local pm_speed_probe_split tLastProbe = {};
+thread_local pm_pace_hook tPaceHook = nullptr;
+thread_local void* tPaceCtx = nullptr;
+
+void callPaceHook(void* ctx, int event, std::int64_t ns) {
+    if (tPaceHook) tPaceHook(ctx, static_cast<int32_t>(event), static_cast<int64_t>(ns));
+}
 
 bool withHammer(const pm_bench_config* c) { return !c || (c->flags & PM_BENCH_NO_HAMMER) == 0; }
 
@@ -61,7 +70,17 @@ int pm_bench_run_item(const pm_bench_config* config, int32_t index, pm_bench_res
         std::unique_ptr<pm::Engine> eng(new (std::nothrow) pm::Engine);
         if (!eng) return 0;
         pm::bench::ScenarioResult r;
-        if (!pm::bench::runScenario(k, pm::bench::caseAt(k, index), *eng, r)) return 0;
+        pm::bench::Config run = k;
+        if (tPaceHook) {
+            run.paceHook = callPaceHook;
+            run.paceCtx = tPaceCtx;
+        }
+        tLastCpu = pm::host::CpuUsage{};
+        tLastProbe = pm_speed_probe_split{};
+        if (!pm::bench::runScenario(run, pm::bench::caseAt(k, index), *eng, r)) return 0;
+        tLastCpu = r.cpu;
+        pm::bench::toProbeSeries(r.probeLatency, tLastProbe.latency);
+        pm::bench::toProbeSeries(r.probeThroughput, tLastProbe.throughput);
         result->mean_us = r.meanUs;
         result->p99_us = r.p99Us;
         result->max_us = r.maxUs;
@@ -118,6 +137,19 @@ int32_t pm_bench_last_config(char* buffer, int32_t size) {
     }
     buffer[n] = 0;
     return n;
+}
+
+void pm_bench_last_cpu_usage(pm_cpu_usage* usage) {
+    if (usage) pm::bench::toCpuUsage(tLastCpu, *usage);
+}
+
+void pm_bench_last_probe_split(pm_speed_probe_split* split) {
+    if (split) *split = tLastProbe;
+}
+
+void pm_bench_set_pace_hook(pm_pace_hook hook, void* ctx) {
+    tPaceHook = hook;
+    tPaceCtx = hook ? ctx : nullptr;
 }
 
 int32_t pm_bench_item_scene(const pm_bench_config* config, int32_t index) {

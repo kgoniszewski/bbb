@@ -17,7 +17,7 @@ by a one-sample run-time loop (sympathetic resonance, pedal bloom),
 continuous half-pedalling, hammer-knock and damper-lift noise hooks, and a
 placeholder two-pickup output, and the app half of M2: a portable host
 layer (MIDI 1.0 / UMP parsing, event queues from the MIDI and UI threads,
-a prepare gate, a render-load meter with diagnostics and a speed probe, benchmark scenes on the audio thread; `core/pm_host`, C API 0.10), an
+a prepare gate, a render-load meter with diagnostics and a speed probe, benchmark scenes on the audio thread, per-CPU render statistics; `core/pm_host`, C API 0.11), an
 offline benchmark library shared by `bench_engine` and the app (`core/pm_bench`), a Swift
 package exposing the C API, and a SwiftUI app for iPad and Mac (see
 [iPad app](#ipad-app); not yet built by anyone, see its checklist). There
@@ -36,7 +36,7 @@ duplex yet.
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
 | `core/pm_bench/` | Non-real-time: the engine benchmark scenarios (worst, typical, cluster, bloom, board-off A/Bs, then the live-playing scenes legato, pedalling, chord release, idle, hammer burst, pedalled chords and the fresh- and same-key bursts, and the hammer per key; back to back or paced to real time), shared by `bench_engine` and the app's Benchmark screen |
-| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, (0.6) the app host `pm_host_*`, (0.7) load diagnostics, build information and the offline benchmark `pm_bench_*`, (0.8) phase timing and the worst buffer's events, (0.9) the worst buffer's hammer and zone-kernel detail, the speed probe and `PM_BENCH_PHASE_TIMING`, (0.10) paced benchmark runs, per-buffer work counts (`pm_work_detail`), the effective engine configuration (`pm_engine_describe`) and benchmark scenes played on the audio thread (`pm_host_scene_*`); `include/` holds the Swift module map |
+| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, (0.6) the app host `pm_host_*`, (0.7) load diagnostics, build information and the offline benchmark `pm_bench_*`, (0.8) phase timing and the worst buffer's events, (0.9) the worst buffer's hammer and zone-kernel detail, the speed probe and `PM_BENCH_PHASE_TIMING`, (0.10) paced benchmark runs, per-buffer work counts (`pm_work_detail`), the effective engine configuration (`pm_engine_describe`) and benchmark scenes played on the audio thread (`pm_host_scene_*`), (0.11) the speed probe's latency- and throughput-bound parts, per-CPU render statistics (`pm_cpu_usage`) and the paced benchmark's pacing hook; `include/` holds the Swift module map |
 | `Package.swift` | Swift package `PianoEngine`, library `PianoCore` (the C++ core, imported in Swift through the C API) |
 | `apps/PianoApp/` | SwiftUI app (iPadOS 17+, macOS 14+): XcodeGen spec `project.yml`, sources, and the package's Swift smoke test |
 | `tools/render_cli/` | Offline renderer: one plucked string to a mono WAV, or a text score through the engine to a stereo WAV |
@@ -430,7 +430,9 @@ SIMD kernel and where the hot arrays fall modulo 16 KiB) is printed at the
 top, for a diff against the app's.
 
 The first line is the speed probe on the benchmark thread (see the Play
-screen's Speed probe toggle). Before the breakdown, per case, the most
+screen's Speed probe toggle), with its latency-bound and throughput-bound
+parts and the CPU the thread is on; `--compare` rows add the parts and
+how many CPUs the render calls ran on. Before the breakdown, per case, the most
 expensive buffer's hammer work (hammers that touched a string, the most
 at once, hammer-samples in contact, contact-solver Newton evaluations and
 fallbacks) and the zone-kernel full rebuilds and in-place key updates per
@@ -439,9 +441,12 @@ buffer.
 The scenarios live in `core/pm_bench` (`bench.h`) and are also reachable
 through the C API (`pm_bench_item_count`, `pm_bench_item_name`,
 `pm_bench_run_item`; flag `PM_BENCH_PHASE_TIMING` runs them with phase
-timing on, `PM_BENCH_PACED` / `PM_BENCH_PACED_EVICT` paced; the result
+timing on, `PM_BENCH_PACED` / `PM_BENCH_PACED_EVICT` paced,
+`PM_BENCH_SPEED_PROBE` with the probe before every 8th buffer; the result
 carries the phase splits and work counts, `pm_bench_last_config` the
-engine configuration): the app's Benchmark tab runs exactly these cases on
+engine configuration, `pm_bench_last_cpu_usage` / `_probe_split` the CPUs
+and probe parts, and `pm_bench_set_pace_hook` lets the caller run the
+paced loop in another scheduling class): the app's Benchmark tab runs exactly these cases on
 the device. `pm_host_scene_start` plays a case's events through the real
 host and audio render path instead (see the Benchmark screen below).
 
@@ -649,15 +654,29 @@ Below the bars (C API `pm_host_get_diagnostics`):
   for the worst buffer, the top 1 % and the mean. Turning it on resets
   the meter so that all of them are timed.
 - **Speed probe** (toggle, off by default): every 8th render call first
-  runs a small fixed workload (`core/pm_host/speed_probe.h`: SIMD one-pole
-  modes and a scalar Newton chain, a few µs on a fast core, no
-  allocation) on the audio thread and records its time. Copy diagnostics
-  compares it with the same workload on the benchmark thread (from the
-  last Benchmark run; without one, on the main thread at the moment of
-  copying) and states the speed the audio thread ran at, e.g. "0.32x
-  (mean)". Below 1 the audio thread ran on a slower core or at a lower
-  clock than the benchmark: its "% of buffer" then overstates the work,
-  and the benchmark is the measure of headroom.
+  runs a small fixed workload (`core/pm_host/speed_probe.h`, about 15 µs on
+  the x86 container, less on a fast Apple core; 16 KiB of stack, no
+  allocation) on the audio thread and records its time, in two parts
+  (API 0.11): latency-bound (a dependent scalar sqrt/divide chain and a
+  dependent vector multiply-add chain) and throughput-bound (the mode-bank
+  kernel's shape: 1024 complex one-pole modes, many independent vector
+  operations in flight). Copy diagnostics compares both with the same
+  workload on the benchmark thread (from the last Benchmark run; without
+  one, on the main thread at the moment of copying) and states the speed
+  the audio thread ran at, e.g. "latency 0.80x, throughput 0.30x". An
+  efficiency core or a low clock costs the throughput part (and the
+  engine's inner loops) far more than the latency part; the API 0.9-0.10
+  probe was mostly latency-bound and so could not see it.
+- **CPU numbers** (API 0.11; recorded while phase timing, thread CPU time
+  or the speed probe is on: two reads of a per-CPU register value per
+  render call, `core/pm_host/cpu_id.h`): which logical CPU each render
+  call started and ended on. Copy diagnostics lists the share of render
+  calls and their mean render time per CPU and per core type, the calls
+  that migrated mid-buffer, the worst buffer's CPUs, and the speed probe's
+  parts per CPU. The core types come from `sysctl` (hw.nperflevels,
+  hw.perflevelN.name / .logicalcpu), but which CPU numbers belong to which
+  type is an assumption (the slowest cores have the lowest numbers, as on
+  every Apple silicon chip so far); the per-CPU probe times check it.
 - **Process CPU** (once a second, main thread): the whole app's CPU over
   the last second in % of one core, split into the audio render (from the
   meter), the main thread (UI) and the other threads (Core MIDI, system
@@ -688,7 +707,8 @@ hammer work (hammers that touched a string, the most at once,
 hammer-samples in contact, Newton evaluations, fallbacks), its work counts
 (API 0.10: hammer-samples stepped and with the damper on, free and forced
 group-blocks, loop members, listeners, zone-kernel entries and zones),
-the phase split when timed, the speed probe, the engine's effective
+the phase split when timed, the speed probe and its parts, the core
+layout and the render calls per CPU, the engine's effective
 configuration (for a diff against the benchmark's), the UI cost test mode, the build
 information (SIMD kernel, optimisation, NDEBUG, compiler), device, thermal
 state and audio route.
@@ -700,11 +720,14 @@ the device at 48 kHz in 64-frame buffers (or, with "512 frames at 44.1
 kHz", at what an iPad app on a Mac is granted), at the selected quality
 tier ("All tiers" adds Balanced and Eco): render time per buffer (mean, p99,
 max, in µs and %) per case, then one hammer alone per key. The first line
-is the speed probe on the benchmark thread, which Copy diagnostics uses
-as the reference for the audio thread's probe. Audio output is
-paused for the run (about a minute; each case prepares its own engine) so
-that the numbers are the engine's alone, then resumes by itself. The run
-is on a background thread of QoS user-interactive. Copy puts the table,
+is the speed probe on the benchmark thread (whole, and its two parts),
+which Copy diagnostics and the audio-thread rows use as the reference.
+Audio output is paused for the run (about a minute; each case prepares its
+own engine) so that the numbers are the engine's alone, then resumes by
+itself. The run is on a dedicated thread of QoS user-interactive. Every
+scenario row lists the CPUs its render calls ran on (as in Copy
+diagnostics), and with the Diagnostics speed probe on, the probe's parts
+run before every 8th buffer against the back-to-back reference. Copy puts the table,
 with the build and device information and the engine configurations (the
 benchmark's last scenario, the last audio-thread run, the app's engine
 now), on the clipboard.
@@ -712,7 +735,17 @@ now), on the clipboard.
 Switches: **Paced** sleeps to each buffer's real-time deadline between
 render calls, as an audio thread waits for its callback (only the render
 call is timed); **Evict** also walks 32 MiB between buffers (other work on
-the core); **Phases** (on by default) runs with phase timing, and each
+the core); **Real-time paced** (on by default) runs the paced loop in an
+audio I/O thread's scheduling class: Mach time-constraint policy (period
+the buffer, computation half of it) and an audio work interval
+(`AudioWorkIntervalCreate`) joined by the thread, started with each
+buffer's deadline before the render call and finished after it, through
+the C API's pacing hook (`pm_bench_set_pace_hook`); the thread returns to
+the standard policy after the paced loop (the engine's prepare runs
+outside it). Without it the paced loop runs at the thread's QoS, which is
+not an audio thread's class at all, so its numbers say nothing about the
+audio thread. Even with it the thread is not the I/O thread (not in the
+output device's workgroup); only the audio-thread rows measure playing; **Phases** (on by default) runs with phase timing, and each
 scenario row is then followed by its phase split (mean, top 1 %, most
 expensive buffer) and its work counts (per buffer: awake modes, free and
 forced group-blocks, loop members and listeners, zone-kernel rebuilds and
@@ -740,13 +773,16 @@ resumes afterwards). The same material can so be measured four ways:
 back to back and paced on the benchmark thread, and on the audio thread
 with the app's engine and with a benchmark engine; which of these differ
 tells the thread (scheduling, core, clock) from the engine instance and
-from the material.
+from the material. **Run all on audio thread** plays every scene in the
+list in turn (one row each, the same format; Cancel stops the series),
+so that a full table on the audio thread takes one tap; a header line
+before the rows gives the I/O configuration and engine.
 
-What to send back from a device: the Benchmark table (Copy), at both
-buffer settings, back to back and paced, with "Run on audio thread" rows
-for pedalled chords and the fresh-key burst (app engine and benchmark
-engine) appended, and Copy diagnostics with Phase timing and Speed probe
-on (after a Benchmark run, for the reference) after (a) a
+What to send back from a device: the Benchmark table (Copy), with the
+Speed probe and Phases on, at both buffer settings, back to back and
+paced (Real-time paced on, and once off), with "Run all on audio thread"
+rows (benchmark engine) appended, and Copy diagnostics with Phase timing
+and Speed probe on (after a Benchmark run, for the reference) after (a) a
 minute of normal playing, (b) Reset, then ten notes hard together and
 released together a few times, (c) Reset, then chords with the sustain
 pedal pressed and released, and (d) Reset, then a minute with nothing

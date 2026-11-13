@@ -356,19 +356,34 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     const auto periodDur = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(block / fs));
     Clock::time_point deadline = Clock::now();
     unsigned evictSink = 0;
-    std::vector<double> probes;
+    std::vector<double> probes, probeLat, probeThr;
     int stepCount = 0;
+    const bool hook = c.paced && c.paceHook;
+    int cpu0 = -1, cpu1 = -1;
     auto step = [&](double* dt) {
         const std::uint64_t t1 = t + static_cast<std::uint64_t>(block);
         for (; next < events.size() && events[next].time < t1; ++next) eng.pushEvent(events[next]);
         if (dt && c.probeEvery > 0 && ++stepCount % c.probeEvery == 0) {
             float sink = 0.0f;
-            probes.push_back(host::timeSpeedProbe(&sink));
+            const int cpu = host::currentCpu();
+            const host::ProbeTimes pt = host::timeSpeedProbeSplit(&sink);
+            probes.push_back(pt.totalUs());
+            probeLat.push_back(pt.latencyUs);
+            probeThr.push_back(pt.throughputUs);
+            res.cpu.addProbe(cpu, pt.latencyUs, pt.throughputUs);
             gEvictSink = gEvictSink + static_cast<unsigned>(sink > 0.0f);
         }
+        if (hook)
+            c.paceHook(c.paceCtx, 1,
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(deadline + periodDur - Clock::now()).count());
+        if (dt) cpu0 = host::currentCpu();
         const auto a = Clock::now();
         eng.render(l.data(), r.data(), block, nullptr);
-        if (dt) *dt = std::chrono::duration<double>(Clock::now() - a).count();
+        if (dt) {
+            *dt = std::chrono::duration<double>(Clock::now() - a).count();
+            cpu1 = host::currentCpu();
+        }
+        if (hook) c.paceHook(c.paceCtx, 2, 0);
         t += static_cast<std::uint64_t>(block);
         if (c.paced) {
             // Other work on this core between buffers: one read-modify-write
@@ -381,6 +396,10 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
                 std::this_thread::sleep_until(deadline);
         }
     };
+    if (hook) {
+        c.paceHook(c.paceCtx, 0, std::chrono::duration_cast<std::chrono::nanoseconds>(periodDur).count());
+        deadline = Clock::now();  // the hook may take a while (thread policy, workgroup join)
+    }
     for (int b = 0; b < warmBlocks; ++b) step(nullptr);
     const double period = block / fs;
     res.periodUs = 1e6 * period;
@@ -393,6 +412,7 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     double freeBlocks = 0.0, forcedBlocks = 0.0, members = 0.0, listeners = 0.0;
     for (int b = 0; b < blocks; ++b) {
         step(&dts[b]);
+        res.cpu.addBuffer(cpu0, cpu1, 1e6 * dts[b]);
         if (dts[b] > period) ++res.overruns;
         if (timing) ph[b] = phasesOf(eng.profile());
         else ph[b].total = 1e6 * dts[b];
@@ -410,6 +430,8 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         if (dts[b] > worstDt) {
             worstDt = dts[b];
             res.maxDetail = detailOf(info);
+            res.cpu.worstStart = cpu0;
+            res.cpu.worstEnd = cpu1;
         }
         total += dts[b];
         if (b < firstBlocks) first += dts[b];
@@ -424,6 +446,7 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     if (res.hammerContactSamples > 0)
         res.hammerUsPerContactSample = res.hammerPhaseUs / static_cast<double>(res.hammerContactSamples);
     gEvictSink = evictSink;  // keeps the eviction walk observable
+    if (hook) c.paceHook(c.paceCtx, 3, 0);
     if (!probes.empty()) {
         res.probeRuns = static_cast<int>(probes.size());
         double sum = 0.0;
@@ -431,6 +454,18 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         res.probeMeanUs = sum / probes.size();
         std::sort(probes.begin(), probes.end());
         res.probeMedianUs = probes[probes.size() / 2];
+        auto stats = [](std::vector<double>& v, ScenarioResult::ProbeStats& o) {
+            std::sort(v.begin(), v.end());
+            double s = 0.0;
+            for (double x : v) s += x;
+            o.runs = static_cast<int>(v.size());
+            o.minUs = v.front();
+            o.maxUs = v.back();
+            o.medianUs = v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+            o.meanUs = s / static_cast<double>(v.size());
+        };
+        stats(probeLat, res.probeLatency);
+        stats(probeThr, res.probeThroughput);
     }
     res.kernelRebuildsPerBuffer = static_cast<double>(rebuilds) / blocks;
     res.kernelKeyUpdatesPerBuffer = static_cast<double>(keyUpdates) / blocks;

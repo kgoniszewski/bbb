@@ -9,7 +9,9 @@
 
 #include "pm_api/pm_api.h"
 #include "pm_api/pm_api_internal.h"
+#include "pm_api/work_detail.h"
 #include "pm_bench/bench.h"
+#include "pm_host/cpu_id.h"
 #include "pm_host/host.h"
 #include "pm_host/speed_probe.h"
 
@@ -50,6 +52,8 @@ struct pm_host {
     std::atomic<int32_t> sceneState{PM_SCENE_IDLE};
     std::atomic<bool> sceneCancel{false};
     pm_host_scene_result sceneResult{};
+    pm_cpu_usage sceneCpu{};            // published with sceneResult
+    pm_speed_probe_split sceneProbe{};
     char sceneConfig[4096] = {};
     // PM_BENCH_SCENE_FRESH_ENGINE: the private engine (owned; replaced or
     // freed only inside the prepare gate) and whether the audio thread
@@ -71,6 +75,12 @@ double threadCpuSeconds() noexcept {
         return static_cast<double>(ts.tv_sec) + 1e-9 * static_cast<double>(ts.tv_nsec);
 #endif
     return -1.0;
+}
+
+void toSplit(const pm::host::ProbeSnapshot& p, pm_speed_probe_split& o) noexcept {
+    o = pm_speed_probe_split{};
+    pm::bench::toProbeSeries(p.latency, o.latency);
+    pm::bench::toProbeSeries(p.throughput, o.throughput);
 }
 
 void toWork(const pm::host::WorstBuffer& b, pm_work_detail& w) noexcept {
@@ -187,6 +197,8 @@ void sceneAfterRender(pm_host* host, pm::Engine& eng, int32_t frames, double ren
     r.probe.mean_us = s.probe.meanUs;
     r.probe.max_us = s.probe.maxUs;
     r.fresh_engine = host->sceneFresh ? 1 : 0;
+    pm::bench::toCpuUsage(s.cpu, host->sceneCpu);
+    toSplit(s.probe, host->sceneProbe);
     if (sc.restoreTiming) eng.setPhaseTiming(false);
     host->sceneFresh = false;
     host->sceneState.store(PM_SCENE_DONE, std::memory_order_release);
@@ -282,12 +294,16 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         if (++host->probeCounter >= every) {
             host->probeCounter = 0;
             float sink = 0.0f;
-            const double us = pm::host::timeSpeedProbe(&sink);
+            const int cpuNow = pm::host::currentCpu();
+            const pm::host::ProbeTimes pt = pm::host::timeSpeedProbeSplit(&sink);
             host->probeSink.store(sink, std::memory_order_relaxed);
-            host->core.meter().recordProbe(us);
+            host->core.meter().recordProbe(pt.latencyUs, pt.throughputUs, cpuNow);
         }
     }
     const bool cpu = host->cpuTiming.load(std::memory_order_relaxed);
+    // CPU numbers while any diagnostic is on (two register reads).
+    const bool trackCpu = cpu || eng->phaseTiming() || host->probeEvery.load(std::memory_order_relaxed) > 0;
+    const int cpuStart = trackCpu ? pm::host::currentCpu() : -1;
     const double c0 = cpu ? threadCpuSeconds() : -1.0;
     const auto t0 = std::chrono::steady_clock::now();
     host->core.forwardEvents([eng](const pm::Event& e) { eng->pushEvent(e); });  // a full engine queue counts the drop
@@ -297,7 +313,10 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
     eng->render(left, right, frames, host_time != 0 ? &clock : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
     const double c1 = cpu ? threadCpuSeconds() : -1.0;
+    const int cpuEnd = trackCpu ? pm::host::currentCpu() : -1;
     pm::host::BufferRecord rec;
+    rec.cpuStart = cpuStart;
+    rec.cpuEnd = cpuEnd;
     rec.renderSeconds = std::chrono::duration<double>(t1 - t0).count();
     rec.periodSeconds = frames / host->sampleRate;
     rec.cpuSeconds = c0 >= 0.0 && c1 >= 0.0 ? c1 - c0 : -1.0;
@@ -528,6 +547,8 @@ int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t it
                run->reset();
                run->describe(host->sceneConfig, static_cast<int>(sizeof host->sceneConfig));
                host->sceneResult = pm_host_scene_result{};
+               host->sceneCpu = pm_cpu_usage{};
+               host->sceneProbe = pm_speed_probe_split{};
                host->sceneResult.state = PM_SCENE_RUNNING;
                host->sceneCancel.store(false, std::memory_order_relaxed);
                host->sceneState.store(PM_SCENE_RUNNING, std::memory_order_release);
@@ -604,6 +625,62 @@ double pm_speed_probe_run_us(int32_t runs, pm_speed_probe_stats* stats) {
         stats->checksum = sink;
     }
     return median;
+}
+
+void pm_host_get_speed_probe_split(const pm_host* host, pm_speed_probe_split* split) {
+    if (!split) return;
+    *split = pm_speed_probe_split{};
+    if (host) toSplit(host->core.meter().probeSnapshot(), *split);
+}
+
+double pm_speed_probe_run_split(int32_t runs, pm_speed_probe_split* split) {
+    constexpr int kMax = 4096;
+    double lat[kMax], thr[kMax];
+    const int n = runs < 1 ? 1 : (runs > kMax ? kMax : runs);
+    for (int i = 0; i < n; ++i) {
+        float r = 0.0f;  // the work is kept live inside timeSpeedProbeSplit
+        const pm::host::ProbeTimes t = pm::host::timeSpeedProbeSplit(&r);
+        lat[i] = t.latencyUs;
+        thr[i] = t.throughputUs;
+    }
+    auto fill = [n](double* t, pm_probe_series& o) {
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) sum += t[i];
+        std::sort(t, t + n);
+        o.runs = static_cast<uint64_t>(n);
+        o.min_us = t[0];
+        o.max_us = t[n - 1];
+        o.median_us = n % 2 ? t[n / 2] : 0.5 * (t[n / 2 - 1] + t[n / 2]);
+        o.mean_us = sum / n;
+    };
+    pm_speed_probe_split s{};
+    fill(lat, s.latency);
+    fill(thr, s.throughput);
+    if (split) *split = s;
+    return s.throughput.median_us;
+}
+
+int32_t pm_current_cpu(void) { return pm::host::currentCpu(); }
+
+void pm_host_get_cpu_usage(const pm_host* host, pm_cpu_usage* usage) {
+    if (!usage) return;
+    *usage = pm_cpu_usage{};
+    usage->worst_cpu_start = usage->worst_cpu_end = -1;
+    if (!host) return;
+    pm::bench::toCpuUsage(host->core.meter().snapshot().cpu, *usage);
+}
+
+void pm_host_scene_get_cpu_usage(const pm_host* host, pm_cpu_usage* usage) {
+    if (!usage) return;
+    *usage = pm_cpu_usage{};
+    usage->worst_cpu_start = usage->worst_cpu_end = -1;
+    if (host && host->sceneState.load(std::memory_order_acquire) == PM_SCENE_DONE) *usage = host->sceneCpu;
+}
+
+void pm_host_scene_get_probe_split(const pm_host* host, pm_speed_probe_split* split) {
+    if (!split) return;
+    *split = pm_speed_probe_split{};
+    if (host && host->sceneState.load(std::memory_order_acquire) == PM_SCENE_DONE) *split = host->sceneProbe;
 }
 
 void pm_host_set_cpu_timing(pm_host* host, int enabled) {

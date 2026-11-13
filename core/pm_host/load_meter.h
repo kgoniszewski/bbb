@@ -29,13 +29,20 @@
 //    Newton evaluations and fallbacks);
 //  - the speed probe (recordProbe): the time of a fixed workload run on
 //    the audio thread every Nth buffer, as min / median / mean / max, to
-//    compare with the same workload on a benchmark thread (speed_probe.h).
+//    compare with the same workload on a benchmark thread (speed_probe.h);
+//    since API 0.11 also its latency-bound and throughput-bound parts;
+//  - which CPU each render call ran on (cpu_id.h), when the caller reads
+//    it: render calls and summed render time per CPU (up to 64), the
+//    render calls that ended on another CPU than they started on, the worst
+//    buffer's CPUs, and the probe's two parts per CPU.
 #pragma once
 
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+
+#include "pm_host/cpu_id.h"
 
 namespace pm::host {
 
@@ -66,6 +73,7 @@ struct BufferRecord {
     int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
     bool timed = false;                // phaseUs valid
     double phaseUs[kLoadPhases] = {};
+    int cpuStart = -1, cpuEnd = -1;    // CPU at the start / end of the render call (-1: not read)
 };
 
 struct WorstBuffer {
@@ -92,11 +100,19 @@ struct WorstBuffer {
     int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
     bool timed = false;
     double phaseUs[kLoadPhases] = {};
+    int cpuStart = -1, cpuEnd = -1;
+};
+
+struct ProbeSeries {
+    std::uint64_t count = 0;
+    double minUs = 0.0, medianUs = 0.0, meanUs = 0.0, maxUs = 0.0;  // median: bin centre (about 1.5 %)
 };
 
 struct ProbeSnapshot {
     std::uint64_t count = 0;  // probe runs since the last reset
-    double minUs = 0.0, medianUs = 0.0, meanUs = 0.0, maxUs = 0.0;  // median: bin centre (about 1.5 %)
+    double minUs = 0.0, medianUs = 0.0, meanUs = 0.0, maxUs = 0.0;  // the whole probe
+    // The two parts (count 0 when only totals were recorded).
+    ProbeSeries latency, throughput;
 };
 
 struct LoadSnapshot {
@@ -124,6 +140,7 @@ struct LoadSnapshot {
     double meanPhaseUs[kLoadPhases] = {};
     double topPhaseUs[kLoadPhases] = {};
     ProbeSnapshot probe;
+    CpuUsage cpu;  // per-CPU totals (cpu.tracked + cpu.unknown == buffers whose CPU was read or not)
 };
 
 class LoadMeter {
@@ -162,6 +179,7 @@ public:
             bump(phaseCnt_[ub]);
         }
         if (us > maxUs_) maxUs_ = us;
+        recordCpu(b.cpuStart, b.cpuEnd, us);
         if (b.cpuSeconds >= 0.0) {
             // The CPU clock is read just outside the wall-clock interval.
             const double stall = std::max(0.0, us - 1e6 * b.cpuSeconds);
@@ -218,6 +236,8 @@ public:
             wZones_.store(b.outZones, std::memory_order_relaxed);
             wTimed_.store(b.timed, std::memory_order_relaxed);
             for (int p = 0; p < kLoadPhases; ++p) wPhase_[p].store(b.timed ? b.phaseUs[p] : 0.0, std::memory_order_relaxed);
+            wCpuStart_.store(b.cpuStart, std::memory_order_relaxed);
+            wCpuEnd_.store(b.cpuEnd, std::memory_order_relaxed);
             worstSeq_.store(seq + 2, std::memory_order_release);
         }
         mean_.store(sum_ / static_cast<double>(n_), std::memory_order_relaxed);
@@ -308,6 +328,8 @@ public:
             w.outZones = wZones_.load(std::memory_order_relaxed);
             w.timed = wTimed_.load(std::memory_order_relaxed);
             for (int p = 0; p < kLoadPhases; ++p) w.phaseUs[p] = wPhase_[p].load(std::memory_order_relaxed);
+            w.cpuStart = wCpuStart_.load(std::memory_order_relaxed);
+            w.cpuEnd = wCpuEnd_.load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
             if (worstSeq_.load(std::memory_order_relaxed) == a) {
                 s.worst = w;
@@ -316,22 +338,35 @@ public:
         }
         phaseSummary(s);
         s.probe = probeSnapshot();
+        s.cpu = cpuSnapshot();
+        s.cpu.worstStart = s.worst.cpuStart;
+        s.cpu.worstEnd = s.worst.cpuEnd;
         return s;
     }
 
-    // Audio thread: one run of the speed probe, in microseconds.
+    // Audio thread: one run of the speed probe, in microseconds (the whole
+    // probe only).
     void recordProbe(double us) noexcept {
         if (reset_.exchange(false, std::memory_order_acquire)) clearAudioState();
         if (!(us >= 0.0)) return;
-        ++probeN_;
-        probeSum_ += us;
-        if (probeN_ == 1 || us < probeMin_) probeMin_ = us;
-        if (us > probeMax_) probeMax_ = us;
-        bump(probeHist_[usBin(us)]);
-        probeMinPub_.store(probeMin_, std::memory_order_relaxed);
-        probeMaxPub_.store(probeMax_, std::memory_order_relaxed);
-        probeMeanPub_.store(probeSum_ / static_cast<double>(probeN_), std::memory_order_relaxed);
-        probeCount_.store(probeN_, std::memory_order_release);
+        probeTotal_.add(us);
+        probeCount_.store(probeTotal_.n, std::memory_order_release);
+    }
+
+    // Audio thread: one run with its two parts and the CPU it ran on (-1:
+    // unknown).
+    void recordProbe(double latencyUs, double throughputUs, int cpu) noexcept {
+        if (reset_.exchange(false, std::memory_order_acquire)) clearAudioState();
+        if (!(latencyUs >= 0.0) || !(throughputUs >= 0.0)) return;
+        probeLatency_.add(latencyUs);
+        probeThroughput_.add(throughputUs);
+        if (cpu >= 0 && cpu < kMaxCpus) {
+            bump(cpuProbeRuns_[cpu]);
+            addTo(cpuProbeLat_[cpu], latencyUs);
+            addTo(cpuProbeThr_[cpu], throughputUs);
+        }
+        probeTotal_.add(latencyUs + throughputUs);
+        probeCount_.store(probeTotal_.n, std::memory_order_release);
     }
 
     // Any thread (also part of snapshot()).
@@ -340,15 +375,32 @@ public:
         if (reset_.load(std::memory_order_acquire)) return p;
         p.count = probeCount_.load(std::memory_order_acquire);
         if (p.count == 0) return p;
-        p.minUs = probeMinPub_.load(std::memory_order_relaxed);
-        p.maxUs = probeMaxPub_.load(std::memory_order_relaxed);
-        p.meanUs = probeMeanPub_.load(std::memory_order_relaxed);
-        // Bin centre (geometric) of the bin holding the median, clamped to
-        // the observed range.
-        const double edge = percentile(probeHist_, kUsBins + 1, 0.5,
-                                       [](int i) { return std::exp2(static_cast<double>(i + 1) / kUsBinsPerOctave); });
-        p.medianUs = std::clamp(edge * std::exp2(-0.5 / kUsBinsPerOctave), p.minUs, p.maxUs);
+        const ProbeSeries t = probeTotal_.read();
+        p.minUs = t.minUs;
+        p.medianUs = t.medianUs;
+        p.meanUs = t.meanUs;
+        p.maxUs = t.maxUs;
+        p.latency = probeLatency_.read();
+        p.throughput = probeThroughput_.read();
         return p;
+    }
+
+    // Any thread (also part of snapshot()): per-CPU totals; worstStart /
+    // worstEnd are filled by snapshot() only.
+    CpuUsage cpuSnapshot() const noexcept {
+        CpuUsage c;
+        if (reset_.load(std::memory_order_acquire)) return c;
+        c.tracked = cpuTracked_.load(std::memory_order_relaxed);
+        c.unknown = cpuUnknown_.load(std::memory_order_relaxed);
+        c.migrations = cpuMigrations_.load(std::memory_order_relaxed);
+        for (int i = 0; i < kMaxCpus; ++i) {
+            c.buffers[i] = cpuBuffers_[i].load(std::memory_order_relaxed);
+            c.renderUs[i] = cpuUs_[i].load(std::memory_order_relaxed);
+            c.probeRuns[i] = cpuProbeRuns_[i].load(std::memory_order_relaxed);
+            c.probeLatencyUs[i] = cpuProbeLat_[i].load(std::memory_order_relaxed);
+            c.probeThroughputUs[i] = cpuProbeThr_[i].load(std::memory_order_relaxed);
+        }
+        return c;
     }
 
     // Any thread. The audio thread clears its totals at its next record();
@@ -360,6 +412,59 @@ public:
     }
 
 private:
+    // One series of probe times: audio-thread totals, a histogram for the
+    // median, and the published min / max / mean.
+    struct Series {
+        std::uint64_t n = 0;
+        double sum = 0.0, mn = 0.0, mx = 0.0;
+        std::atomic<std::uint32_t> hist[kUsBins + 1] = {};
+        std::atomic<std::uint64_t> count{0};
+        std::atomic<double> minPub{0.0}, maxPub{0.0}, meanPub{0.0};
+        void add(double us) noexcept {
+            ++n;
+            sum += us;
+            if (n == 1 || us < mn) mn = us;
+            if (us > mx) mx = us;
+            bump(hist[usBin(us)]);
+            minPub.store(mn, std::memory_order_relaxed);
+            maxPub.store(mx, std::memory_order_relaxed);
+            meanPub.store(sum / static_cast<double>(n), std::memory_order_relaxed);
+            count.store(n, std::memory_order_release);
+        }
+        ProbeSeries read() const noexcept {
+            ProbeSeries p;
+            p.count = count.load(std::memory_order_acquire);
+            if (p.count == 0) return p;
+            p.minUs = minPub.load(std::memory_order_relaxed);
+            p.maxUs = maxPub.load(std::memory_order_relaxed);
+            p.meanUs = meanPub.load(std::memory_order_relaxed);
+            // Bin centre (geometric) of the bin holding the median, clamped
+            // to the observed range.
+            const double edge = percentile(hist, kUsBins + 1, 0.5,
+                                           [](int i) { return std::exp2(static_cast<double>(i + 1) / kUsBinsPerOctave); });
+            p.medianUs = std::clamp(edge * std::exp2(-0.5 / kUsBinsPerOctave), p.minUs, p.maxUs);
+            return p;
+        }
+        void clear() noexcept {
+            n = 0;
+            sum = mn = mx = 0.0;
+            for (auto& c : hist) c.store(0, std::memory_order_relaxed);
+            count.store(0, std::memory_order_relaxed);
+        }
+    };
+
+    void recordCpu(int c0, int c1, double us) noexcept {
+        if (c0 >= 0 && c0 < kMaxCpus) {
+            bump(cpuBuffers_[c0]);
+            addTo(cpuUs_[c0], us);
+            cpuTracked_.store(cpuTracked_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        } else {
+            cpuUnknown_.store(cpuUnknown_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        }
+        if (c0 >= 0 && c1 >= 0 && c0 != c1)
+            cpuMigrations_.store(cpuMigrations_.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    }
+
     static int loadBin(double load) noexcept {
         const double x = load / kLoadBinWidth;
         return x < static_cast<double>(kLoadBins) ? static_cast<int>(x) : kLoadBins;
@@ -422,10 +527,20 @@ private:
         for (auto& row : phaseBin_)
             for (auto& c : row) c.store(0.0, std::memory_order_relaxed);
         for (auto& c : phaseAll_) c.store(0.0, std::memory_order_relaxed);
-        probeN_ = 0;
-        probeSum_ = probeMin_ = probeMax_ = 0.0;
-        for (auto& c : probeHist_) c.store(0, std::memory_order_relaxed);
+        probeTotal_.clear();
+        probeLatency_.clear();
+        probeThroughput_.clear();
         probeCount_.store(0, std::memory_order_relaxed);
+        cpuTracked_.store(0, std::memory_order_relaxed);
+        cpuUnknown_.store(0, std::memory_order_relaxed);
+        cpuMigrations_.store(0, std::memory_order_relaxed);
+        for (int i = 0; i < kMaxCpus; ++i) {
+            cpuBuffers_[i].store(0, std::memory_order_relaxed);
+            cpuUs_[i].store(0.0, std::memory_order_relaxed);
+            cpuProbeRuns_[i].store(0, std::memory_order_relaxed);
+            cpuProbeLat_[i].store(0.0, std::memory_order_relaxed);
+            cpuProbeThr_[i].store(0.0, std::memory_order_relaxed);
+        }
     }
 
     // Audio-thread state.
@@ -455,14 +570,18 @@ private:
     std::atomic<int> wKeyUpd_{0}, wMaxContact_{0}, wContactSamples_{0}, wNewton_{0}, wFallback_{0};
     std::atomic<int> wHamSamples_{0}, wHamDamped_{0}, wFree_{0}, wForced_{0};
     std::atomic<int> wMembers_{0}, wListeners_{0}, wEntries_{0}, wZones_{0};
-    // Speed probe: audio-thread totals and the published values.
-    std::uint64_t probeN_ = 0;
-    double probeSum_ = 0.0, probeMin_ = 0.0, probeMax_ = 0.0;
-    std::atomic<std::uint32_t> probeHist_[kUsBins + 1] = {};
+    // Speed probe: the whole probe and its two parts.
+    Series probeTotal_, probeLatency_, probeThroughput_;
     std::atomic<std::uint64_t> probeCount_{0};
-    std::atomic<double> probeMinPub_{0.0}, probeMaxPub_{0.0}, probeMeanPub_{0.0};
     std::atomic<bool> wTimed_{false};
     std::atomic<double> wPhase_[kLoadPhases] = {};
+    std::atomic<int> wCpuStart_{-1}, wCpuEnd_{-1};
+    // Per-CPU totals (one writer: relaxed load + store).
+    std::atomic<std::uint64_t> cpuTracked_{0}, cpuUnknown_{0}, cpuMigrations_{0};
+    std::atomic<std::uint32_t> cpuBuffers_[kMaxCpus] = {};
+    std::atomic<double> cpuUs_[kMaxCpus] = {};
+    std::atomic<std::uint32_t> cpuProbeRuns_[kMaxCpus] = {};
+    std::atomic<double> cpuProbeLat_[kMaxCpus] = {}, cpuProbeThr_[kMaxCpus] = {};
 };
 
 }  // namespace pm::host

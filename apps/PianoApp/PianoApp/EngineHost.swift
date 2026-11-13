@@ -170,6 +170,9 @@ final class EngineHost {
         return w
     }
 
+    /// The CPU the calling thread runs on now (-1: unknown).
+    static var currentCpu: Int { Int(pm_current_cpu()) }
+
     /// The engine's effective configuration, one "key value" per line.
     func describeEngine() -> String {
         var buf = [CChar](repeating: 0, count: 4096)
@@ -224,6 +227,53 @@ final class EngineHost {
     static func runSpeedProbe(runs: Int) -> pm_speed_probe_stats {
         var s = pm_speed_probe_stats()
         _ = pm_speed_probe_run_us(Int32(runs), &s)
+        return s
+    }
+
+    /// The audio-thread probe's latency-bound and throughput-bound parts.
+    func speedProbeSplit() -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        pm_host_get_speed_probe_split(raw, &s)
+        return s
+    }
+
+    /// Both parts on the calling thread (non-real-time).
+    static func runSpeedProbeSplit(runs: Int) -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        _ = pm_speed_probe_run_split(Int32(runs), &s)
+        return s
+    }
+
+    /// Which CPUs the render calls ran on (live meter, since the last reset).
+    func cpuUsage() -> pm_cpu_usage {
+        var u = pm_cpu_usage()
+        pm_host_get_cpu_usage(raw, &u)
+        return u
+    }
+
+    /// The finished scene run's CPUs and probe parts.
+    func sceneCpuUsage() -> pm_cpu_usage {
+        var u = pm_cpu_usage()
+        pm_host_scene_get_cpu_usage(raw, &u)
+        return u
+    }
+
+    func sceneProbeSplit() -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        pm_host_scene_get_probe_split(raw, &s)
+        return s
+    }
+
+    /// The last benchmark scenario run on the calling thread.
+    static func benchLastCpuUsage() -> pm_cpu_usage {
+        var u = pm_cpu_usage()
+        pm_bench_last_cpu_usage(&u)
+        return u
+    }
+
+    static func benchLastProbeSplit() -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        pm_bench_last_probe_split(&s)
         return s
     }
 

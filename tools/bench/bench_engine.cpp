@@ -116,16 +116,23 @@ int main(int argc, char** argv) {
                 fs, block, pm::simdKernelName(), cfg.seconds, eng->stats().totalModes, eng->stats().groups,
                 pm::ModeBank::kGroupSize);
     {
-        std::vector<double> t(501);
+        std::vector<double> t(501), lat(501), thr(501);
         float sink = 0.0f;
-        for (double& x : t) {
+        for (std::size_t i = 0; i < t.size(); ++i) {
             float r = 0.0f;
-            x = pm::host::timeSpeedProbe(&r);
+            const pm::host::ProbeTimes p = pm::host::timeSpeedProbeSplit(&r);
+            t[i] = p.totalUs();
+            lat[i] = p.latencyUs;
+            thr[i] = p.throughputUs;
             sink += r;
         }
         std::sort(t.begin(), t.end());
-        std::printf("  speed probe on this thread: min %.2f / median %.2f us (checksum %g)\n", t[0], t[t.size() / 2],
-                    static_cast<double>(sink));
+        std::sort(lat.begin(), lat.end());
+        std::sort(thr.begin(), thr.end());
+        std::printf("  speed probe on this thread: min %.2f / median %.2f us (latency-bound part %.2f, throughput-bound "
+                    "%.2f, medians; checksum %g); this thread on CPU %d\n",
+                    t[0], t[t.size() / 2], lat[lat.size() / 2], thr[thr.size() / 2], static_cast<double>(sink),
+                    pm::host::currentCpu());
     }
     {
         char desc[4096];
@@ -164,8 +171,12 @@ int main(int argc, char** argv) {
                 std::printf("    %-37s %-6s %8.1f %8.1f %8.1f %4d |", m == 0 ? c.name : "", kMode[m], r[m].meanUs, r[m].p99Us,
                             r[m].maxUs, r[m].overruns);
                 for (int p = 0; p < pm::bench::kPhaseCount; ++p) std::printf(" %7.1f", r[m].all.us[p]);
-                std::printf(" | %6.3f %6.3f | %6.2f\n", r[m].hammerUsPerSample, r[m].hammerUsPerContactSample,
-                            r[m].probeMedianUs);
+                int cpus = 0;
+                for (int k = 0; k < pm::host::kMaxCpus; ++k) cpus += r[m].cpu.buffers[k] > 0;
+                std::printf(" | %6.3f %6.3f | %6.2f (lat %5.2f thr %6.2f; %d CPU%s, %llu migr.)\n", r[m].hammerUsPerSample,
+                            r[m].hammerUsPerContactSample, r[m].probeMedianUs, r[m].probeLatency.medianUs,
+                            r[m].probeThroughput.medianUs, cpus, cpus == 1 ? "" : "s",
+                            static_cast<unsigned long long>(r[m].cpu.migrations));
             }
             for (int m = 1; m < kModes; ++m) {
                 std::printf("    %-37s %-6s %8.2f %8.2f %8.2f      |", "", "ratio", r[m].meanUs / r[0].meanUs,
@@ -178,7 +189,9 @@ int main(int argc, char** argv) {
         }
         std::printf("  (over: buffers longer than the period; us/hs: hammers phase per hammer-sample stepped, us/hc:\n"
                     "   per hammer-sample in contact; phases are means over all buffers; probe: median of the speed\n"
-                    "   probe run right before every 4th render call, untimed, as the app's host does)\n");
+                    "   probe run right before every 4th render call, untimed, as the app's host does, with its\n"
+                    "   latency-bound and throughput-bound parts; CPUs: distinct CPUs the render calls started on,\n"
+                    "   and the calls that ended on another CPU)\n");
         return 0;
     }
     std::printf("  board-on cases at tier %s unless named; phase timing %s; %s\n", tierName[static_cast<int>(cfg.tier)],

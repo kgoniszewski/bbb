@@ -85,5 +85,15 @@ final class PianoCoreTests: XCTestCase {
         XCTAssertGreaterThan(stats.min_us, 0)
         XCTAssertLessThanOrEqual(stats.min_us, median)
         XCTAssertLessThanOrEqual(median, stats.max_us)
+        // API 0.11: the two parts, the CPU number, an empty CPU table.
+        var split = pm_speed_probe_split()
+        let thr = pm_speed_probe_run_split(21, &split)
+        XCTAssertEqual(split.throughput.runs, 21)
+        XCTAssertEqual(thr, split.throughput.median_us)
+        XCTAssertGreaterThan(split.latency.min_us, 0)
+        XCTAssertGreaterThanOrEqual(pm_current_cpu(), -1)
+        var usage = pm_cpu_usage()
+        pm_bench_last_cpu_usage(&usage)
+        pm_bench_set_pace_hook(nil, nil)
     }
 }

@@ -194,6 +194,25 @@ int main(void) {
         pm_host_get_speed_probe(NULL, &ps);
         pm_host_get_worst_detail(NULL, NULL);
     }
+    /* Probe parts and CPU numbers (API 0.11). */
+    {
+        pm_speed_probe_split sp;
+        pm_cpu_usage cu;
+        const double thr = pm_speed_probe_run_split(21, &sp);
+        printf("  probe parts on this thread: latency %.2f / throughput %.2f us (median); CPU %d\n",
+               sp.latency.median_us, sp.throughput.median_us, (int)pm_current_cpu());
+        EXPECT(sp.latency.runs == 21 && sp.throughput.runs == 21 && thr == sp.throughput.median_us);
+        EXPECT(sp.latency.min_us > 0.0 && sp.throughput.min_us > 0.0);
+        EXPECT(pm_current_cpu() >= -1);
+        pm_bench_last_cpu_usage(&cu);
+        pm_bench_last_probe_split(&sp);
+        pm_bench_set_pace_hook(NULL, NULL);
+        pm_host_get_cpu_usage(NULL, &cu);
+        pm_host_get_speed_probe_split(NULL, &sp);
+        pm_host_scene_get_cpu_usage(NULL, &cu);
+        pm_host_scene_get_probe_split(NULL, &sp);
+        EXPECT(cu.worst_cpu_start == -1 && PM_MAX_CPUS == 64);
+    }
     printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }

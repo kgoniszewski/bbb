@@ -2,8 +2,10 @@
 // on this device and shows the table, with a Copy button. Audio output is
 // paused for the run (about a minute) so that the numbers are the engine's
 // alone; it resumes by itself afterwards. Paced runs sleep to real-time
-// deadlines between buffers; "Run on audio thread" plays one scene through
-// the real audio path, so the same material is measured three ways.
+// deadlines between buffers (optionally in an audio thread's scheduling
+// class); "Run on audio thread" plays one scene, "Run all on audio thread"
+// every scene in turn, through the real audio path, so the same material is
+// measured three ways.
 import Foundation
 import SwiftUI
 
@@ -30,6 +32,9 @@ struct BenchmarkView: View {
                     .fixedSize()
                     .disabled(model.benchRunning)
                 Toggle("Evict", isOn: $model.benchEvict)
+                    .fixedSize()
+                    .disabled(model.benchRunning)
+                Toggle("Real-time paced", isOn: $model.benchRealtime)
                     .fixedSize()
                     .disabled(model.benchRunning)
                 Toggle("Phases", isOn: $model.benchPhases)
@@ -59,6 +64,11 @@ struct BenchmarkView: View {
                 }
                 .buttonStyle(.bordered)
                 .disabled(model.benchRunning || model.sceneRunning)
+                Button("Run all on audio thread") {
+                    model.runAllOnAudioThread()
+                }
+                .buttonStyle(.bordered)
+                .disabled(model.benchRunning || model.sceneRunning)
                 if model.sceneRunning {
                     Button("Cancel") { model.cancelScene() }
                         .buttonStyle(.bordered)
@@ -75,7 +85,16 @@ struct BenchmarkView: View {
                  + "deadline between buffers, as an audio thread does (Evict: and walks 32 MiB in between). "
                  + "Run on audio thread: the selected scene's events played through the real audio path, "
                  + "audible, on the app's engine (reset first) or a benchmark-prepared one; the row has the "
-                 + "same statistics, phase split and counts (switch the speed probe on in Diagnostics for its line).")
+                 + "same statistics, phase split and counts (switch the speed probe on in Diagnostics for its line). "
+                 + "Run all on audio thread: every scene in turn, one row each (Cancel stops the series). "
+                 + "Scheduling classes differ: the benchmark runs on an ordinary thread (QoS user-interactive); "
+                 + "Real-time paced puts its paced loop on a time-constraint thread in its own audio work interval "
+                 + "with each buffer's deadline, which is the class of the audio I/O thread but still not the I/O "
+                 + "thread itself (not the output device's workgroup). Only the audio-thread rows are what playing "
+                 + "costs; on Apple silicon the system picks the core type and clock for the audio thread from its "
+                 + "deadlines, so a low % of the buffer at light load is not headroom. Each row lists the CPUs the "
+                 + "render calls ran on (core types assumed from the CPU numbers) and, with the speed probe on, its "
+                 + "latency-bound and throughput-bound parts against the benchmark thread.")
                 .font(.caption)
                 .foregroundColor(.secondary)
             ScrollView([.vertical, .horizontal]) {

@@ -17,6 +17,7 @@
 #include "pm_api/pm_api.h"
 #include "pm_bench/bench.h"
 #include "pm_engine/events.h"
+#include "pm_host/speed_probe.h"
 #include "test_harness.h"
 
 // ---- counting allocator, armed only around the calls under test
@@ -420,12 +421,104 @@ TEST(speed_probe) {
     // (scheduling noise only).
     CHECK(ps.median_us < 3.0 * refUs && refUs < 3.0 * ps.median_us);
     CHECK(gAllocs.load() == 0);
+    // The two parts (0.11): every run recorded in both, each part shorter
+    // than the whole, and the parts' medians plausible against this thread's.
+    pm_speed_probe_split sp, refSplit;
+    pm_host_get_speed_probe_split(h, &sp);
+    const double refThr = pm_speed_probe_run_split(101, &refSplit);
+    std::printf("  probe parts: audio thread latency %.2f / throughput %.2f us (median), this thread %.2f / %.2f us\n",
+                sp.latency.median_us, sp.throughput.median_us, refSplit.latency.median_us, refThr);
+    CHECK(sp.latency.runs == 100 && sp.throughput.runs == 100);
+    CHECK(sp.latency.min_us > 0.0 && sp.latency.min_us <= sp.latency.median_us && sp.latency.median_us <= sp.latency.max_us);
+    CHECK(sp.throughput.min_us > 0.0 && sp.throughput.median_us <= sp.throughput.max_us);
+    CHECK(sp.latency.min_us + sp.throughput.min_us <= ps.min_us * 1.001 + 1e-9);
+    CHECK(refThr == refSplit.throughput.median_us && refSplit.latency.runs == 101);
+    CHECK(sp.throughput.median_us < 3.0 * refThr && refThr < 3.0 * sp.throughput.median_us);
+    // CPU numbers: read while the probe is on (Linux: sched_getcpu), every
+    // render call counted once, every probe run on some CPU.
+    pm_cpu_usage cu;
+    pm_host_get_cpu_usage(h, &cu);
+    std::uint64_t perCpu = 0, probeRuns = 0;
+    int cpusUsed = 0;
+    for (int i = 0; i < PM_MAX_CPUS; ++i) {
+        perCpu += cu.buffers[i];
+        probeRuns += cu.probe_runs[i];
+        cpusUsed += cu.buffers[i] > 0;
+        if (cu.buffers[i]) CHECK(cu.mean_render_us[i] > 0.0);
+        if (cu.probe_runs[i]) CHECK(cu.probe_throughput_us[i] > 0.0 && cu.probe_latency_us[i] > 0.0);
+    }
+    std::printf("  CPUs: %llu render calls tracked on %d CPU(s), %llu unknown, %llu migrations; worst on %d..%d; "
+                "this thread now on CPU %d\n",
+                static_cast<unsigned long long>(cu.buffers_tracked), cpusUsed,
+                static_cast<unsigned long long>(cu.buffers_unknown), static_cast<unsigned long long>(cu.migrations),
+                cu.worst_cpu_start, cu.worst_cpu_end, pm_current_cpu());
+    CHECK(cu.buffers_tracked + cu.buffers_unknown == d.buffers);
+    CHECK(perCpu == cu.buffers_tracked && cu.migrations <= d.buffers);
+#if defined(__linux__) || defined(__APPLE__)
+    CHECK(pm_current_cpu() >= 0);
+    CHECK(cu.buffers_tracked == d.buffers && probeRuns == 100 && cpusUsed >= 1);
+    CHECK(cu.worst_cpu_start >= 0 && cu.worst_cpu_end >= 0);
+#endif
     pm_host_set_speed_probe(h, 0);
     pm_host_reset_load(h);
     for (int buf = 0; buf < 8; ++buf) pm_host_render(h, l.data(), r.data(), kFrames, bufferStart(buf));
     pm_host_get_speed_probe(h, &ps);
     CHECK(ps.interval == 0 && ps.runs == 0);
+    // No diagnostic on: no CPU numbers are read.
+    pm_host_get_cpu_usage(h, &cu);
+    CHECK(cu.buffers_tracked == 0 && cu.buffers_unknown == 8 && cu.worst_cpu_start == -1);
     pm_host_destroy(h);
+}
+
+// The probe's SIMD parts (0.11) against scalar references of the same
+// recursions: identical up to rounding (FMA contraction, summation order).
+TEST(speed_probe_parts_match_scalar_reference) {
+    using namespace pm::host;
+    const float drive = 1e-3f;
+    ProbeBank bank;
+    probeBankInit(bank);
+    const float simdThr = probeThroughputWork(bank, drive);
+    // Scalar reference of the throughput part.
+    std::vector<double> zr(kProbeBankModes), zi(kProbeBankModes), cr(kProbeBankModes), ci(kProbeBankModes);
+    ProbeBank init;
+    probeBankInit(init);
+    for (int i = 0; i < kProbeBankModes; ++i) {
+        zr[i] = init.zr[i];
+        zi[i] = init.zi[i];
+        cr[i] = init.cr[i];
+        ci[i] = init.ci[i];
+    }
+    double refThr = 0.0;
+    for (int n = 0; n < kProbeBankSteps; ++n)
+        for (int i = 0; i < kProbeBankModes; ++i) {
+            const double nr = cr[i] * zr[i] - ci[i] * zi[i] + drive;
+            const double ni = ci[i] * zr[i] + cr[i] * zi[i];
+            zr[i] = nr;
+            zi[i] = ni;
+            refThr += ni;
+        }
+    double maxState = 0.0;
+    for (int i = 0; i < kProbeBankModes; ++i)
+        maxState = std::max(maxState, std::fabs(static_cast<double>(bank.zr[i]) - zr[i]) +
+                                          std::fabs(static_cast<double>(bank.zi[i]) - zi[i]));
+    // Scalar reference of the latency part.
+    double x = 1.0;
+    for (int it = 0; it < kProbeNewton; ++it) {
+        const double a = 1.0 + 0.0625 * (it & 15);
+        const double sq = std::sqrt(x);
+        x -= (x * x * sq - a) / (2.5 * x * sq);
+        if (!(x > 1e-3)) x = 1.0;
+    }
+    double v = static_cast<float>(x);
+    for (int it = 0; it < kProbeFmaChain; ++it) v = v * static_cast<double>(0.999f) + drive;
+    const double refLat = 4.0 * v;  // hsum over four lanes (eight with AVX2)
+    const float simdLat = probeLatencyWork(drive);
+    const double lanes = static_cast<double>(pm::simd::kWidth) / 4.0;
+    std::printf("  throughput part %.6g (scalar %.6g, state error %.2g), latency part %.6g (scalar %.6g)\n", simdThr,
+                refThr, maxState, simdLat, refLat * lanes);
+    CHECK(std::fabs(simdThr - refThr) <= 1e-4 * std::fabs(refThr) + 1e-4);
+    CHECK(maxState < 1e-5);
+    CHECK(std::fabs(simdLat - refLat * lanes) <= 1e-4 * std::fabs(refLat * lanes));
 }
 
 // Worst-buffer hammer detail (0.9): ten hard notes arriving in one 512-frame
@@ -553,6 +646,19 @@ TEST(scene_on_audio_path) {
     CHECK(res.has_phases == 1 && res.mean_us > 0.0 && res.p99_us <= res.max_us && res.mean_awake_modes > 100.0);
     CHECK(res.free_group_blocks > 0.0 && res.min_frames == kFrames && res.max_frames == kFrames);
     CHECK(res.probe.runs == static_cast<std::uint64_t>(measured / 4) || res.probe.runs == static_cast<std::uint64_t>(measured / 4 + 1));
+    // CPUs and probe parts of the measured buffers (0.11; phase timing on,
+    // so the CPU numbers are read).
+    {
+        pm_cpu_usage cu;
+        pm_speed_probe_split sp;
+        pm_host_scene_get_cpu_usage(h, &cu);
+        pm_host_scene_get_probe_split(h, &sp);
+        CHECK(cu.buffers_tracked + cu.buffers_unknown == static_cast<std::uint64_t>(measured));
+        CHECK(sp.throughput.runs == res.probe.runs && sp.latency.runs == res.probe.runs);
+#if defined(__linux__) || defined(__APPLE__)
+        CHECK(cu.buffers_tracked == static_cast<std::uint64_t>(measured));
+#endif
+    }
     double sum = 0.0;
     for (int p = 0; p < PM_PHASE_COUNT; ++p) sum += res.mean_phase_us[p];
     CHECK(sum > 0.0 && sum <= res.mean_us * 1.001);
@@ -647,9 +753,65 @@ TEST(paced_benchmark) {
         if (pm_bench_item_scene(&cfg, i) == static_cast<int>(pm::bench::Scene::Idle)) idle = i;
     CHECK(idle >= 0);
     pm_bench_result res;
+    // Pacing hook (0.11): begin with the period, one start / done pair per
+    // buffer (warm-up included), each before its deadline, then end.
+    struct Calls {
+        int begin = 0, buffers = 0, done = 0, end = 0, order = 0;
+        std::int64_t period = 0, minLeft = INT64_MAX, maxLeft = INT64_MIN;
+    } calls;
+    pm_bench_set_pace_hook(
+        [](void* ctx, int32_t event, int64_t ns) {
+            Calls& c = *static_cast<Calls*>(ctx);
+            switch (event) {
+                case PM_PACE_BEGIN: ++c.begin; c.period = ns; break;
+                case PM_PACE_BUFFER:
+                    if (c.buffers != c.done) ++c.order;
+                    ++c.buffers;
+                    c.minLeft = std::min<std::int64_t>(c.minLeft, ns);
+                    c.maxLeft = std::max<std::int64_t>(c.maxLeft, ns);
+                    break;
+                case PM_PACE_BUFFER_DONE: ++c.done; break;
+                case PM_PACE_END: ++c.end; break;
+                default: ++c.order;
+            }
+        },
+        &calls);
+    cfg.flags |= PM_BENCH_SPEED_PROBE;
     const auto a = std::chrono::steady_clock::now();
     CHECK(pm_bench_run_item(&cfg, idle, &res) == 1);
     const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+    pm_bench_set_pace_hook(nullptr, nullptr);
+    const int buffers = static_cast<int>(0.5 * 48000.0 / 256) + static_cast<int>(0.3 * 48000.0 / 256);
+    std::printf("  pace hook: begin %d (period %lld ns), %d buffers / %d done, end %d; time to deadline %lld..%lld us\n",
+                calls.begin, static_cast<long long>(calls.period), calls.buffers, calls.done, calls.end,
+                static_cast<long long>(calls.minLeft / 1000), static_cast<long long>(calls.maxLeft / 1000));
+    CHECK(calls.begin == 1 && calls.end == 1 && calls.order == 0);
+    CHECK(calls.buffers == buffers && calls.done == buffers);
+    CHECK(calls.period == static_cast<std::int64_t>(1e9 * 256 / 48000.0));
+    CHECK(calls.maxLeft <= calls.period + 1000000);  // at most a period (+ 1 ms of clock skew) ahead
+    // CPU usage and probe parts of the run (0.11).
+    pm_cpu_usage cu;
+    pm_speed_probe_split sp;
+    pm_bench_last_cpu_usage(&cu);
+    pm_bench_last_probe_split(&sp);
+    const int measured = static_cast<int>(0.3 * 48000.0 / 256);
+    std::printf("  paced run: %llu buffers on known CPUs, %llu migrations; probe %llu runs, latency %.2f / "
+                "throughput %.2f us\n",
+                static_cast<unsigned long long>(cu.buffers_tracked), static_cast<unsigned long long>(cu.migrations),
+                static_cast<unsigned long long>(sp.throughput.runs), sp.latency.median_us, sp.throughput.median_us);
+    CHECK(cu.buffers_tracked + cu.buffers_unknown == static_cast<std::uint64_t>(measured));
+    CHECK(sp.latency.runs == static_cast<std::uint64_t>(measured / 8) && sp.throughput.runs == sp.latency.runs);
+#if defined(__linux__) || defined(__APPLE__)
+    CHECK(cu.buffers_tracked == static_cast<std::uint64_t>(measured) && cu.worst_cpu_start >= 0);
+#endif
+    // Not paced: the hook is not called.
+    calls = Calls{};
+    pm_bench_set_pace_hook([](void* ctx, int32_t, int64_t) { ++static_cast<Calls*>(ctx)->order; }, &calls);
+    pm_bench_config fast = cfg;
+    fast.flags = PM_BENCH_NO_HAMMER;
+    pm_bench_result fr;
+    CHECK(pm_bench_run_item(&fast, idle, &fr) == 1 && calls.order == 0);
+    pm_bench_set_pace_hook(nullptr, nullptr);
     char conf[4096];
     const int n = pm_bench_last_config(conf, sizeof conf);
     std::printf("  paced idle scene: %.2f s wall for 0.8 s of audio, mean %.1f us, %d overruns; config %d bytes\n", wall,
@@ -693,6 +855,17 @@ TEST(null_tolerance) {
     char cbuf[8];
     CHECK(pm_host_scene_config(nullptr, cbuf, sizeof cbuf) == 0 && cbuf[0] == 0);
     CHECK(pm_engine_describe(nullptr, cbuf, sizeof cbuf) == 0);
+    pm_cpu_usage cu;
+    pm_host_get_cpu_usage(nullptr, &cu);
+    pm_host_scene_get_cpu_usage(nullptr, &cu);
+    CHECK(cu.buffers_tracked == 0 && cu.worst_cpu_start == -1);
+    pm_speed_probe_split sp;
+    pm_host_get_speed_probe_split(nullptr, &sp);
+    pm_host_scene_get_probe_split(nullptr, &sp);
+    CHECK(sp.latency.runs == 0);
+    pm_host_get_cpu_usage(nullptr, nullptr);
+    pm_bench_last_cpu_usage(nullptr);
+    pm_bench_last_probe_split(nullptr);
     pm_host* h = makeHost(false);
     CHECK(h != nullptr);
     if (!h) return;

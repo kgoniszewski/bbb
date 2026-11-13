@@ -1,6 +1,7 @@
 // Render-load meter: mean, max, over-budget count, smoothing, reset, and
 // concurrent reads while the audio thread records.
 #include <atomic>
+#include <cmath>
 #include <thread>
 
 #include "pm_host/load_meter.h"
@@ -214,4 +215,53 @@ TEST(worst_buffer_is_never_torn) {
     }
     audio.join();
     CHECK(ok);
+}
+
+// Per-CPU tally (0.11): render calls and time by the CPU they started on,
+// migrations (start != end), unknown CPUs, the worst buffer's CPUs, the
+// probe's parts per CPU and overall; a reset clears all of it.
+TEST(cpu_tally_and_probe_parts) {
+    LoadMeter m;
+    const double period = 512.0 / 44100.0;
+    auto rec = [&](double us, int c0, int c1) {
+        pm::host::BufferRecord b;
+        b.renderSeconds = us * 1e-6;
+        b.periodSeconds = period;
+        b.cpuStart = c0;
+        b.cpuEnd = c1;
+        m.record(b);
+    };
+    for (int i = 0; i < 30; ++i) rec(3000.0, 1, 1);  // a slow core
+    for (int i = 0; i < 70; ++i) rec(1000.0, 6, 6);  // a fast core
+    rec(5000.0, 6, 2);                               // worst, migrated mid-buffer
+    rec(500.0, -1, -1);                              // CPU not read
+    rec(500.0, 64, 64);                              // out of the table
+    for (int i = 0; i < 10; ++i) m.recordProbe(4.0, 30.0, 1);
+    for (int i = 0; i < 10; ++i) m.recordProbe(2.0, 8.0, 6);
+    m.recordProbe(2.0, 8.0, -1);
+    m.recordProbe(20.0);  // whole probe only (no parts)
+    const auto s = m.snapshot();
+    const pm::host::CpuUsage& c = s.cpu;
+    CHECK(s.buffers == 103);
+    CHECK(c.tracked == 101 && c.unknown == 2 && c.migrations == 1);
+    CHECK(c.buffers[1] == 30 && c.buffers[6] == 71 && c.buffers[2] == 0);
+    CHECK_NEAR(c.renderUs[1], 30 * 3000.0, 1e-6);
+    CHECK_NEAR(c.renderUs[6], 70 * 1000.0 + 5000.0, 1e-6);
+    CHECK(c.worstStart == 6 && c.worstEnd == 2);
+    CHECK(s.worst.cpuStart == 6 && s.worst.cpuEnd == 2);
+    CHECK(c.probeRuns[1] == 10 && c.probeRuns[6] == 10);
+    CHECK_NEAR(c.probeThroughputUs[1] / c.probeRuns[1], 30.0, 1e-9);
+    CHECK_NEAR(c.probeLatencyUs[6] / c.probeRuns[6], 2.0, 1e-9);
+    CHECK(s.probe.count == 22 && s.probe.latency.count == 21 && s.probe.throughput.count == 21);
+    CHECK_NEAR(s.probe.throughput.minUs, 8.0, 1e-12);
+    CHECK_NEAR(s.probe.throughput.maxUs, 30.0, 1e-12);
+    CHECK_NEAR(s.probe.throughput.meanUs, (10 * 30.0 + 11 * 8.0) / 21.0, 1e-9);
+    CHECK(std::fabs(s.probe.throughput.medianUs - 8.0) < 0.02 * 8.0);  // 11 of 21 at 8 us: bin centre
+    CHECK_NEAR(s.probe.maxUs, 34.0, 1e-12);
+    CHECK_NEAR(s.probe.minUs, 10.0, 1e-12);
+    m.requestReset();
+    rec(100.0, 3, 3);
+    const auto r = m.snapshot();
+    CHECK(r.cpu.tracked == 1 && r.cpu.buffers[3] == 1 && r.cpu.buffers[6] == 0 && r.cpu.migrations == 0);
+    CHECK(r.probe.count == 0 && r.probe.latency.count == 0 && r.cpu.probeRuns[1] == 0);
 }

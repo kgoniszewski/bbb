@@ -149,6 +149,10 @@ final class AppModel: ObservableObject {
     static let speedProbeInterval = 8
     /// The probe on the benchmark thread at the last benchmark run (reference).
     private var benchProbe: pm_speed_probe_stats?
+    /// Its two parts (latency-bound, throughput-bound), the reference for the ratios.
+    private var benchProbeSplit: pm_speed_probe_split?
+    /// Performance levels and the assumed CPU-number-to-core-type mapping.
+    let coreLayout = CoreLayout.read()
     // Offline benchmark (Benchmark tab)
     @Published var benchRunning = false
     @Published var benchProgress = ""
@@ -162,11 +166,18 @@ final class AppModel: ObservableObject {
     @Published var benchEvict = false
     /// Phase timing during the scenarios (the live meter's phase split uses it too).
     @Published var benchPhases = true
+    /// Paced runs in an audio thread's scheduling class: time-constraint
+    /// policy and an audio work interval with each buffer's deadline
+    /// (PacedRealtime). Off: the benchmark thread's normal QoS (userInteractive).
+    @Published var benchRealtime = true
     /// Scenario run on the audio thread ("Run on audio thread"), an index into sceneNames.
     @Published var sceneItem = 0
     /// Run the scene on a private engine prepared as the benchmark's (not the app's instance).
     @Published var sceneFreshEngine = false
     @Published var sceneRunning = false
+    /// Scenes still to run after the current one ("Run all on audio thread").
+    private var sceneQueue: [Int] = []
+    private var sceneSeries = 0  // scenes in the running series (0: a single scene)
     /// The scenario names (benchmark items without the hammer micro-benchmark).
     let sceneNames: [String] = {
         var c = pm_bench_config()
@@ -179,7 +190,6 @@ final class AppModel: ObservableObject {
     private var benchConfigText = ""   // the benchmark engine's configuration (last scenario run)
     private var sceneConfigText = ""   // the audio-thread run's engine configuration
     private var benchHeader = ""
-    private let benchQueue = DispatchQueue(label: "piano.benchmark", qos: .userInteractive)
     // Controls
     @Published var sustainDown = false
     @Published var tier: QualityTier = .full
@@ -475,6 +485,12 @@ final class AppModel: ObservableObject {
             out += String(format: " -> audio thread ran at %.2fx (mean), %.2fx (median), %.2fx (fastest run)",
                           ref.median_us / p.mean_us, ref.median_us / p.median_us, ref.median_us / p.min_us)
         }
+        let split = host.speedProbeSplit()
+        if split.latency.runs > 0 {
+            let refSplit = benchProbeSplit ?? EngineHost.runSpeedProbeSplit(runs: 101)
+            out += "\n  parts on the audio thread: " + probeSplitText(split, reference: refSplit)
+            if benchProbeSplit == nil { out += " (reference: main thread now, no benchmark run yet)" }
+        }
         return out
     }
 
@@ -498,6 +514,7 @@ final class AppModel: ObservableObject {
         out += ", thermal state \(AppModel.thermalName(info.thermalState))"
         if info.isLowPowerModeEnabled { out += ", low power mode" }
         out += "\n"
+        out += "cores: " + coreLayout.description + "\n"
         return out
     }
 
@@ -570,6 +587,8 @@ final class AppModel: ObservableObject {
             out += "thread CPU time: off\n"
         }
         out += speedProbeText() + "\n"
+        out += "cores: " + coreLayout.description + "\n"
+        for line in coreLayout.usageLines(host.cpuUsage(), indent: "") { out += line + "\n" }
         out += processCpuText() + "\n"
         out += "UI cost test: \(uiCost.mode.label)\n"
         out += "(loads are render time / each buffer's own period; p99 is the upper edge of a 0.25 % bin)\n"
@@ -640,6 +659,7 @@ final class AppModel: ObservableObject {
         if benchPhases { flags |= PM_BENCH_PHASE_TIMING.rawValue }
         if benchPaced { flags |= PM_BENCH_PACED.rawValue }
         if benchEvict { flags |= PM_BENCH_PACED_EVICT.rawValue }
+        if speedProbe { flags |= PM_BENCH_SPEED_PROBE.rawValue }  // the Diagnostics switch
         config.flags = Int32(flags)
         return config
     }
@@ -656,7 +676,15 @@ final class AppModel: ObservableObject {
         benchHeader += String(format: "fs %.0f Hz, %d-frame buffers (%.0f us), ", rate, frames, Double(frames) / rate * 1e6)
         benchHeader += "board-on cases at tier \(tier.label), 3 s per case; audio paused during the run; "
         benchHeader += benchEvict ? "paced to real time with a 32 MiB eviction walk between buffers" : (benchPaced ? "paced to real time" : "buffers back to back")
-        benchHeader += benchPhases ? ", phase timing on\n" : ", phase timing off\n"
+        benchHeader += benchPhases ? ", phase timing on" : ", phase timing off"
+        benchHeader += speedProbe ? ", speed probe before every 8th buffer\n" : "\n"
+        benchHeader += "benchmark thread: a dedicated thread at QoS userInteractive"
+        if benchPaced || benchEvict {
+            benchHeader += benchRealtime
+                ? "; paced loop on a time-constraint (real-time) policy in its own audio work interval with each buffer's deadline, as an audio I/O thread"
+                : "; paced loop at that QoS (NOT an audio thread's scheduling class: no real-time policy, no workgroup deadlines)"
+        }
+        benchHeader += ". Audio-thread rows: the real Core Audio I/O thread (real-time, in the output device's workgroup).\n"
         if let ac = audioController {
             ac.suspendOutput { [weak self] in
                 self?.startBenchmark(config)
@@ -670,13 +698,25 @@ final class AppModel: ObservableObject {
         var cfg = config
         let count = Int(pm_bench_item_count(&cfg))
         benchProgress = "0/\(count)"
-        benchQueue.async { [weak self] in
+        let layout = coreLayout
+        let paced = (config.flags & Int32(PM_BENCH_PACED.rawValue | PM_BENCH_PACED_EVICT.rawValue)) != 0
+        let realtime = paced && benchRealtime
+        // A dedicated thread rather than a dispatch queue: the paced loop may
+        // change its scheduling policy (PacedRealtime), which must not leak
+        // into a pooled worker thread.
+        let thread = Thread { [weak self] in
+            let rt = realtime ? PacedRealtime() : nil
+            rt?.install()
             // The speed probe's reference: the same workload as on the audio
-            // thread, here on the benchmark thread.
+            // thread, here on the benchmark thread, back to back.
             let probe = EngineHost.runSpeedProbe(runs: 501)
-            let probeLine = String(format: "speed probe on the benchmark thread: min %.2f / median %.2f us", probe.min_us, probe.median_us)
+            let split = EngineHost.runSpeedProbeSplit(runs: 501)
+            var probeLine = String(format: "speed probe on the benchmark thread: min %.2f / median %.2f us", probe.min_us, probe.median_us)
+            probeLine += String(format: " (latency-bound part %.2f, throughput-bound part %.2f us, medians); on %@ now",
+                                split.latency.median_us, split.throughput.median_us, layout.label(EngineHost.currentCpu))
             DispatchQueue.main.async {
                 self?.benchProbe = probe
+                self?.benchProbeSplit = split
                 self?.benchLines.append(probeLine)
             }
             var c = config
@@ -688,20 +728,33 @@ final class AppModel: ObservableObject {
                 var r = pm_bench_result()
                 let ok = pm_bench_run_item(&c, Int32(i), &r) == 1
                 var lines = [AppModel.benchLine(name: name, result: r, ok: ok)]
-                if ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue) { lines += AppModel.benchDetailLines(r) }
+                if ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue) {
+                    lines += AppModel.benchDetailLines(r)
+                    lines += layout.usageLines(EngineHost.benchLastCpuUsage())
+                    let ps = EngineHost.benchLastProbeSplit()
+                    if ps.latency.runs > 0 {
+                        lines.append("    speed probe before every 8th buffer (\(ps.latency.runs) runs): " + probeSplitText(ps, reference: split))
+                    }
+                }
                 let conf = ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue) ? AppModel.benchLastConfig() : nil
                 DispatchQueue.main.async {
                     self?.benchLines.append(contentsOf: lines)
                     if let conf = conf { self?.benchConfigText = conf }
                 }
             }
+            rt?.uninstall()
+            let notes = rt?.notes ?? []
             DispatchQueue.main.async {
                 guard let self = self else { return }
+                if !notes.isEmpty { self.benchLines.append("paced thread: " + notes.joined(separator: "; ")) }
                 self.benchRunning = false
                 self.benchProgress = "Done (\(count) items); audio resumed"
                 self.audioController?.resumeOutput()
             }
         }
+        thread.name = "piano.benchmark"
+        thread.qualityOfService = .userInteractive
+        thread.start()
     }
 
     static let benchColumns = "case".padding(toLength: 38, withPad: " ", startingAt: 0)
@@ -785,19 +838,49 @@ final class AppModel: ObservableObject {
     /// probe over the run. Uses the Benchmark tab's seconds, tier and phase
     /// timing; the frame count and sample rate are the device's.
     func runOnAudioThread() {
-        guard let host = host, !benchRunning, !sceneRunning else { return }
+        guard !benchRunning, !sceneRunning else { return }
         guard sceneItem >= 0 && sceneItem < sceneNames.count else { return }
+        sceneQueue = []
+        sceneSeries = 0
+        appendSceneHeader(count: 1)
+        startScene(item: sceneItem)
+    }
+
+    /// Every scene in the list, one after the other, on the audio thread
+    /// (one row each, the same format), so that a full paced-on-the-audio-
+    /// thread table needs one tap. Cancel stops the series.
+    func runAllOnAudioThread() {
+        guard !benchRunning, !sceneRunning, !sceneNames.isEmpty else { return }
+        sceneQueue = Array(1..<sceneNames.count)
+        sceneSeries = sceneNames.count
+        appendSceneHeader(count: sceneNames.count)
+        startScene(item: 0)
+    }
+
+    private func appendSceneHeader(count: Int) {
+        var line = "audio-thread runs (\(count) scene\(count == 1 ? "" : "s")): the real Core Audio I/O thread, "
+        line += String(format: "%.0f Hz, I/O buffer %d frames; ", audio.sampleRate, audio.ioBufferFrames)
+        line += sceneFreshEngine ? "benchmark-prepared engine" : "app engine (reset first)"
+        line += speedProbe ? "; speed probe every \(AppModel.speedProbeInterval) buffers" : "; speed probe off (Diagnostics)"
+        line += benchPhases ? "; phase timing on (CPU numbers recorded)" : "; phase timing off"
+        benchLines.append(line)
+    }
+
+    private func startScene(item: Int) {
+        guard let host = host else { return }
         var config = benchConfig()
         config.flags &= ~Int32(PM_BENCH_ALL_TIERS.rawValue)  // sceneNames are the default item list
         if sceneFreshEngine { config.flags |= Int32(PM_BENCH_SCENE_FRESH_ENGINE.rawValue) }
-        sceneName = sceneNames[sceneItem]
+        sceneName = sceneNames[item]
         sceneRunning = true
-        benchProgress = "Starting \(sceneName) on the audio thread"
+        let position = sceneSeries > 0 ? " (\(item + 1)/\(sceneSeries))" : ""
+        benchProgress = "Starting \(sceneName) on the audio thread" + position
         if benchHeader.isEmpty { benchHeader = "Piano benchmark, \(Date())\n" + environmentText() }
-        host.startScene(config: config, item: sceneItem) { [weak self] ok in
+        host.startScene(config: config, item: item) { [weak self] ok in
             guard let self = self else { return }
             guard ok else {
                 self.sceneRunning = false
+                self.sceneQueue = []
                 self.benchProgress = "Could not start the scene (audio not running or engine not prepared)"
                 return
             }
@@ -810,6 +893,7 @@ final class AppModel: ObservableObject {
     }
 
     func cancelScene() {
+        sceneQueue = []
         host?.cancelScene()
     }
 
@@ -821,14 +905,28 @@ final class AppModel: ObservableObject {
         sceneTimer = nil
         sceneRunning = false
         guard r.state == Int32(PM_SCENE_DONE.rawValue) else {
+            sceneQueue = []
             benchProgress = "Scene cancelled"
             return
         }
         benchProgress = "Done: \(sceneName) on the audio thread"
         benchLines.append(contentsOf: AppModel.sceneLines(name: sceneName, result: r, benchProbe: benchProbe))
+        benchLines.append(contentsOf: coreLayout.usageLines(host.sceneCpuUsage()))
+        let ps = host.sceneProbeSplit()
+        if ps.latency.runs > 0 {
+            benchLines.append("    speed probe parts over the run: " + probeSplitText(ps, reference: benchProbeSplit))
+        }
         // The engine keeps playing from the scene's end state: silence it.
         host.allNotesOff()
         host.pushNow(PM_EVENT_SUSTAIN, value: 0)
+        if !sceneQueue.isEmpty {
+            let next = sceneQueue.removeFirst()
+            // A moment for the all-notes-off to land; the next scene resets the engine anyway.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                guard let self = self, !self.sceneRunning, !self.benchRunning else { return }
+                self.startScene(item: next)
+            }
+        }
     }
 
     static func sceneLines(name: String, result r: pm_host_scene_result, benchProbe: pm_speed_probe_stats?) -> [String] {

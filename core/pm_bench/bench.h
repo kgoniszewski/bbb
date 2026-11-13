@@ -55,6 +55,18 @@
 // back to back isolates nothing but the gap, spin + eviction the caches
 // alone, and sleep against spin the core's power state and clock.
 //
+// Scheduling class: the paced loop runs on the calling thread, in whatever
+// scheduling class that thread has. A real audio thread is a time-constraint
+// (real-time) thread in the audio device's workgroup, whose deadlines the
+// system's performance controller sees; an ordinary thread that sleeps
+// between buffers is not. Config::paceHook lets the caller put the paced
+// loop into an audio thread's class (the app: time-constraint policy and an
+// audio work interval, start / finish per buffer with its deadline) without
+// platform code here.
+//
+// CPU numbers (cpu_id.h) are read right before and after every measured
+// render call (outside the timed interval) and tallied per CPU.
+//
 // Phase timing (Config::phaseTiming) is the engine's run-time switch, the
 // same one the app's diagnostics use; bench_engine turns it on for its
 // per-phase breakdown and can run every case with it off as well, to
@@ -66,6 +78,7 @@
 #include <vector>
 
 #include "pm_engine/engine.h"
+#include "pm_host/cpu_id.h"
 
 namespace pm::bench {
 
@@ -81,6 +94,10 @@ struct Config {
     bool spin = false;        // paced only: busy-wait to the deadline instead of sleeping (core stays awake)
     std::size_t evictBytes = 0;  // paced only: scratch walked between buffers (0: none)
     int probeEvery = 0;       // > 0: the speed probe right before every Nth render call (untimed), as the host does
+    // Paced only: called on this thread (event: 0 begin, ns = period; 1
+    // before a render call, ns = time to its deadline; 2 after it; 3 end).
+    void (*paceHook)(void* ctx, int event, std::int64_t ns) = nullptr;
+    void* paceCtx = nullptr;
 };
 
 // Default eviction buffer of --paced-evict / PM_BENCH_PACED_EVICT: larger
@@ -163,7 +180,13 @@ struct ScenarioResult {
     // and mean (us). After a sleep it shows whether the core itself is
     // slower on waking (clock, power state) rather than its caches colder.
     int probeRuns = 0;
-    double probeMedianUs = 0.0, probeMeanUs = 0.0;
+    double probeMedianUs = 0.0, probeMeanUs = 0.0;  // the whole probe
+    struct ProbeStats {
+        int runs = 0;
+        double minUs = 0.0, medianUs = 0.0, meanUs = 0.0, maxUs = 0.0;
+    };
+    ProbeStats probeLatency, probeThroughput;  // its two parts (speed_probe.h)
+    host::CpuUsage cpu;  // CPUs of the measured render calls
     bool paced = false, spin = false;
     std::size_t evictBytes = 0;
 };
