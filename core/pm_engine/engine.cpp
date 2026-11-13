@@ -1054,6 +1054,7 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             const std::int64_t age = now - static_cast<std::int64_t>(hammers_[active_[a]].launchTime);
             len = std::min<std::int64_t>(len, kSubBlock - age % kSubBlock);
         }
+        if (subBlockHook_) subBlockHook_(subBlockCtx_);
         processSubBlock(left + pos, right + pos, static_cast<int>(len), now);
         pos += len;
     }

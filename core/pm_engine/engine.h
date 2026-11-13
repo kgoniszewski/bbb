@@ -363,6 +363,16 @@ public:
     // Any thread; takes effect at the next render().
     void setPhaseTiming(bool on) noexcept { phaseTiming_.store(on, std::memory_order_relaxed); }
     bool phaseTiming() const noexcept { return phaseTiming_.load(std::memory_order_relaxed); }
+    // Called by render() right before each sub-block (the segments counted in
+    // RenderInfo::subBlocks), on the rendering thread; for diagnostics that
+    // sample per-sub-block state such as the CPU number. Must be real-time
+    // safe. Set it on the rendering thread between render() calls, or while
+    // render() cannot run (inside the host's prepare gate); null removes it.
+    using SubBlockHook = void (*)(void* ctx) noexcept;
+    void setSubBlockHook(SubBlockHook hook, void* ctx) noexcept {
+        subBlockHook_ = hook;
+        subBlockCtx_ = hook ? ctx : nullptr;
+    }
 
     // Back to the state right after prepare() (silence, dampers seated,
     // pedals up, sample time 0), keeping the prepared tables, parameters and
@@ -593,6 +603,8 @@ private:
     ProfClock::time_point profT_{};
     bool profiling_ = false;
     std::atomic<bool> phaseTiming_{false};
+    SubBlockHook subBlockHook_ = nullptr;
+    void* subBlockCtx_ = nullptr;
     std::uint64_t damperUpdates_ = 0;  // counter, for RenderInfo::damperUpdates
 };
 

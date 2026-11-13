@@ -1,6 +1,7 @@
 /* The C API compiles as C and drives the engine end to end. */
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "pm_api/pm_api.h"
 
@@ -24,6 +25,12 @@ int main(void) {
 
     EXPECT(pm_api_version() == ((PM_API_VERSION_MAJOR << 16) | (PM_API_VERSION_MINOR << 8) |
                                 PM_API_VERSION_PATCH));
+    {
+        /* The version string starts with the macros' number (0.10.0 was once left behind). */
+        char want[32];
+        snprintf(want, sizeof want, "%d.%d.%d ", PM_API_VERSION_MAJOR, PM_API_VERSION_MINOR, PM_API_VERSION_PATCH);
+        EXPECT(strncmp(pm_version_string(), want, strlen(want)) == 0);
+    }
     EXPECT(eng != NULL);
     EXPECT(pm_engine_prepare(eng, 48000.0, 256) == 1);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_MASTER_GAIN_DB, -6.0) == 1);

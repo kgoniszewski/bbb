@@ -147,10 +147,9 @@ final class AppModel: ObservableObject {
     let uiCost = UICostStore()
     /// Speed probe on the audio thread: every this many render calls.
     static let speedProbeInterval = 8
-    /// The probe on the benchmark thread at the last benchmark run (reference).
-    private var benchProbe: pm_speed_probe_stats?
-    /// Its two parts (latency-bound, throughput-bound), the reference for the ratios.
-    private var benchProbeSplit: pm_speed_probe_split?
+    /// The speed probe's reference for the "x slower" ratios (see
+    /// ProbeReference): from the last benchmark run, or nil before one.
+    private var probeRef: ProbeReference?
     /// Performance levels and the assumed CPU-number-to-core-type mapping.
     let coreLayout = CoreLayout.read()
     // Offline benchmark (Benchmark tab)
@@ -174,6 +173,19 @@ final class AppModel: ObservableObject {
     @Published var sceneItem = 0
     /// Run the scene on a private engine prepared as the benchmark's (not the app's instance).
     @Published var sceneFreshEngine = false
+    /// Load multiplier of the audio-thread runs: engines rendered per buffer
+    /// (1...PM_SCENE_MAX_LOAD; > 1 uses benchmark-prepared engines, about 6 MB each).
+    @Published var sceneLoadK = 1
+    static let maxLoad = Int(PM_SCENE_MAX_LOAD)
+    /// Headroom sweep: the selected scene at these loads, one after the other.
+    static let sweepLoads = [1, 2, 3, 4, 6, 8]
+    @Published var sweepRunning = false
+    private var sweepQueue: [Int] = []
+    private var sweepRows: [String] = []
+    private var sweepItem = 0
+    /// Back-to-back benchmark means (us) by scene name, with their buffer
+    /// size and rate, for the sweep's full-speed prediction.
+    private var b2bMeans: [String: (meanUs: Double, frames: Int, rate: Double)] = [:]
     @Published var sceneRunning = false
     /// Scenes still to run after the current one ("Run all on audio thread").
     private var sceneQueue: [Int] = []
@@ -470,26 +482,11 @@ final class AppModel: ObservableObject {
         if p.interval == 0 && p.runs == 0 { return "audio-thread speed probe: off" }
         var out = "audio-thread speed probe (every \(p.interval) buffers, \(p.runs) runs): "
         guard p.runs > 0 else { return out + "no runs yet" }
-        out += String(format: "min %.1f / median %.1f / mean %.1f / max %.1f us", p.min_us, p.median_us, p.mean_us, p.max_us)
-        let ref: pm_speed_probe_stats
-        let refName: String
-        if let b = benchProbe {
-            ref = b
-            refName = "benchmark thread"
-        } else {
-            ref = EngineHost.runSpeedProbe(runs: 101)
-            refName = "main thread now (no benchmark run yet)"
-        }
-        out += String(format: "; %@ %.1f us (median, min %.1f)", refName, ref.median_us, ref.min_us)
-        if p.mean_us > 0 && p.median_us > 0 && p.min_us > 0 {
-            out += String(format: " -> audio thread ran at %.2fx (mean), %.2fx (median), %.2fx (fastest run)",
-                          ref.median_us / p.mean_us, ref.median_us / p.median_us, ref.median_us / p.min_us)
-        }
+        out += String(format: "min %.1f / median %.1f / mean %.1f / max %.1f us (both parts)", p.min_us, p.median_us, p.mean_us, p.max_us)
         let split = host.speedProbeSplit()
         if split.latency.runs > 0 {
-            let refSplit = benchProbeSplit ?? EngineHost.runSpeedProbeSplit(runs: 101)
-            out += "\n  parts on the audio thread: " + probeSplitText(split, reference: refSplit)
-            if benchProbeSplit == nil { out += " (reference: main thread now, no benchmark run yet)" }
+            let ref = probeRef ?? ProbeReference.warmedUp(source: "a warmed-up series on the main thread now (no benchmark run yet)")
+            out += "\n  parts on the audio thread: " + probeSplitText(split, reference: ref)
         }
         return out
     }
@@ -665,7 +662,7 @@ final class AppModel: ObservableObject {
     }
 
     func runBenchmark() {
-        guard !benchRunning, !sceneRunning, host != nil else { return }
+        guard !benchRunning, !sceneRunning, !sweepRunning, host != nil else { return }
         benchRunning = true
         benchLines = []
         benchProgress = "Pausing audio"
@@ -708,15 +705,16 @@ final class AppModel: ObservableObject {
             let rt = realtime ? PacedRealtime() : nil
             rt?.install()
             // The speed probe's reference: the same workload as on the audio
-            // thread, here on the benchmark thread, back to back.
-            let probe = EngineHost.runSpeedProbe(runs: 501)
-            let split = EngineHost.runSpeedProbeSplit(runs: 501)
-            var probeLine = String(format: "speed probe on the benchmark thread: min %.2f / median %.2f us", probe.min_us, probe.median_us)
-            probeLine += String(format: " (latency-bound part %.2f, throughput-bound part %.2f us, medians); on %@ now",
-                                split.latency.median_us, split.throughput.median_us, layout.label(EngineHost.currentCpu))
+            // thread, here on the benchmark thread, after a warm-up (the
+            // thread's core and clock ramp up under load), then lowered by
+            // the per-row medians of back-to-back rows that ran on
+            // performance cores only.
+            var ref = ProbeReference.warmedUp(source: "warmed-up series on the benchmark thread")
+            let probeLine = String(format: "speed probe on the benchmark thread, warmed up (min of 10 medians of 101 runs): latency-bound part %.2f us, throughput-bound part %.2f us; on %@ now",
+                                   ref.latencyUs, ref.throughputUs, layout.label(EngineHost.currentCpu))
+            let ref0 = ref
             DispatchQueue.main.async {
-                self?.benchProbe = probe
-                self?.benchProbeSplit = split
+                self?.probeRef = ref0
                 self?.benchLines.append(probeLine)
             }
             var c = config
@@ -728,25 +726,38 @@ final class AppModel: ObservableObject {
                 var r = pm_bench_result()
                 let ok = pm_bench_run_item(&c, Int32(i), &r) == 1
                 var lines = [AppModel.benchLine(name: name, result: r, ok: ok)]
-                if ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue) {
+                let scenario = ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue)
+                if scenario {
                     lines += AppModel.benchDetailLines(r)
-                    lines += layout.usageLines(EngineHost.benchLastCpuUsage())
+                    let usage = EngineHost.benchLastCpuUsage()
+                    lines += layout.usageLines(usage)
                     let ps = EngineHost.benchLastProbeSplit()
                     if ps.latency.runs > 0 {
-                        lines.append("    speed probe before every 8th buffer (\(ps.latency.runs) runs): " + probeSplitText(ps, reference: split))
+                        lines.append("    speed probe before every 8th buffer (\(ps.latency.runs) runs): " + probeSplitText(ps, reference: ref))
+                        if r.paced == 0 && layout.onlyFastest(probeRunsOf: usage) {
+                            ref.lower(with: ps, source: "back-to-back row '\(name)' on performance cores")
+                        }
                     }
                 }
-                let conf = ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue) ? AppModel.benchLastConfig() : nil
+                let conf = scenario ? AppModel.benchLastConfig() : nil
+                let refNow = ref
+                let b2b: (String, Double)? = scenario && r.paced == 0 ? (name, r.mean_us) : nil
+                let frames = Int(config.block_frames)
+                let rate = config.sample_rate
                 DispatchQueue.main.async {
                     self?.benchLines.append(contentsOf: lines)
+                    self?.probeRef = refNow
                     if let conf = conf { self?.benchConfigText = conf }
+                    if let b = b2b { self?.b2bMeans[b.0] = (meanUs: b.1, frames: frames, rate: rate) }
                 }
             }
             rt?.uninstall()
             let notes = rt?.notes ?? []
+            let refLine = "speed probe reference from now on: " + ref.description
             DispatchQueue.main.async {
                 guard let self = self else { return }
                 if !notes.isEmpty { self.benchLines.append("paced thread: " + notes.joined(separator: "; ")) }
+                self.benchLines.append(refLine)
                 self.benchRunning = false
                 self.benchProgress = "Done (\(count) items); audio resumed"
                 self.audioController?.resumeOutput()
@@ -832,60 +843,95 @@ final class AppModel: ObservableObject {
 
     /// Plays the selected scenario's events through the real host and audio
     /// render path in real time (audible), on the app's engine (reset to its
-    /// just-prepared state first) or, with sceneFreshEngine, on a private
-    /// engine prepared as the benchmark's; then appends a row with the same
-    /// statistics, phase split and counts as a benchmark row, and the speed
-    /// probe over the run. Uses the Benchmark tab's seconds, tier and phase
-    /// timing; the frame count and sample rate are the device's.
+    /// just-prepared state first) or, with sceneFreshEngine or a load above
+    /// 1, on benchmark-prepared engines; then appends a row with the same
+    /// statistics, phase split and counts as a benchmark row, the CPUs, the
+    /// load multiplier's CPU trace and the speed probe over the run (the
+    /// probe is switched on for the run). Uses the Benchmark tab's tier and
+    /// phase timing; the frame count and sample rate are the device's.
     func runOnAudioThread() {
-        guard !benchRunning, !sceneRunning else { return }
+        guard !benchRunning, !sceneRunning, !sweepRunning else { return }
         guard sceneItem >= 0 && sceneItem < sceneNames.count else { return }
         sceneQueue = []
         sceneSeries = 0
-        appendSceneHeader(count: 1)
-        startScene(item: sceneItem)
+        appendSceneHeader(count: 1, load: sceneLoadK)
+        startScene(item: sceneItem, load: sceneLoadK)
     }
 
     /// Every scene in the list, one after the other, on the audio thread
     /// (one row each, the same format), so that a full paced-on-the-audio-
     /// thread table needs one tap. Cancel stops the series.
     func runAllOnAudioThread() {
-        guard !benchRunning, !sceneRunning, !sceneNames.isEmpty else { return }
+        guard !benchRunning, !sceneRunning, !sweepRunning, !sceneNames.isEmpty else { return }
         sceneQueue = Array(1..<sceneNames.count)
         sceneSeries = sceneNames.count
-        appendSceneHeader(count: sceneNames.count)
-        startScene(item: 0)
+        appendSceneHeader(count: sceneNames.count, load: sceneLoadK)
+        startScene(item: 0, load: sceneLoadK)
     }
 
-    private func appendSceneHeader(count: Int) {
+    /// Headroom sweep: the selected scene (default: worst) on the audio
+    /// thread at loads 1, 2, 3, 4, 6 and 8, stopping after a load whose
+    /// overruns exceed 20 % of the buffers; then a compact table with the
+    /// full-speed prediction (load x the last back-to-back benchmark mean of
+    /// the scene at the same buffer size). Render time growing about K-fold
+    /// from the load-1 figure means the thread had no headroom; staying near
+    /// the prediction means the system speeds the thread up as needed.
+    func runHeadroomSweep() {
+        guard !benchRunning, !sceneRunning, !sweepRunning else { return }
+        guard sceneItem >= 0 && sceneItem < sceneNames.count else { return }
+        sceneQueue = []
+        sceneSeries = 0
+        sweepItem = sceneItem
+        sweepQueue = Array(AppModel.sweepLoads.dropFirst())
+        sweepRows = []
+        sweepRunning = true
+        benchLines.append("headroom sweep: \(sceneNames[sweepItem]) at load \u{00D7}"
+                          + AppModel.sweepLoads.map { String($0) }.joined(separator: ", ")
+                          + " (stops after a load with more than 20 % overruns)")
+        appendSceneHeader(count: 1, load: AppModel.sweepLoads[0])
+        startScene(item: sweepItem, load: AppModel.sweepLoads[0])
+    }
+
+    private func appendSceneHeader(count: Int, load: Int) {
         var line = "audio-thread runs (\(count) scene\(count == 1 ? "" : "s")): the real Core Audio I/O thread, "
         line += String(format: "%.0f Hz, I/O buffer %d frames; ", audio.sampleRate, audio.ioBufferFrames)
-        line += sceneFreshEngine ? "benchmark-prepared engine" : "app engine (reset first)"
-        line += speedProbe ? "; speed probe every \(AppModel.speedProbeInterval) buffers" : "; speed probe off (Diagnostics)"
-        line += benchPhases ? "; phase timing on (CPU numbers recorded)" : "; phase timing off"
+        if load > 1 {
+            line += "load \u{00D7}\(load): \(load) benchmark-prepared engines per buffer, the first one heard"
+        } else {
+            line += sceneFreshEngine ? "benchmark-prepared engine" : "app engine (reset first)"
+        }
+        line += "; speed probe every 8 buffers (on for the run)"
+        line += benchPhases ? "; phase timing on" : "; phase timing off"
+        line += "; CPU number read at every sub-block until the first change"
         benchLines.append(line)
     }
 
-    private func startScene(item: Int) {
+    private func startScene(item: Int, load: Int) {
         guard let host = host else { return }
         var config = benchConfig()
         config.flags &= ~Int32(PM_BENCH_ALL_TIERS.rawValue)  // sceneNames are the default item list
         if sceneFreshEngine { config.flags |= Int32(PM_BENCH_SCENE_FRESH_ENGINE.rawValue) }
+        // The probe on for the run (the host switches it off again afterwards
+        // if it was off), so every row has its line and the CPU numbers.
+        config.flags |= Int32(PM_BENCH_SPEED_PROBE.rawValue)
+        let k = max(1, min(AppModel.maxLoad, load))
         sceneName = sceneNames[item]
         sceneRunning = true
         let position = sceneSeries > 0 ? " (\(item + 1)/\(sceneSeries))" : ""
-        benchProgress = "Starting \(sceneName) on the audio thread" + position
+        benchProgress = (k > 1 ? "Preparing \(k) engines for " : "Starting ") + sceneName + " on the audio thread" + position
         if benchHeader.isEmpty { benchHeader = "Piano benchmark, \(Date())\n" + environmentText() }
-        host.startScene(config: config, item: item) { [weak self] ok in
+        host.startScene(config: config, item: item, load: k) { [weak self] ok in
             guard let self = self else { return }
             guard ok else {
                 self.sceneRunning = false
                 self.sceneQueue = []
-                self.benchProgress = "Could not start the scene (audio not running or engine not prepared)"
+                if self.sweepRunning { self.finishSweep(note: "stopped: the scene could not start") }
+                self.benchProgress = "Could not start the scene (audio not running, engine not prepared, or out of memory)"
                 return
             }
             self.sceneConfigText = host.sceneConfig()
-            self.benchProgress = "Playing \(self.sceneName) on the audio thread (\(self.sceneFreshEngine ? "benchmark-prepared engine" : "app engine")); leave the keyboard alone"
+            let what = k > 1 ? "load \u{00D7}\(k)" : (self.sceneFreshEngine ? "benchmark-prepared engine" : "app engine")
+            self.benchProgress = "Playing \(self.sceneName) on the audio thread (\(what)); leave the keyboard alone"
             let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.pollScene() }
             RunLoop.main.add(t, forMode: .common)
             self.sceneTimer = t
@@ -894,7 +940,12 @@ final class AppModel: ObservableObject {
 
     func cancelScene() {
         sceneQueue = []
-        host?.cancelScene()
+        sweepQueue = []
+        if sceneRunning {
+            host?.cancelScene()
+        } else if sweepRunning {
+            finishSweep(note: "cancelled")  // between two loads
+        }
     }
 
     private func pollScene() {
@@ -906,36 +957,121 @@ final class AppModel: ObservableObject {
         sceneRunning = false
         guard r.state == Int32(PM_SCENE_DONE.rawValue) else {
             sceneQueue = []
+            if sweepRunning { finishSweep(note: "cancelled") }
             benchProgress = "Scene cancelled"
             return
         }
         benchProgress = "Done: \(sceneName) on the audio thread"
-        benchLines.append(contentsOf: AppModel.sceneLines(name: sceneName, result: r, benchProbe: benchProbe))
-        benchLines.append(contentsOf: coreLayout.usageLines(host.sceneCpuUsage()))
+        let load = host.sceneLoad()
         let ps = host.sceneProbeSplit()
+        benchLines.append(contentsOf: AppModel.sceneLines(name: sceneName, result: r, load: Int(load.load), reference: probeRef))
+        benchLines.append(contentsOf: coreLayout.usageLines(host.sceneCpuUsage()))
+        benchLines.append(contentsOf: coreLayout.loadLines(load))
         if ps.latency.runs > 0 {
-            benchLines.append("    speed probe parts over the run: " + probeSplitText(ps, reference: benchProbeSplit))
+            benchLines.append("    speed probe parts over the run: " + probeSplitText(ps, reference: probeRef))
         }
         // The engine keeps playing from the scene's end state: silence it.
         host.allNotesOff()
         host.pushNow(PM_EVENT_SUSTAIN, value: 0)
+        if sweepRunning {
+            sweepRows.append(sweepRow(result: r, load: load, probe: ps))
+            let overrunShare = r.buffers > 0 ? Double(r.overruns) / Double(r.buffers) : 0.0
+            if overrunShare > 0.2 {
+                finishSweep(note: String(format: "stopped after load \u{00D7}%d: %.0f %% of its buffers overran", load.load, 100.0 * overrunShare))
+            } else if sweepQueue.isEmpty {
+                finishSweep(note: "complete")
+            } else {
+                let next = sweepQueue.removeFirst()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                    guard let self = self, self.sweepRunning, !self.sceneRunning, !self.benchRunning else { return }
+                    self.appendSceneHeader(count: 1, load: next)
+                    self.startScene(item: self.sweepItem, load: next)
+                }
+            }
+            return
+        }
         if !sceneQueue.isEmpty {
             let next = sceneQueue.removeFirst()
             // A moment for the all-notes-off to land; the next scene resets the engine anyway.
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
                 guard let self = self, !self.sceneRunning, !self.benchRunning else { return }
-                self.startScene(item: next)
+                self.startScene(item: next, load: self.sceneLoadK)
             }
         }
     }
 
-    static func sceneLines(name: String, result r: pm_host_scene_result, benchProbe: pm_speed_probe_stats?) -> [String] {
-        let label = (r.fresh_engine == 1 ? "audio thread, bench engine: " : "audio thread, app engine: ") + name
+    static let sweepColumns = "  load  mean us   p99 us   max us  max %  overruns    ended on P  changed CPU  us before   probe lat / thr (vs full speed)      load x b2b  mean / (load x b2b)"
+
+    /// One row of the sweep table.
+    private func sweepRow(result r: pm_host_scene_result, load l: pm_scene_load, probe ps: pm_speed_probe_split) -> String {
+        let buffers = max(1, Int(r.buffers))
+        var row = String(format: "  %4d %8.0f %8.0f %8.0f %6.1f %4d (%4.1f %%)", l.load, r.mean_us, r.p99_us, r.max_us,
+                         r.max_load * 100, r.overruns, 100.0 * Double(r.overruns) / Double(buffers))
+        if let p = coreLayout.endOnFastestShare(l) {
+            row += String(format: "  %10.0f %%", 100.0 * p)
+        } else {
+            row += "           -"
+        }
+        if l.cpu_tracked == 1 && l.buffers > 0 {
+            row += String(format: "  %9.0f %%", 100.0 * Double(l.migrated) / Double(l.buffers))
+            row += l.migrated > 0 ? String(format: "  %9.0f", l.mean_us_before_migration) : "          -"
+        } else {
+            row += "            -          -"
+        }
+        if ps.latency.runs > 0 {
+            var probe = String(format: "   %5.1f / %5.1f us", ps.latency.median_us, ps.throughput.median_us)
+            if let ref = probeRef {
+                probe += String(format: " (%.1f\u{00D7} / %.1f\u{00D7} slower)", ps.latency.median_us / ref.latencyUs,
+                                ps.throughput.median_us / ref.throughputUs)
+            }
+            row += probe.padding(toLength: 37, withPad: " ", startingAt: 0)
+        } else {
+            row += "   probe off".padding(toLength: 37, withPad: " ", startingAt: 0)
+        }
+        if let b = b2bMeans[sceneName], b.frames == Int(r.max_frames), b.frames == Int(r.min_frames),
+           abs(b.rate - r.sample_rate) < 0.5 {
+            let predicted = Double(l.load) * b.meanUs
+            row += String(format: " %10.0f %10.2f", predicted, r.mean_us / predicted)
+        } else {
+            row += "          -          -"
+        }
+        return row
+    }
+
+    private func finishSweep(note: String) {
+        guard sweepRunning else { return }
+        sweepRunning = false
+        sweepQueue = []
+        let name = sweepItem < sceneNames.count ? sceneNames[sweepItem] : "?"
+        benchLines.append("headroom sweep, \(name): " + note)
+        benchLines.append(AppModel.sweepColumns)
+        benchLines.append(contentsOf: sweepRows)
+        var notes = "  (render time of all engines per buffer; overruns: render time above the buffer period; ended on P: "
+        notes += "buffers whose render call ended on a performance core; changed CPU: buffers that ran on another CPU before "
+        notes += "they ended, us before: mean time from the start of the render call to the first sub-block seen on another CPU; "
+        notes += "probe: audio-thread medians over the run against the full-speed reference"
+        if let ref = probeRef { notes += " (" + ref.description + ")" }
+        notes += "; load x b2b: the full-speed prediction, load x the last back-to-back benchmark mean of this scene"
+        if let b = b2bMeans[name] {
+            notes += String(format: " (%.0f us at %ld frames, %.0f Hz; '-' when the buffer size differs)", b.meanUs, b.frames, b.rate)
+        } else {
+            notes += " (none yet: run the benchmark with Paced off and the I/O buffer size, e.g. 512 frames at 44.1 kHz)"
+        }
+        notes += ". Mean growing about load-fold from the load-1 row: no headroom on this thread; staying near load x b2b: "
+        notes += "the system moves the thread to a fast core and clock as the work grows.)"
+        benchLines.append(notes)
+        sweepRows = []
+    }
+
+    static func sceneLines(name: String, result r: pm_host_scene_result, load: Int, reference: ProbeReference?) -> [String] {
+        let engine = load > 1 ? "audio thread, bench engines x\(load): " : (r.fresh_engine == 1 ? "audio thread, bench engine: " : "audio thread, app engine: ")
+        let label = engine + name
         var head = String(label.prefix(38)).padding(toLength: 38, withPad: " ", startingAt: 0)
         head += String(format: " %8.1f %8.1f %8.1f %8.2f %7.2f %7.2f", r.mean_us, r.p99_us, r.max_us,
                        r.mean_load * 100, r.p99_load * 100, r.max_load * 100)
-        head += String(format: "   (%d buffers of %d-%d frames at %.0f Hz; p99 to the meter's 1.5 %% bins)",
-                       r.buffers, r.min_frames, r.max_frames, r.sample_rate)
+        head += String(format: "   (%d buffers of %d-%d frames at %.0f Hz; %d overruns = %.1f %%; p99 to the meter's 1.5 %% bins)",
+                       r.buffers, r.min_frames, r.max_frames, r.sample_rate, r.overruns,
+                       100.0 * Double(r.overruns) / Double(max(1, Int(r.buffers))))
         var out = [head]
         if r.has_phases == 1 {
             out.append("    phases us (events / hammers / free / forced / board / other): mean " + phaseText(r.mean_phase_us)
@@ -948,15 +1084,15 @@ final class AppModel: ObservableObject {
                             usPerContact: r.hammer_us_per_contact_sample, overruns: r.overruns, worst: r.worst))
         let p = r.probe
         if p.runs > 0 {
-            var line = String(format: "    speed probe over the run (%llu runs): min %.1f / median %.1f / mean %.1f / max %.1f us",
+            var line = String(format: "    speed probe over the run (%llu runs, both parts): min %.1f / median %.1f / mean %.1f / max %.1f us",
                               p.runs, p.min_us, p.median_us, p.mean_us, p.max_us)
-            if let b = benchProbe, p.mean_us > 0, p.median_us > 0 {
-                line += String(format: "; benchmark thread %.1f us -> %.2fx (mean), %.2fx (median)", b.median_us,
-                               b.median_us / p.mean_us, b.median_us / p.median_us)
+            if let ref = reference {
+                line += "; median " + ProbeReference.ratioText(p.median_us, ref.latencyUs + ref.throughputUs)
+                    + String(format: " than the full-speed reference (%.2f us)", ref.latencyUs + ref.throughputUs)
             }
             out.append(line)
         } else {
-            out.append("    speed probe: off (switch it on in Diagnostics to compare clocks)")
+            out.append("    speed probe: no runs")
         }
         return out
     }

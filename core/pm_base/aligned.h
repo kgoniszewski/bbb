@@ -37,7 +37,12 @@ inline constexpr std::size_t kStaggerSpan = 16384;
 inline constexpr std::size_t kStaggerStep = 37;
 inline constexpr std::size_t kStaggerMinBytes = 8192;  // smaller arrays: plain cache-line alignment
 inline std::atomic<unsigned> staggerCounter{0};
+// Bytes held by all live AlignedArrays (process-wide, including the stagger
+// over-allocation), for memory reports; changed only in allocate / release.
+inline std::atomic<std::size_t> liveBytes{0};
 }  // namespace detail
+
+inline std::size_t alignedLiveBytes() noexcept { return detail::liveBytes.load(std::memory_order_relaxed); }
 
 template <typename T>
 class AlignedArray {
@@ -74,6 +79,7 @@ public:
         const std::size_t extra = stagger ? detail::kStaggerSpan - kCacheLine : 0;
         void* p = ::operator new(bytes + extra, std::align_val_t{kCacheLine}, std::nothrow);
         if (!p) return false;
+        detail::liveBytes.fetch_add(bytes + extra, std::memory_order_relaxed);
         std::size_t offset = 0;
         if (stagger) {
             // Successive large arrays start kStaggerStep lines apart modulo
@@ -93,7 +99,12 @@ public:
     }
 
     void release() noexcept {
-        if (raw_) ::operator delete(raw_, std::align_val_t{kCacheLine}, std::nothrow);
+        if (raw_) {
+            const std::size_t bytes = ((size_ * sizeof(T) + kCacheLine - 1) / kCacheLine) * kCacheLine;
+            const std::size_t extra = bytes >= detail::kStaggerMinBytes ? detail::kStaggerSpan - kCacheLine : 0;
+            detail::liveBytes.fetch_sub(bytes + extra, std::memory_order_relaxed);
+            ::operator delete(raw_, std::align_val_t{kCacheLine}, std::nothrow);
+        }
         data_ = nullptr;
         raw_ = nullptr;
         size_ = 0;

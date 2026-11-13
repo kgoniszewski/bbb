@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <new>
 #include <thread>
 #include <vector>
@@ -16,6 +17,7 @@
 
 #include "pm_api/pm_api.h"
 #include "pm_bench/bench.h"
+#include "pm_engine/engine.h"
 #include "pm_engine/events.h"
 #include "pm_host/speed_probe.h"
 #include "test_harness.h"
@@ -699,6 +701,126 @@ TEST(scene_on_audio_path) {
     CHECK(res.state == PM_SCENE_IDLE);
     pm_engine_destroy(ref);
     pm_host_destroy(h);
+}
+
+// Headroom test (0.12): a scene with a load multiplier renders every buffer
+// on K benchmark-prepared engines. The audible output is the first engine's
+// (bit-identical to a freshly prepared engine fed the scene's events), the
+// other engines do the same work (their sub-blocks are counted by the CPU
+// trace), nothing is allocated on the audio path, the speed probe is on for
+// the run only, and the trace's totals are consistent.
+TEST(scene_load_multiplier) {
+    pm_host* h = makeHost(true);
+    CHECK(h != nullptr);
+    if (!h) return;
+    std::vector<float> l(kFrames), r(kFrames);
+    pm_host_set_speed_probe(h, 0);
+    pm_bench_config cfg;
+    std::memset(&cfg, 0, sizeof cfg);
+    cfg.sample_rate = kFs;
+    cfg.seconds = 0.1;
+    cfg.block_frames = kFrames;
+    cfg.flags = PM_BENCH_NO_HAMMER | PM_BENCH_SPEED_PROBE;
+    int typical = -1;
+    for (int i = 0; i < pm_bench_item_count(&cfg); ++i)
+        if (pm_bench_item_scene(&cfg, i) == static_cast<int>(pm::bench::Scene::Typical)) typical = i;
+    CHECK(typical >= 0);
+    CHECK(pm_host_scene_start_load(h, &cfg, typical, 0) == 0);
+    CHECK(pm_host_scene_start_load(h, &cfg, typical, PM_SCENE_MAX_LOAD + 1) == 0);
+    constexpr int kLoad = 2;
+    CHECK(pm_host_scene_start_load(h, &cfg, typical, kLoad) == 1);
+    pm_speed_probe_stats ps;
+    pm_host_get_speed_probe(h, &ps);
+    CHECK(ps.interval == 8);  // on for the run
+
+    pm::bench::Config k;
+    auto ref = std::make_unique<pm::Engine>();
+    CHECK(pm::bench::prepareForCase(pm::bench::caseAt(k, typical), *ref, kFs, kFrames));
+    std::vector<pm::Event> events;
+    pm::bench::sceneEvents(pm::bench::Scene::Typical, kFs, static_cast<std::uint64_t>(2.0 * kFs), events);
+    std::vector<float> rl(kFrames), rr(kFrames);
+    std::size_t next = 0;
+    std::uint64_t t = 0;
+    bool same = true;
+    int buffers = 0;
+    pm_host_scene_result res;
+    gAllocs.store(0);
+    gArmed.store(true);
+    while (buffers < 400) {
+        pm_host_render(h, l.data(), r.data(), kFrames, 0);
+        ++buffers;
+        gArmed.store(false);
+        for (; next < events.size() && events[next].time < t + kFrames; ++next) ref->pushEvent(events[next]);
+        ref->render(rl.data(), rr.data(), kFrames, nullptr);
+        t += kFrames;
+        same = same && std::memcmp(l.data(), rl.data(), sizeof(float) * kFrames) == 0 &&
+               std::memcmp(r.data(), rr.data(), sizeof(float) * kFrames) == 0;
+        pm_host_scene_get_result(h, &res);
+        gArmed.store(true);
+        if (res.state == PM_SCENE_DONE) break;
+    }
+    gArmed.store(false);
+    pm_scene_load ld;
+    pm_host_scene_get_load(h, &ld);
+    const int measured = static_cast<int>(0.1 * kFs / kFrames);
+    std::uint64_t left = 0, ends = 0, moved = 0;
+    for (int i = 0; i < PM_SCENE_LEFT_BINS; ++i) left += ld.left_after[i];
+    for (int i = 0; i < PM_MAX_CPUS; ++i) {
+        ends += ld.end_cpu[i];
+        moved += ld.moved_to[i];
+    }
+    std::printf("  load x%d: %d buffers measured, mean %.1f us, engine %.2f MB, %.1f sub-blocks per buffer, "
+                "%llu of %llu buffers migrated; output = fresh engine: %s; allocations %ld; probe runs %llu\n",
+                ld.load, res.buffers, res.mean_us, ld.engine_bytes / 1048576.0, ld.mean_sub_blocks,
+                static_cast<unsigned long long>(ld.migrated), static_cast<unsigned long long>(ld.buffers),
+                same ? "yes" : "NO", gAllocs.load(), static_cast<unsigned long long>(res.probe.runs));
+    CHECK(res.state == PM_SCENE_DONE && res.buffers == measured && res.fresh_engine == 1);
+    CHECK(same);
+    CHECK(gAllocs.load() == 0);
+    CHECK(ld.load == kLoad);
+    CHECK(ld.engine_bytes > (std::uint64_t{1} << 20));
+    CHECK(res.probe.runs > 0);
+    pm_host_get_speed_probe(h, &ps);
+    CHECK(ps.interval == 0);  // restored
+#if defined(__linux__) || defined(__APPLE__)
+    CHECK(ld.cpu_tracked == 1 && ld.buffers == static_cast<std::uint64_t>(measured));
+    // Every engine's sub-blocks are traced: at least K x frames / 32 per buffer.
+    CHECK(ld.mean_sub_blocks >= kLoad * kFrames / pm::Engine::kSubBlock);
+    CHECK(ends == ld.buffers && left == ld.migrated && moved == ld.migrated && ld.migrated <= ld.buffers);
+#endif
+    // pm_host_scene_start: load 1, the app's engine; the trace is removed afterwards.
+    CHECK(pm_host_scene_start(h, &cfg, typical) == 1);
+    int n = 0;
+    do {
+        pm_host_render(h, l.data(), r.data(), kFrames, 0);
+        pm_host_scene_get_result(h, &res);
+    } while (res.state == PM_SCENE_RUNNING && ++n < 400);
+    pm_host_scene_get_load(h, &ld);
+    CHECK(res.state == PM_SCENE_DONE && res.fresh_engine == 0 && ld.load == 1 && ld.engine_bytes == 0);
+#if defined(__linux__) || defined(__APPLE__)
+    CHECK(ld.mean_sub_blocks >= kFrames / pm::Engine::kSubBlock && ld.mean_sub_blocks < 2.0 * kFrames / pm::Engine::kSubBlock);
+#endif
+    pm_host_destroy(h);
+}
+
+// The benchmark's load multiplier (0.12): K engines per buffer; the first
+// engine's work counts are reported, so they match a load-1 run exactly.
+TEST(bench_load_multiplier) {
+    pm::bench::Config c;
+    c.sampleRate = 48000.0;
+    c.block = 256;
+    c.seconds = 0.2;
+    pm::bench::Case k = pm::bench::caseAt(c, 6);  // cluster, board off: quick to prepare
+    CHECK(k.scene == pm::bench::Scene::Cluster && !k.board);
+    auto eng = std::make_unique<pm::Engine>();
+    pm::bench::ScenarioResult one, two;
+    CHECK(pm::bench::runScenario(c, k, *eng, one));
+    c.load = 2;
+    CHECK(pm::bench::runScenario(c, k, *eng, two));
+    std::printf("  bench load: x1 mean %.1f us, x2 mean %.1f us (ratio %.2f); engine %.2f MB\n", one.meanUs, two.meanUs,
+                two.meanUs / one.meanUs, two.engineBytes / 1048576.0);
+    CHECK(one.load == 1 && two.load == 2 && one.engineBytes == 0 && two.engineBytes > (std::size_t{1} << 20));
+    CHECK(one.freeGroupBlocksPerBuffer == two.freeGroupBlocksPerBuffer && one.meanAwakeModes == two.meanAwakeModes);
 }
 
 // The burst scenes of the benchmark (0.10): fresh keys are never struck

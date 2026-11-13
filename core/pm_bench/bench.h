@@ -64,6 +64,15 @@
 // audio work interval, start / finish per buffer with its deadline) without
 // platform code here.
 //
+// Load multiplier (Config::load = K, 1..kMaxLoad): every buffer is rendered
+// by K independent engines, each prepared for the case and fed the same
+// events, one after the other inside the timed interval; the first engine's
+// output and work counts are reported, the others render into scratch. The
+// work per buffer is then exactly K times the scene's, with K times its
+// working set (about 6 MB per engine), which shows whether a thread whose
+// core and clock the system chooses gets K times the work done in time.
+// Phase splits are the first engine's.
+//
 // CPU numbers (cpu_id.h) are read right before and after every measured
 // render call (outside the timed interval) and tallied per CPU.
 //
@@ -94,6 +103,7 @@ struct Config {
     bool spin = false;        // paced only: busy-wait to the deadline instead of sleeping (core stays awake)
     std::size_t evictBytes = 0;  // paced only: scratch walked between buffers (0: none)
     int probeEvery = 0;       // > 0: the speed probe right before every Nth render call (untimed), as the host does
+    int load = 1;             // engines rendered per buffer (load multiplier, see above), 1..kMaxLoad
     // Paced only: called on this thread (event: 0 begin, ns = period; 1
     // before a render call, ns = time to its deadline; 2 after it; 3 end).
     void (*paceHook)(void* ctx, int event, std::int64_t ns) = nullptr;
@@ -104,6 +114,9 @@ struct Config {
 // than the L2 of the cores in question (Apple M-series P-cluster 16 MiB, x86
 // 1-2 MiB per core) and than most last-level caches' share per core.
 inline constexpr std::size_t kDefaultEvictBytes = std::size_t{32} << 20;
+
+// Largest load multiplier: 8 engines of about 6 MB each.
+inline constexpr int kMaxLoad = 8;
 
 enum class Scene : int {
     Worst = 0, Typical = 1, Cluster = 2, Bloom = 3,
@@ -187,13 +200,18 @@ struct ScenarioResult {
     };
     ProbeStats probeLatency, probeThroughput;  // its two parts (speed_probe.h)
     host::CpuUsage cpu;  // CPUs of the measured render calls
+    int load = 1;                    // engines rendered per buffer
+    std::size_t engineBytes = 0;     // load > 1: memory of one prepared engine (object + aligned arrays)
     bool paced = false, spin = false;
     std::size_t evictBytes = 0;
 };
 
 // Configures 'eng' for the case (culling, soundboard, tier) and prepares it
-// (non-real-time, about a second).
-bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames);
+// (non-real-time, about a second). bytes (optional): the memory the prepared
+// engine holds, sizeof(Engine) plus its aligned arrays (measured as the
+// change of the process-wide aligned-array total, so only exact while no
+// other thread allocates aligned arrays at the same time).
+bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames, std::size_t* bytes = nullptr);
 
 // Prepares 'eng' for the case (culling, soundboard, tier) and runs it.
 // Returns false if the engine could not be prepared.

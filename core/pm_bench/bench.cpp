@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -319,13 +321,19 @@ const char* hammerName(int index) noexcept {
     return index >= 0 && index < kHammerKeyCount ? kNames[index] : "?";
 }
 
-bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames) {
+bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames, std::size_t* bytes) {
     eng.setCulling(k.cull, -100.0f);
     SoundboardConfig bc;
     bc.enabled = k.board;
     bc.tier = k.tier;
     eng.setSoundboardConfig(bc);
-    return eng.prepare(sampleRate, maxFrames);
+    const std::size_t before = alignedLiveBytes();
+    const bool ok = eng.prepare(sampleRate, maxFrames);
+    if (bytes) {
+        const std::size_t after = alignedLiveBytes();
+        *bytes = sizeof(Engine) + (after > before ? after - before : 0);
+    }
+    return ok;
 }
 
 bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& res) {
@@ -335,6 +343,19 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     if (!prepareForCase(k, eng, fs, block)) return false;
     const bool timing = c.phaseTiming;
     eng.setPhaseTiming(timing);
+    // Load multiplier: the other engines, prepared alike (same work, phase
+    // timing included). The first of them gives the memory per engine (a
+    // re-prepare of 'eng' frees its arrays as it goes, so it cannot).
+    const int load = std::clamp(c.load, 1, kMaxLoad);
+    res.load = load;
+    std::vector<std::unique_ptr<Engine>> extra;
+    for (int i = 1; i < load; ++i) {
+        extra.emplace_back(new (std::nothrow) Engine);
+        if (!extra.back() || !prepareForCase(k, *extra.back(), fs, block, i == 1 ? &res.engineBytes : nullptr))
+            return false;
+        extra.back()->setPhaseTiming(timing);
+    }
+    std::vector<float> xl(static_cast<std::size_t>(block)), xr(static_cast<std::size_t>(block));
     // The worst cases are measured from the first strike, so the max
     // includes the burst of 88 hammers (1 ms apart, pool of 32).
     const double warm = k.scene == Scene::Worst ? 0.0 : 0.5;
@@ -362,7 +383,10 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     int cpu0 = -1, cpu1 = -1;
     auto step = [&](double* dt) {
         const std::uint64_t t1 = t + static_cast<std::uint64_t>(block);
-        for (; next < events.size() && events[next].time < t1; ++next) eng.pushEvent(events[next]);
+        for (; next < events.size() && events[next].time < t1; ++next) {
+            eng.pushEvent(events[next]);
+            for (auto& e : extra) e->pushEvent(events[next]);
+        }
         if (dt && c.probeEvery > 0 && ++stepCount % c.probeEvery == 0) {
             float sink = 0.0f;
             const int cpu = host::currentCpu();
@@ -379,6 +403,7 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         if (dt) cpu0 = host::currentCpu();
         const auto a = Clock::now();
         eng.render(l.data(), r.data(), block, nullptr);
+        for (auto& e : extra) e->render(xl.data(), xr.data(), block, nullptr);
         if (dt) {
             *dt = std::chrono::duration<double>(Clock::now() - a).count();
             cpu1 = host::currentCpu();

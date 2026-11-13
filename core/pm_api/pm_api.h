@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 11
+#define PM_API_VERSION_MINOR 12
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -105,6 +105,8 @@ typedef struct pm_stats {
 } pm_stats;
 
 uint32_t pm_api_version(void); /* (major << 16) | (minor << 8) | patch */
+/* "major.minor.patch (...)", built from the macros above (API 0.12: the
+ * number always matches them). */
 const char* pm_version_string(void);
 
 pm_engine* pm_engine_create(void);  /* NULL on allocation failure */
@@ -508,7 +510,8 @@ enum pm_bench_flags {
     PM_BENCH_SCENE_FRESH_ENGINE = 32,
     /* API 0.11, scenarios: the speed probe (both parts) right before every
      * 8th render call, untimed, as the host runs it on the audio thread;
-     * see pm_bench_last_probe_split and pm_bench_last_cpu_usage. */
+     * see pm_bench_last_probe_split and pm_bench_last_cpu_usage. API 0.12,
+     * pm_host_scene_start(_load): the host's speed probe on for the run. */
     PM_BENCH_SPEED_PROBE = 64
 };
 
@@ -649,7 +652,7 @@ typedef struct pm_host_scene_result {
     int32_t reserved;
 } pm_host_scene_result;
 
-int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t item_index);
+int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t item_index);  /* = _load with load 1 */
 /* Any thread: stops a running scene (no result). */
 void pm_host_scene_cancel(pm_host* host);
 /* Main thread: the state, and once PM_SCENE_DONE the result. */
@@ -667,6 +670,63 @@ int32_t pm_host_scene_config(const pm_host* host, char* buffer, int32_t size);
  * and the audio-thread probe's parts over the run. Zeros otherwise. */
 void pm_host_scene_get_cpu_usage(const pm_host* host, pm_cpu_usage* usage);
 void pm_host_scene_get_probe_split(const pm_host* host, pm_speed_probe_split* split);
+
+/* ------------------------------------------------------------------------
+ * Headroom test (API 0.12): a scene on the audio thread with a load
+ * multiplier, and where in the buffer the render call changed CPU.
+ *
+ * pm_host_scene_start_load is pm_host_scene_start with 'load' = K (1 ..
+ * PM_SCENE_MAX_LOAD) engines: K > 1 renders every buffer of the scene on K
+ * independent engines, each prepared exactly as the benchmark prepares the
+ * item's (K > 1 implies PM_BENCH_SCENE_FRESH_ENGINE), all fed the scene's
+ * events, one after the other inside the timed render call; the first one is
+ * heard and takes the MIDI and UI events, the others render into scratch
+ * (allocated here, not on the audio thread). The work per buffer is exactly K
+ * times the scene's, with K times its working set: if the render time grows
+ * K-fold from the efficiency-core figure the system has no headroom left on
+ * that thread; if it stays near K times the back-to-back (performance-core)
+ * figure it does. Preparing takes about a second per engine (calling
+ * thread); each engine holds about 6 MB (pm_scene_load.engine_bytes). The
+ * engines are freed at the next pm_host_scene_start(_load) or
+ * pm_host_destroy. With PM_BENCH_SPEED_PROBE in config->flags the speed probe
+ * runs every 8th buffer for the run if it was off (and is switched off again
+ * at its end), as PM_BENCH_PHASE_TIMING does for phase timing.
+ *
+ * While the CPU numbers are read (the speed probe, phase timing or thread
+ * CPU time on), every engine of the scene also reads the CPU number at the
+ * start of each of its sub-blocks (Engine sub-block hook: one per-CPU
+ * register read, as pm_current_cpu, until the first change in the buffer),
+ * so a migration is located within the buffer: sub-block n counts across the
+ * K engines (engine 2's first sub-block follows engine 1's last). */
+#define PM_SCENE_MAX_LOAD 8
+#define PM_SCENE_LEFT_BINS 129
+
+typedef struct pm_scene_load {
+    int32_t load;                /* engines rendered per buffer (K) */
+    int32_t cpu_tracked;         /* 1: CPU numbers were read (the fields below are valid) */
+    uint64_t engine_bytes;       /* memory of one benchmark-prepared engine: the object plus its aligned
+                                    arrays (0: the app's engine only, not measured) */
+    uint64_t buffers;            /* measured buffers with a CPU number */
+    uint64_t migrated;           /* of those, buffers that ran on another CPU before they ended */
+    double mean_sub_blocks;      /* sub-blocks per buffer, all K engines */
+    /* Over the migrated buffers: render start to the first sub-block start
+     * found on another CPU (a change seen only at the end of the call counts
+     * as the whole render time). */
+    double mean_us_before_migration;
+    double mean_sub_blocks_before_migration;
+    uint32_t end_cpu[PM_MAX_CPUS];   /* buffers by the CPU the render call ended on */
+    uint32_t moved_to[PM_MAX_CPUS];  /* migrated buffers by the first other CPU seen */
+    /* Migrated buffers by the sub-block at whose start another CPU was first
+     * seen (bin n: sub-block n, 0-based; a change seen only at the end of the
+     * call counts at the buffer's sub-block total); the last bin holds n >=
+     * PM_SCENE_LEFT_BINS - 1. */
+    uint32_t left_after[PM_SCENE_LEFT_BINS];
+    int32_t reserved;
+} pm_scene_load;
+
+int pm_host_scene_start_load(pm_host* host, const pm_bench_config* config, int32_t item_index, int32_t load);
+/* Once PM_SCENE_DONE (zeros otherwise; load is 1 for pm_host_scene_start). */
+void pm_host_scene_get_load(const pm_host* host, pm_scene_load* result);
 
 #ifdef __cplusplus
 }

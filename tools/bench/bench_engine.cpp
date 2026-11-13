@@ -32,8 +32,16 @@
 // probe before the render calls). --only S
 // restricts the cases to those whose name contains S.
 //
+// Load multiplier (bench.h): --load K (1..8) renders every buffer on K
+// independent engines fed the same events, inside the timed interval, so the
+// work and the working set per buffer are K times the scene's; with --paced
+// it asks whether a thread sleeping between buffers gets K times the work
+// done in time (render time growing K-fold from the slow-core figure: no
+// headroom; staying near K x the back-to-back figure: the core speeds up).
+// The first line after the configuration gives the memory of one engine.
+//
 //   bench_engine [--seconds 3] [--block 64] [--fs 48000] [--tier full|balanced|eco] [--tiers]
-//                [--timing on|off|both] [--paced] [--paced-evict MiB] [--compare] [--only text]
+//                [--timing on|off|both] [--paced] [--paced-evict MiB] [--compare] [--only text] [--load K]
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -44,6 +52,23 @@
 
 #include "pm_bench/bench.h"
 #include "pm_host/speed_probe.h"
+
+#if defined(__linux__)
+#include <fstream>
+#endif
+
+namespace {
+// Resident set size in bytes (Linux; 0 elsewhere), to cross-check the
+// engine's own memory count.
+long long residentBytes() {
+#if defined(__linux__)
+    std::ifstream f("/proc/self/statm");
+    long long pages = 0, resident = 0;
+    if (f >> pages >> resident) return resident * 4096;
+#endif
+    return 0;
+}
+}  // namespace
 
 int main(int argc, char** argv) {
     pm::bench::Config cfg;
@@ -98,6 +123,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "unknown timing mode %s\n", argv[i + 1]);
                 return 2;
             }
+        } else if (!std::strcmp(argv[i], "--load")) {
+            cfg.load = static_cast<int>(v);
+            if (cfg.load < 1 || cfg.load > pm::bench::kMaxLoad) {
+                std::fprintf(stderr, "--load must be 1..%d\n", pm::bench::kMaxLoad);
+                return 2;
+            }
         } else if (!std::strcmp(argv[i], "--seconds")) cfg.seconds = v;
         else if (!std::strcmp(argv[i], "--block")) cfg.block = static_cast<int>(v);
         else if (!std::strcmp(argv[i], "--fs")) cfg.sampleRate = v;
@@ -109,12 +140,23 @@ int main(int argc, char** argv) {
     const double fs = cfg.sampleRate;
     const int block = cfg.block;
 
+    const long long rss0 = residentBytes();
+    const std::size_t aligned0 = pm::alignedLiveBytes();
     auto eng = std::make_unique<pm::Engine>();
     if (!eng->prepare(fs, block)) return 1;
+    const std::size_t engineBytes = sizeof(pm::Engine) + (pm::alignedLiveBytes() - aligned0);
+    const long long rss1 = residentBytes();
     std::printf("engine benchmark: fs %.0f Hz, block %d, kernel %s, %.1f s measured; %d normal modes "
                 "in %d groups of %d\n",
                 fs, block, pm::simdKernelName(), cfg.seconds, eng->stats().totalModes, eng->stats().groups,
                 pm::ModeBank::kGroupSize);
+    std::printf("  memory of one prepared engine: %.2f MB (object %.2f MB + aligned arrays)", engineBytes / 1048576.0,
+                sizeof(pm::Engine) / 1048576.0);
+    if (rss1 > 0) std::printf("; process resident set grew by %.2f MB while preparing it", (rss1 - rss0) / 1048576.0);
+    std::printf("\n");
+    if (cfg.load > 1)
+        std::printf("  load multiplier %d: every buffer rendered by %d engines fed the same events (%.1f MB of engines)\n",
+                    cfg.load, cfg.load, cfg.load * engineBytes / 1048576.0);
     {
         std::vector<double> t(501), lat(501), thr(501);
         float sink = 0.0f;
@@ -194,9 +236,10 @@ int main(int argc, char** argv) {
                     "   and the calls that ended on another CPU)\n");
         return 0;
     }
-    std::printf("  board-on cases at tier %s unless named; phase timing %s; %s\n", tierName[static_cast<int>(cfg.tier)],
+    std::printf("  board-on cases at tier %s unless named; phase timing %s; %s; load x%d\n", tierName[static_cast<int>(cfg.tier)],
                 timingMode == 0 ? "off" : (timingMode == 1 ? "on" : "off, then on"),
-                !cfg.paced ? "buffers back to back" : (cfg.evictBytes ? "paced to real time, eviction walk between buffers" : "paced to real time"));
+                !cfg.paced ? "buffers back to back" : (cfg.evictBytes ? "paced to real time, eviction walk between buffers" : "paced to real time"),
+                cfg.load);
     const int nCases = pm::bench::caseCount(cfg);
     std::vector<pm::bench::ScenarioResult> results(static_cast<std::size_t>(nCases));
     std::vector<pm::bench::ScenarioResult> untimed(static_cast<std::size_t>(nCases));
@@ -216,6 +259,8 @@ int main(int argc, char** argv) {
                     "max %6.2f %%; awake modes mean %5.0f, at end %5d\n",
                     c.name, r.avgPercent, r.first100msPercent, r.p99Percent, r.maxPercent,
                     r.meanAwakeModes, r.awakeModesEnd);
+        std::printf("  %-35s us per buffer mean %.1f / p99 %.1f / max %.1f; overruns %d of %d (%.1f %%)\n", "",
+                    r.meanUs, r.p99Us, r.maxUs, r.overruns, r.buffers, 100.0 * r.overruns / std::max(1, r.buffers));
     }
     if (timingMode == 2) {
         std::printf("  phase timing off vs on, us per buffer (mean / p99 / max):\n");

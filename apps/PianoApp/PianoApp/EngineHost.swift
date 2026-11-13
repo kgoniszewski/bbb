@@ -186,12 +186,14 @@ final class EngineHost {
     /// on the prepare queue (it closes the prepare gate briefly, and with
     /// PM_BENCH_SCENE_FRESH_ENGINE prepares a private engine first); calls
     /// completion on the main thread.
-    func startScene(config: pm_bench_config, item: Int, completion: @escaping (Bool) -> Void) {
+    /// load: engines rendered per buffer (pm_host_scene_start_load; > 1
+    /// prepares that many benchmark engines first, about a second each).
+    func startScene(config: pm_bench_config, item: Int, load: Int, completion: @escaping (Bool) -> Void) {
         let hostBits = Int(bitPattern: raw)
         prepareQueue.async { [self] in
             var c = config
             let ok = withExtendedLifetime(self) {
-                pm_host_scene_start(OpaquePointer(bitPattern: hostBits), &c, Int32(item)) == 1
+                pm_host_scene_start_load(OpaquePointer(bitPattern: hostBits), &c, Int32(item), Int32(load)) == 1
             }
             DispatchQueue.main.async {
                 completion(ok)
@@ -206,6 +208,14 @@ final class EngineHost {
     }
 
     func cancelScene() { pm_host_scene_cancel(raw) }
+
+    /// The finished scene's load multiplier, memory per engine and where in
+    /// the buffer the render calls changed CPU.
+    func sceneLoad() -> pm_scene_load {
+        var l = pm_scene_load()
+        pm_host_scene_get_load(raw, &l)
+        return l
+    }
 
     /// The configuration of the engine the scene runs on (captured at its start).
     func sceneConfig() -> String {

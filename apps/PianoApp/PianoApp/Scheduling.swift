@@ -58,6 +58,25 @@ struct CoreLayout {
         return nil
     }
 
+    /// Whether a CPU number belongs to the fastest performance level (under
+    /// the assumption above). Without reported levels: false.
+    func isFastest(_ cpu: Int) -> Bool {
+        guard let lv = level(of: cpu), let fastest = levels.first else { return false }
+        return lv.name == fastest.name
+    }
+
+    /// True if every speed-probe run of the usage was on the fastest level.
+    func onlyFastest(probeRunsOf u: pm_cpu_usage) -> Bool {
+        var usage = u
+        let runs: [UInt32] = CoreLayout.elements(&usage.probe_runs)
+        var any = false
+        for (cpu, n) in runs.enumerated() where n > 0 {
+            if !isFastest(cpu) { return false }
+            any = true
+        }
+        return any
+    }
+
     /// "E0", "P6": the assumed level's initial and the CPU number.
     func label(_ cpu: Int) -> String {
         guard cpu >= 0 else { return "?" }
@@ -142,6 +161,63 @@ struct CoreLayout {
         return out
     }
 
+    /// Share of the buffers that ended on the fastest level (nil: unknown).
+    func endOnFastestShare(_ l: pm_scene_load) -> Double? {
+        guard l.cpu_tracked == 1, l.buffers > 0, !levels.isEmpty else { return nil }
+        var load = l
+        let ends: [UInt32] = CoreLayout.elements(&load.end_cpu)
+        var n = 0.0
+        for (cpu, c) in ends.enumerated() where c > 0 && isFastest(cpu) { n += Double(c) }
+        return n / Double(l.buffers)
+    }
+
+    /// Lines for an audio-thread run's load multiplier and CPU trace: the
+    /// engines and their memory, where the render calls ended, how many
+    /// changed CPU mid-buffer, to which CPU, and how far into the buffer.
+    func loadLines(_ l: pm_scene_load, indent: String = "    ") -> [String] {
+        var out: [String] = []
+        var head = indent + "load \u{00D7}\(l.load)"
+        if l.engine_bytes > 0 {
+            let mb = Double(l.engine_bytes) / 1048576.0
+            head += String(format: ": %d benchmark-prepared engine(s) of %.1f MB each (%.1f MB)", l.load, mb, mb * Double(l.load))
+        } else {
+            head += ": the app's engine"
+        }
+        guard l.cpu_tracked == 1, l.buffers > 0 else {
+            out.append(head + "; CPU trace: not recorded")
+            return out
+        }
+        var load = l
+        let ends: [UInt32] = CoreLayout.elements(&load.end_cpu)
+        let moved: [UInt32] = CoreLayout.elements(&load.moved_to)
+        let left: [UInt32] = CoreLayout.elements(&load.left_after)
+        let total = Double(l.buffers)
+        if let p = endOnFastestShare(l) {
+            head += String(format: "; %.0f %% of buffers ended on %@ cores", 100.0 * p, levels.first?.name ?? "the fastest")
+        }
+        head += "; ended on: " + ends.enumerated().filter { $0.element > 0 }
+            .map { String(format: "%@ %.0f %%", label($0.offset), 100.0 * Double($0.element) / total) }.joined(separator: ", ")
+        out.append(head)
+        var mig = indent + String(format: "mid-buffer CPU changes: %llu of %llu buffers (%.1f %%)", l.migrated, l.buffers,
+                                  100.0 * Double(l.migrated) / total)
+        if l.migrated > 0 {
+            mig += "; first other CPU: " + moved.enumerated().filter { $0.element > 0 }
+                .map { "\(label($0.offset)) \($0.element)" }.joined(separator: ", ")
+            mig += String(format: "; left the start CPU after %.1f of %.1f sub-blocks on average (%.0f us after the start of the render call)",
+                          l.mean_sub_blocks_before_migration, l.mean_sub_blocks, l.mean_us_before_migration)
+            // By eighths of the buffer's sub-blocks (all engines).
+            var eighths = [Int](repeating: 0, count: 8)
+            let per = max(l.mean_sub_blocks, 1.0)
+            for (i, n) in left.enumerated() where n > 0 {
+                let e = min(7, Int(Double(i) / per * 8.0))
+                eighths[e] += Int(n)
+            }
+            mig += "; by eighth of the buffer: " + eighths.map { String($0) }.joined(separator: " / ")
+        }
+        out.append(mig)
+        return out
+    }
+
     /// The elements of a C fixed-size array (imported as a tuple).
     static func elements<T, E>(_ tuple: inout T) -> [E] {
         let count = MemoryLayout<T>.size / MemoryLayout<E>.stride
@@ -151,15 +227,72 @@ struct CoreLayout {
     }
 }
 
-/// The speed probe's two parts against a reference (the benchmark thread's,
-/// measured back to back): "x / y us -> a / b x".
-func probeSplitText(_ s: pm_speed_probe_split, reference r: pm_speed_probe_split?) -> String {
+/// The reference the audio thread's speed probe is compared with: the
+/// probe's latency-bound and throughput-bound parts at full speed. Taken
+/// as the minimum of a warmed-up series on a non-real-time thread (the
+/// first runs on a thread that was idle are slow: core and clock ramp up)
+/// and, during a benchmark, of the per-row medians of back-to-back rows
+/// whose probe runs were all on performance cores. Each part says where its
+/// value came from.
+struct ProbeReference {
+    var latencyUs: Double
+    var throughputUs: Double
+    var latencySource: String
+    var throughputSource: String
+
+    /// Runs the probe on the calling thread (non-real-time, about 0.3 s):
+    /// warm-up runs for 0.25 s, then the minimum of 10 medians of 101 runs.
+    static func warmedUp(source: String) -> ProbeReference {
+        let start = ProcessInfo.processInfo.systemUptime
+        while ProcessInfo.processInfo.systemUptime - start < 0.25 {
+            _ = EngineHost.runSpeedProbeSplit(runs: 21)
+        }
+        var lat = Double.greatestFiniteMagnitude
+        var thr = Double.greatestFiniteMagnitude
+        for _ in 0..<10 {
+            let s = EngineHost.runSpeedProbeSplit(runs: 101)
+            lat = min(lat, s.latency.median_us)
+            thr = min(thr, s.throughput.median_us)
+        }
+        return ProbeReference(latencyUs: lat, throughputUs: thr, latencySource: source, throughputSource: source)
+    }
+
+    /// Takes a row's medians where they are faster.
+    mutating func lower(with s: pm_speed_probe_split, source: String) {
+        if s.latency.runs > 0 && s.latency.median_us > 0 && s.latency.median_us < latencyUs {
+            latencyUs = s.latency.median_us
+            latencySource = source
+        }
+        if s.throughput.runs > 0 && s.throughput.median_us > 0 && s.throughput.median_us < throughputUs {
+            throughputUs = s.throughput.median_us
+            throughputSource = source
+        }
+    }
+
+    var description: String {
+        if latencySource == throughputSource {
+            return String(format: "latency %.2f us, throughput %.2f us (", latencyUs, throughputUs) + latencySource + ")"
+        }
+        return String(format: "latency %.2f us (", latencyUs) + latencySource
+            + String(format: "), throughput %.2f us (", throughputUs) + throughputSource + ")"
+    }
+
+    /// "2.31x slower" (or "1.05x faster"): time on the audio thread against the reference.
+    static func ratioText(_ us: Double, _ ref: Double) -> String {
+        guard us > 0, ref > 0 else { return "-" }
+        let r = us / ref
+        return r >= 1.0 ? String(format: "%.2f\u{00D7} slower", r) : String(format: "%.2f\u{00D7} faster", 1.0 / r)
+    }
+}
+
+/// The speed probe's two parts against the reference.
+func probeSplitText(_ s: pm_speed_probe_split, reference r: ProbeReference?) -> String {
     var out = String(format: "latency-bound part median %.2f us (mean %.2f), throughput-bound part median %.2f us (mean %.2f)",
                      s.latency.median_us, s.latency.mean_us, s.throughput.median_us, s.throughput.mean_us)
-    if let r = r, s.latency.median_us > 0, s.throughput.median_us > 0, r.latency.runs > 0 {
-        out += String(format: "; vs the benchmark thread back to back (%.2f / %.2f us): latency %.2fx, throughput %.2fx speed",
-                      r.latency.median_us, r.throughput.median_us,
-                      r.latency.median_us / s.latency.median_us, r.throughput.median_us / s.throughput.median_us)
+    if let r = r, s.latency.median_us > 0, s.throughput.median_us > 0 {
+        out += "; medians vs the full-speed reference (" + r.description + "): latency "
+            + ProbeReference.ratioText(s.latency.median_us, r.latencyUs) + ", throughput "
+            + ProbeReference.ratioText(s.throughput.median_us, r.throughputUs)
     }
     return out
 }
