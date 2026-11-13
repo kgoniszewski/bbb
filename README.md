@@ -36,7 +36,7 @@ duplex yet.
 | `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface (smooth placeholder kept for unit tests), soundboard mode set v0 and its admittances (`soundboard_model.h`), unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
-| `core/pm_bench/` | Non-real-time: the engine benchmark scenarios (worst, typical, cluster, bloom, board-off A/Bs, then the live-playing scenes legato, pedalling, chord release, idle, hammer burst, pedalled chords and the fresh- and same-key bursts, and the hammer per key; back to back or paced to real time), shared by `bench_engine` and the app's Benchmark screen |
+| `core/pm_bench/` | Non-real-time: the engine benchmark scenarios (worst, typical, cluster, bloom, board-off A/Bs, then the live-playing scenes legato, pedalling, chord release, idle, hammer burst, pedalled chords, the fresh- and same-key bursts and the pedal lift, and the hammer per key; back to back or paced to real time), shared by `bench_engine` and the app's Benchmark screen |
 | `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, (0.6) the app host `pm_host_*`, (0.7) load diagnostics, build information and the offline benchmark `pm_bench_*`, (0.8) phase timing and the worst buffer's events, (0.9) the worst buffer's hammer and zone-kernel detail, the speed probe and `PM_BENCH_PHASE_TIMING`, (0.10) paced benchmark runs, per-buffer work counts (`pm_work_detail`), the effective engine configuration (`pm_engine_describe`) and benchmark scenes played on the audio thread (`pm_host_scene_*`), (0.11) the speed probe's latency- and throughput-bound parts, per-CPU render statistics (`pm_cpu_usage`) and the paced benchmark's pacing hook, (0.12) audio-thread scenes with a load multiplier and a per-sub-block CPU trace (`pm_host_scene_start_load`, `pm_scene_load`); `include/` holds the Swift module map |
 | `Package.swift` | Swift package `PianoEngine`, library `PianoCore` (the C++ core, imported in Swift through the C API) |
 | `apps/PianoApp/` | SwiftUI app (iPadOS 17+, macOS 14+): XcodeGen spec `project.yml`, sources, and the package's Swift smoke test |
@@ -120,6 +120,28 @@ duplex yet.
   of the sub-block each coupled mode adds the input's share to its state
   (Horner in c). The same recursion, rearranged: its trajectory equals the
   per-sample loop to rounding.
+  Damper responses: a key's impulse response changes with its damper
+  amount. Each coupled group's exact response (about one free pass of the
+  group over 32 samples) is cached with the amount it was computed for, so
+  a damper returning to an amount reuses it, and at most
+  `Engine::kResponseBudget` = 32 are computed per control tick (32
+  samples), none for keys whose dampers move in a tick whose damper
+  changes need more than that. Beyond it, during a pedal stroke, a group contributes its
+  precomputed second-order expansion in the damper amount (relative error
+  under 4.2e-4 per mode and tap; `ModeBank::coupledResponse`), and its zone-kernel
+  columns take the change of the key's response instead of a re-sum; once
+  the key's damper has stopped moving the exact responses replace the
+  expansions within the same budget, so at rest every cache and the zone
+  kernel are exact again, and with fewer changes per tick than the budget
+  the output is bit-identical to unlimited exact responses
+  (`Engine::setExactDamperResponses`, for A/B). Difference from exact
+  responses over 6.5 s at 48 kHz / 64 frames (the same at 44.1 kHz / 512):
+  at most -100 dB (bloom) to -113 dB re peak, RMS -116 to -130 dB (pedal
+  lift, pedalling, pedalled chords, both bursts, a continuous half-pedal
+  sweep). A key joining or leaving the loop (a hammer takes it over or
+  hands it back, the pedal lifts or lands its damper) updates the zone
+  kernel in place as well when the packed entries stay the same, which
+  replaces most full rebuilds.
   Static correction: driven by a bridge displacement, each string mode
   responds quasi-statically with 2T/L (1 + B n^2) u, the same for every
   partial, so the truncated modal sum is a large negative stiffness on the
@@ -355,7 +377,12 @@ six notes at velocity 100-127 in one buffer on keys not struck for at
 least 6 s, two of them released after 30 ms; every fourth burst lands in a
 legato pedal change, so those staccato notes are damped while their
 hammers are still active) and the same with the same six keys every time
-(same-key burst, the warm counterpart); last, the
+(same-key burst, the warm counterpart), and a pedal lift (a 12-note
+chord over both hands every 1.2 s released into the pedal and four keys
+held, about 9000 modes sounding; every 0.6 s the pedal comes up for 150 ms
+and goes down again, as CC64 on/off and as ramps, with three notes struck
+as it goes down: the dampers land on and lift off sounding strings, the
+iPad's worst live buffer); last, the
 cost of one hammer per buffer for eight keys (at mf, 2.2 m/s; the scenes
 use MIDI velocities 70-127, the clusters 120, the burst 127, i.e. 5.5
 m/s). `--tier balanced|eco` and `--tiers` run the board cases at the
@@ -456,8 +483,9 @@ parts and the CPU the thread is on; `--compare` rows add the parts and
 how many CPUs the render calls ran on. Before the breakdown, per case, the most
 expensive buffer's hammer work (hammers that touched a string, the most
 at once, hammer-samples in contact, contact-solver Newton evaluations and
-fallbacks) and the zone-kernel full rebuilds and in-place key updates per
-buffer.
+fallbacks), the zone-kernel full rebuilds and in-place key updates per
+buffer, and the most damper updates and coupled-group responses computed
+exactly / taken from the damper expansion in one buffer of the run.
 
 The scenarios live in `core/pm_bench` (`bench.h`) and are also reachable
 through the C API (`pm_bench_item_count`, `pm_bench_item_name`,
@@ -491,10 +519,19 @@ burst scenes' key rules; a paced run takes real time). The M4 ones: `test_soundb
 targets, positive-real loop, admittance against a time-domain drive of the
 run-time bank, bake + loop = driving point), `test_soundboard_coupling`
 (no double counting), `test_passivity` (10^4 random reduced systems with
-the production components; a sign-flipped loop is flagged), `test_sympathetic` (silently held key, pedal
-bloom per third octave, monotonic in the sympathetic gain) and
+the production components, and 3000 with every damper amount moving on
+every sub-block under a damper-response budget of 0-2 groups, so the loop
+runs on expanded responses; a sign-flipped loop is flagged), `test_sympathetic` (silently held key, pedal
+bloom per third octave, monotonic in the sympathetic gain),
 `test_half_pedal` (graded T60 against pedal position, no click on pedal
-moves, re-pedalling keeps energy). `test_hammer` also checks the hammer's
+moves, re-pedalling keeps energy; 30 notes under a pedal swept
+continuously for 4 s: bounded, within -80 dB of exact responses (measured
+-112), at most the budget of exact responses per tick, every response and
+the zone kernel exact once the pedal rests, buffer-size invariant, decays
+with the pedal up, silenced by a panic mid-stroke; with the dampers at rest
+the output is bit-identical to exact responses) and `test_idle` (also: the
+zone kernel updated in place, including keys joining and leaving, equals a
+full rebuild bit for bit). `test_hammer` also checks the hammer's
 sample path (one pass over a key's modes per base sample) against its
 substep path (one pass per substep) and against a double-precision
 recursion. Unit tests of the unison solver and the

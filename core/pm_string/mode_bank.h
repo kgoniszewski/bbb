@@ -206,15 +206,60 @@ public:
     // RT. The response of segment s's output to a unit input at sample 0,
     // h[0..kResponseTaps), over its awake coupled groups, static correction
     // included; *k1 = the correction's tap on the previous input. Returns
-    // false (h untouched) when no coupled group is awake. Each group's
-    // response is cached until its coefficients change (damper), so a group
-    // going to sleep or waking costs a re-sum; a damper change costs about
-    // one free pass of the coupled groups over kResponseTaps samples. Call it
-    // only when coupledVersion() changed.
-    bool coupledResponse(int s, float* h, float* k1, Kernel kernel = Kernel::Simd) noexcept;
+    // false (h untouched) when no coupled group is awake. Call it only when
+    // coupledVersion() changed. *exact (optional) is set to whether every
+    // group's response in h is exact (see "Damper responses" below).
+    //
+    // Damper responses. Each coupled group's exact response is cached
+    // together with the damper amount it was computed for (computing one
+    // costs about one free pass of the group over kResponseTaps samples), so
+    // a group going to sleep or waking costs a re-sum, and a damper that
+    // returns to an amount it had keeps its cache. The lifted response
+    // (amount 0) is precomputed. The groups whose cache does not match the
+    // segment's current amount are recomputed if the response budget left
+    // in the current control tick (beginResponseTick) covers all of them,
+    // except for a segment whose damper moved in this tick while the tick's
+    // damper changes together need more than the whole budget (a pedal
+    // stroke: the budget is better spent on keys at rest). Otherwise each of
+    // them contributes its second-order expansion in the damper amount d,
+    //   h_k(d) = H0_k + d D1_k + d^2 D2_k,
+    //   D1_k = -k sum wOut r Im(c0^k wIn),  D2_k = k^2 / 2 sum wOut r^2 Im(c0^k wIn)
+    // (r = damper rate per sample, c0 the free coefficient; precomputed;
+    // summed over the awake groups once per awake set when all of them are
+    // expanded), the exact response's Taylor series in d, truncated: the
+    // relative error of a mode's tap k is at most about (d r k)^3 / 6, under
+    // 4.2e-4 for the strongest damper (192 1/s: r k <= 0.135 at tap 31 at
+    // 44.1 kHz, d <= 1). Amounts above 1 (panic only) use the expansion at
+    // d = 1. Such groups are marked approximate; refineResponses() replaces
+    // them by exact ones once their segment's amount has stopped moving,
+    // within the budget, so at rest every cache is exact and h is what an
+    // unlimited budget gives.
+    bool coupledResponse(int s, float* h, float* k1, Kernel kernel = Kernel::Simd, bool* exact = nullptr) noexcept;
+    // RT. Starts a control tick: up to 'groups' exact group responses may be
+    // computed (by refineResponses and coupledResponse) until the next call;
+    // groups < 0: unlimited (every response exact, as before budgets).
+    void beginResponseTick(int groups) noexcept {
+        budget_ = tickBudget_ = groups;
+        tickDemand_ = 0;
+        ++tick_;
+    }
+    // RT, after the tick's damper changes and before the loop reads the
+    // responses. Spends the tick's budget, less what the tick's own damper
+    // changes need when they fit in it, on the awake approximate groups of
+    // segments whose damper amount has not changed during the last two
+    // ticks, round-robin over the segments; such a segment is re-summed at
+    // its next coupledResponse (its version changes).
+    void refineResponses(Kernel kernel = Kernel::Simd) noexcept;
+    // Awake coupled groups whose response is currently approximate.
+    int approximateGroups() const noexcept;
+    // RT. Forgets the damper-amount caches, the approximations and the tick
+    // count (what allocate and load leave), keeping the lifted responses and
+    // the expansion rows: an engine reset then renders as a fresh one.
+    void resetResponses() noexcept;
     // Non-RT: fills the damper-lifted response cache of every coupled group
-    // (after the modes, weights and coupled groups are set), so that lifting
-    // a damper never costs a recompute on the audio thread.
+    // and its expansion rows D1, D2 (after the modes, damper rates, weights
+    // and coupled groups are set), so that lifting a damper never costs a
+    // recompute on the audio thread and every amount has its expansion.
     void precomputeCoupledResponses() noexcept;
     bool segmentHasAwakeCoupled(int s) const noexcept;
     // Has sleeping coupled groups that input could wake (culling on and the
@@ -247,8 +292,11 @@ public:
     // Total number of (group x sub-block) kernel invocations so far; a silent
     // bank leaves it unchanged.
     std::uint64_t groupBlocksProcessed() const noexcept { return groupBlocks_; }
-    // Coupled groups whose impulse response coupledResponse() recomputed, so far.
+    // Coupled groups whose exact impulse response was computed on the audio
+    // thread (coupledResponse, refineResponses), so far; and group responses
+    // coupledResponse() took from the expansion instead (over budget).
     std::uint64_t responseGroupsComputed() const noexcept { return responseGroups_; }
+    std::uint64_t responseGroupsApproximated() const noexcept { return approxGroups_; }
     // Group x sub-block invocations of the forced kernel (applyCoupledInput), so far.
     std::uint64_t forcedGroupBlocks() const noexcept { return forcedBlocks_; }
 
@@ -268,20 +316,31 @@ private:
         active_[g] = on;
         activeCount_ += on ? 1 : -1;
         const int s = groupSeg_[g];
-        if (g < segFirstGroup(s) + segCoupled_[s]) ++segVersion_[s];
+        if (g < segFirstGroup(s) + segCoupled_[s]) {
+            ++segVersion_[s];
+            ++segAwakeVer_[s];
+        }
     }
     // Applies the segment's damper amount to group g's coefficients.
     void refreshGroup(int g) noexcept;
     // After active_ was written directly: recount and refresh awake groups.
     void syncActive() noexcept;
     void touchAll() noexcept {
-        for (int s = 0; s < nSeg_; ++s) ++segVersion_[s];
+        for (int s = 0; s < nSeg_; ++s) {
+            ++segVersion_[s];
+            ++segAwakeVer_[s];
+        }
     }
-    void invalidateResponse(int g, bool lifted) noexcept {
-        groupHValid_[g] = 0;
-        if (lifted) groupH0Valid_[g] = 0;
+    // The free coefficients or weights of group g changed (non-RT setters):
+    // every cached response of it is out of date.
+    void invalidateResponse(int g) noexcept {
+        groupHValid_[g] = groupH0Valid_[g] = groupTaylorValid_[g] = 0;
         ++segVersion_[groupSeg_[g]];
+        ++segAwakeVer_[groupSeg_[g]];
     }
+    // Exact responses of the listed groups (consecutive runs in one kernel
+    // call) at the current coefficients, into the lifted or the current cache.
+    void computeResponses(const int* list, int n, bool lifted, Kernel kernel) noexcept;
 
     AlignedArray<float> zr_, zi_, dr_, ci_, wIn_, wInIm_, wOut_;  // dr = Re(c) - 1
     AlignedArray<float> dr0_, ci0_;   // free-string coefficient
@@ -306,6 +365,23 @@ private:
     // which survives damper changes.
     AlignedArray<float> groupH_, groupH0_;
     AlignedArray<std::uint8_t> groupHValid_, groupH0Valid_;
+    AlignedArray<float> groupHAmount_;            // damper amount of groupH_'s row
+    AlignedArray<float> groupD1_, groupD2_;       // expansion rows (see coupledResponse)
+    AlignedArray<std::uint8_t> groupTaylorValid_;
+    AlignedArray<std::uint8_t> groupApprox_;      // last coupledResponse used the expansion
+    AlignedArray<std::uint8_t> segApprox_;        // some awake group of the segment is approximate
+    AlignedArray<std::uint32_t> segDampTick_;     // tick of the segment's last damper change
+    // Per segment, the expansion rows summed over its awake coupled groups
+    // (3 x kResponseTaps), valid while the awake set is the one counted by
+    // segAwakeVer_ when they were summed.
+    AlignedArray<float> segT_;
+    AlignedArray<std::uint32_t> segAwakeVer_, segTVer_;
+    AlignedArray<std::uint8_t> segTValid_;
+    std::uint32_t tick_ = 0;
+    int budget_ = -1;                             // exact responses left this tick (< 0: unlimited)
+    int tickBudget_ = -1;                         // the tick's whole budget
+    int tickDemand_ = 0;                          // awake coupled groups whose damper moved this tick
+    int refineCursor_ = 0;
     AlignedArray<int> hList_;
     AlignedArray<float> segCullScale_, segInputScale_;  // per-segment threshold factors
 
@@ -319,6 +395,7 @@ private:
     int activeCount_ = 0;
     std::uint64_t groupBlocks_ = 0;
     std::uint64_t responseGroups_ = 0;
+    std::uint64_t approxGroups_ = 0;
     std::uint64_t forcedBlocks_ = 0;
 };
 

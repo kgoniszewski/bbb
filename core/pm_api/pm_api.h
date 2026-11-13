@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 12
+#define PM_API_VERSION_MINOR 13
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -559,6 +559,8 @@ typedef struct pm_bench_result {
     pm_work_detail worst;    /* the most expensive buffer by wall time */
 } pm_bench_result;
 
+/* Items: the scenarios (bench.h order; API 0.13 appended "pedal lift",
+ * scene 12, after the same-key burst), then the hammer keys. */
 int32_t pm_bench_item_count(const pm_bench_config* config);
 /* Static string; "" for an index out of range. */
 const char* pm_bench_item_name(const pm_bench_config* config, int32_t index);

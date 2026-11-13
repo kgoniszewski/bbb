@@ -278,14 +278,17 @@ int main(int argc, char** argv) {
                 "   by the OS.)\n");
 
     std::printf("  most expensive buffer: hammers that touched a string / most at once / contact samples,\n"
-                "  Newton evaluations / fallbacks; zone kernel per buffer on average: full rebuilds, key updates\n");
+                "  Newton evaluations / fallbacks; zone kernel per buffer on average: full rebuilds, key updates;\n"
+                "  most in one buffer of the run: damper updates, coupled-group responses exact / expanded\n");
     for (int i = 0; i < nCases; ++i) {
         if (!selected(i)) continue;
         const pm::bench::ScenarioResult& r = results[static_cast<std::size_t>(i)];
         const pm::bench::BufferDetail& d = r.maxDetail;
-        std::printf("    %-35s hammers %2d / %2d / %5d, Newton %6d / %d; kernel %.2f rebuilds, %.2f key updates\n",
+        std::printf("    %-35s hammers %2d / %2d / %5d, Newton %6d / %d; kernel %.2f rebuilds, %.2f key updates;"
+                    " dampers %d, responses %d / %d\n",
                     pm::bench::caseAt(cfg, i).name, d.hammersInContact, d.maxHammersInContact, d.hammerContactSamples,
-                    d.newtonEvals, d.fallbackSolves, r.kernelRebuildsPerBuffer, r.kernelKeyUpdatesPerBuffer);
+                    d.newtonEvals, d.fallbackSolves, r.kernelRebuildsPerBuffer, r.kernelKeyUpdatesPerBuffer,
+                    r.maxDamperUpdates, r.maxResponseGroups, r.maxApproxResponses);
     }
     std::printf("  work counts: most expensive buffer (hammer-samples stepped / with damper on; group-blocks free /\n"
                 "  forced; loop members / listeners / kernel entries / zones read) | means per buffer (free / forced\n"

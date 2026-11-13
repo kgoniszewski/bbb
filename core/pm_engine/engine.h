@@ -77,14 +77,27 @@
 // below -1 dBFS (0.89) and never reaches 1.0.
 //
 // Cost of events (measured with per-buffer instruction counts, see
-// core/pm_bench "pedalling" and "release" scenes). A damper amount that
-// changes costs a coefficient update of the key's awake modes and a
-// recompute of the impulse response the loop caches for its awake coupled
-// groups (about one free pass of them over kSubBlock samples); sleeping
-// groups take the new amount when they wake (mode_bank.h). A key's own
-// damper motion applies on every control tick; what the sustain pedal moves
-// (every damper at once) on every second tick per key, half of the keys on
-// each, so a pedal stroke recomputes at most half of them per tick.
+// core/pm_bench "pedalling", "release" and "pedal lift" scenes). A damper
+// amount that changes costs a coefficient update of the key's awake modes
+// and a new impulse response of its awake coupled groups for the loop;
+// sleeping groups take the new amount when they wake (mode_bank.h). A key's
+// own damper motion applies on every control tick; what the sustain pedal
+// moves (every damper at once) on every second tick per key, half of the
+// keys on each. Exact group responses (about one free pass of a group over
+// kSubBlock samples each) are computed for at most kResponseBudget groups
+// per control tick; beyond that a group's response is its precomputed
+// second-order expansion in the damper amount (relative error under 4.2e-4,
+// ModeBank::coupledResponse), and exact responses replace the expansions
+// within the same budget once the key's damper has stopped moving. Whatever
+// the pedal does, a tick therefore computes at most kResponseBudget exact
+// responses; the rest of a damper change (the awake modes' coefficients,
+// the expanded response, its change added to the zone kernel's columns) is
+// a fixed cost per key and awake group. At rest every response is exact
+// again (a few ticks after the motion ends), and with fewer changes per
+// tick than the budget (a few keys released, the pedal held) nothing is
+// approximated at all: the output is then bit-identical to an unlimited
+// budget (setExactDamperResponses). A pedal stroke over sounding strings
+// changes the responses of up to about 300 awake coupled groups per tick.
 //
 // Idle (setIdleSleep, on by default): with no string mode awake, no
 // hammer, no knock or damper noise and the board asleep for two sub-blocks,
@@ -154,7 +167,8 @@ struct RenderInfo {
     int damperUpdates = 0;     // damper amounts applied to a key's modes
     int responseGroups = 0;    // coupled groups whose impulse response was recomputed
     int kernelRebuilds = 0;    // full zone-kernel rebuilds of the soundboard loop (member set changed)
-    int kernelKeyUpdates = 0;  // keys whose zone-kernel columns were updated in place (response changed)
+    int kernelKeyUpdates = 0;  // keys whose zone-kernel columns were updated in place (response or membership changed)
+    int approxResponses = 0;   // coupled-group responses taken from the damper expansion (over the tick budget)
     // Work counts, to compare buffers of different engine instances or
     // material: hammer-samples stepped by the contact solver (every active
     // hammer, in flight, in contact or waiting for its release; each is one
@@ -238,6 +252,9 @@ class Engine {
 public:
     static constexpr int kHammerPool = 32;
     static constexpr int kSubBlock = 32;     // also the control-rate grid
+    // Exact coupled-group impulse responses per control tick (see "Cost of
+    // events" above; about 2 % of an all-keys-awake tick on the audio thread).
+    static constexpr int kResponseBudget = 32;
     static_assert(kSubBlock <= CouplingLoop::kMaxBlock, "sub-block longer than the loop's kernel");
     static constexpr int kQueueSize = 1024;
     static constexpr int kMaxPending = 1024;
@@ -335,6 +352,16 @@ public:
     // zone kernel whole on every change instead of updating the changed
     // columns in place (CouplingLoop::setAlwaysRebuild, the bit-exact reference).
     void setKernelAlwaysRebuild(bool on) noexcept { loop_.setAlwaysRebuild(on); }
+    // Damper responses (any thread, from the next render): exact (unlimited
+    // budget: every coupled group's response recomputed exactly whenever its
+    // damper amount changes, as before the budget) or budgeted (default; see
+    // "Cost of events" above). For A/B tests.
+    void setExactDamperResponses(bool on) noexcept { exactResp_.store(on, std::memory_order_relaxed); }
+    bool exactDamperResponses() const noexcept { return exactResp_.load(std::memory_order_relaxed); }
+    // Inspection (tests): coupled groups whose response is approximate now,
+    // and whether the loop's zone kernel equals a full rebuild bit for bit.
+    int approximateResponses() const noexcept { return bank_.approximateGroups(); }
+    bool loopKernelExact() noexcept { return !boardOn_ || loop_.kernelMatchesRebuild(); }
     float masterGainDb() const noexcept { return masterGainDb_.load(std::memory_order_relaxed); }
     float stereoWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
     SchedulingMode schedulingMode() const noexcept {
@@ -525,6 +552,8 @@ private:
     int quietRun_ = 0, stableTicks_ = 0;
     bool idleSleep_ = true;
     std::atomic<bool> idleOn_{true};
+    std::atomic<bool> exactResp_{false};
+    bool exactRespApplied_ = false;
     float tickP0T_ = 0.0f, tickP0B_ = 0.0f, tickW_ = 0.0f, tickDampedCull_ = 0.0f;
 
     // Keys, dampers, pedal.

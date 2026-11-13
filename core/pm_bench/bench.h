@@ -35,6 +35,15 @@
 //   same-key burst: identical, except that every burst strikes the same six
 //             keys (the warm counterpart: compare the hammer phase per
 //             hammer-sample of the two)
+//   pedal lift: many strings sounding under the held sustain pedal (a
+//             two-hand chord of 12 notes struck every 1.2 s and released
+//             into the pedal, four bass and middle keys held throughout);
+//             every 0.6 s the pedal comes up for 150 ms and goes down
+//             again (alternately CC64 on/off and ramps of many values), and
+//             three notes are struck as it goes down: the dampers land on
+//             and lift off about 9000 sounding modes, as in the iPad's
+//             worst live buffer (the damper amounts change on every control
+//             tick while the felts pass through their transition)
 //   hammer:   cost of one active hammer per buffer, per key, while in
 //             contact and averaged over its life (from the launch until
 //             hammerFinished: the release wait, or since the sample path's
@@ -121,7 +130,7 @@ inline constexpr int kMaxLoad = 8;
 enum class Scene : int {
     Worst = 0, Typical = 1, Cluster = 2, Bloom = 3,
     Legato = 4, Pedalling = 5, ChordRelease = 6, Idle = 7,
-    HammerBurst = 8, PedalChords = 9, FreshBurst = 10, SameBurst = 11
+    HammerBurst = 8, PedalChords = 9, FreshBurst = 10, SameBurst = 11, PedalLift = 12
 };
 
 // Every event of a scene up to sample 'end' (sample-time stamps), in time
@@ -159,6 +168,7 @@ struct BufferDetail {
     int hammersInContact = 0, maxHammersInContact = 0, hammerContactSamples = 0;
     int newtonEvals = 0, fallbackSolves = 0;
     int kernelRebuilds = 0, kernelKeyUpdates = 0, responseGroups = 0, damperUpdates = 0;
+    int approxResponses = 0;  // coupled-group responses from the damper expansion (over budget)
     int hammerSamples = 0, hammerDampedSamples = 0;  // RenderInfo: hammer-samples stepped / with a damper on
     int awakeModes = 0, freeGroupBlocks = 0, forcedGroupBlocks = 0;
     int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
@@ -178,6 +188,9 @@ struct ScenarioResult {
     int maxIndex = 0, topCount = 0;
     BufferDetail maxDetail;    // the most expensive buffer by wall time
     double kernelRebuildsPerBuffer = 0.0, kernelKeyUpdatesPerBuffer = 0.0;
+    // Most damper updates and exact / expanded coupled-group responses in
+    // one buffer over the run (RenderInfo).
+    int maxDamperUpdates = 0, maxResponseGroups = 0, maxApproxResponses = 0;
     // Means per buffer over the measured buffers (RenderInfo).
     double freeGroupBlocksPerBuffer = 0.0, forcedGroupBlocksPerBuffer = 0.0;
     double loopMembersMean = 0.0, loopListenersMean = 0.0;

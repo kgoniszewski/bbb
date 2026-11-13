@@ -31,7 +31,7 @@ uint32_t pm_api_version(void) {
 const char* pm_version_string(void) {
     return PM_STR(PM_API_VERSION_MAJOR) "." PM_STR(PM_API_VERSION_MINOR) "." PM_STR(PM_API_VERSION_PATCH)
         " (M4, app host, diagnostics, phase timing, speed probe, benchmark, pacing, audio-thread scenes, "
-        "per-CPU statistics, headroom test)";
+        "per-CPU statistics, headroom test, damper-response budget)";
 }
 
 pm_engine* pm_engine_create(void) {

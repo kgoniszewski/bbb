@@ -154,26 +154,29 @@ int main(void) {
         const char* info = pm_build_info();
         EXPECT(info != NULL && info[0] != 0);
         printf("  build: %s\n", info);
-        /* 15 scenarios (7, then 8 of live playing: 4 in API 0.8, hammer
+        /* 16 scenarios (7, then 9 of live playing: 4 in API 0.8, hammer
          * burst and pedalled chords in 0.9, fresh- and same-key bursts in
-         * 0.10) + 8 hammer keys; the 6 tier cases go before the live ones. */
-        EXPECT(pm_bench_item_count(&bc) == 23);
+         * 0.10, pedal lift in 0.13) + 8 hammer keys; the 6 tier cases go
+         * before the live ones. */
+        EXPECT(pm_bench_item_count(&bc) == 24);
         bc.flags = PM_BENCH_ALL_TIERS;
-        EXPECT(pm_bench_item_count(&bc) == 29);
+        EXPECT(pm_bench_item_count(&bc) == 30);
         EXPECT(pm_bench_item_name(&bc, 13)[0] == 'l'); /* legato */
         bc.flags = PM_BENCH_NO_HAMMER;
-        EXPECT(pm_bench_item_count(&bc) == 15);
-        EXPECT(pm_bench_item_name(&bc, 15)[0] == 0);
+        EXPECT(pm_bench_item_count(&bc) == 16);
+        EXPECT(pm_bench_item_name(&bc, 16)[0] == 0);
         EXPECT(pm_bench_item_name(&bc, 8)[0] == 'p');  /* pedalling */
         EXPECT(pm_bench_item_name(&bc, 11)[0] == 'h'); /* hammer burst */
         EXPECT(pm_bench_item_name(&bc, 13)[0] == 'f'); /* fresh-key burst */
         EXPECT(pm_bench_item_name(&bc, 14)[0] == 's'); /* same-key burst */
-        EXPECT(pm_bench_item_scene(&bc, 13) == 10 && pm_bench_item_scene(&bc, 15) == -1);
+        EXPECT(pm_bench_item_name(&bc, 15)[0] == 'p'); /* pedal lift */
+        EXPECT(pm_bench_item_scene(&bc, 13) == 10 && pm_bench_item_scene(&bc, 15) == 12 &&
+               pm_bench_item_scene(&bc, 16) == -1);
         bc.flags = 0;
         EXPECT(pm_bench_item_name(&bc, 3)[0] == 'c');  /* cluster */
-        EXPECT(pm_bench_item_name(&bc, 18)[0] == 'h'); /* hammer, key 40 */
+        EXPECT(pm_bench_item_name(&bc, 19)[0] == 'h'); /* hammer, key 40 */
         bc.hammer_strikes = 3;
-        EXPECT(pm_bench_run_item(&bc, 18, &br) == 1);
+        EXPECT(pm_bench_run_item(&bc, 19, &br) == 1);
         EXPECT(br.ok == 1 && br.kind == PM_BENCH_HAMMER && br.key == 40 && br.strings == 3 &&
                br.oversampling == 2 && br.contact_us > 0.0 && br.life_us > 0.0);
         bc.seconds = 0.05;

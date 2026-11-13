@@ -66,6 +66,7 @@ struct Result {
     double final = 0.0;     // E(end) / E(0)
     double lateRise = 0.0;  // mean E over the last quarter / mean E over the third quarter
     int modes = 0, boardModes = 0;
+    long approx = 0, exactResponses = 0;  // group responses expanded / computed exactly
     bool finite = true;
 };
 
@@ -76,7 +77,12 @@ struct Result {
 // (A loop whose strings answer the board one sub-block late, what the exact
 // block solve replaces, grows too slowly at these coupling strengths to be
 // caught within 0.5 s and is not used as the detector.)
-Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool flipped = false) {
+// moving: every key's damper amount takes a random step on every sub-block
+// (within 0..A, A random in 0.02..1.5: near-lossless strings stress
+// passivity most), and the bank's damper-response budget is 0-2 groups per
+// sub-block, so the loop runs on approximate (expanded) and stale-amount
+// responses most of the time (ModeBank::coupledResponse).
+Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool flipped = false, bool moving = false) {
     Rng r{seed};
     pm::PlateParams pp;
     pp.lengthX = r.uni(1.6, 2.2);
@@ -150,6 +156,11 @@ Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool 
         res.modes += sets[i].count;
     }
     bank.setCulling(r.uni(0.0, 1.0) < 0.5, -100.0f);
+    if (moving) bank.precomputeCoupledResponses();
+    const int budget = moving ? r.range(0, 2) : -1;
+    const double maxAmount = moving ? std::exp(r.uni(std::log(0.02), std::log(1.5))) : 0.0;
+    std::vector<float> amount(static_cast<std::size_t>(nk));
+    for (int i = 0; i < nk; ++i) amount[i] = bank.segmentDamper(i);
     pm::Soundboard sb;
     pm::loadSoundboard(sb, board, kFs);
     res.boardModes = board.modes;
@@ -185,6 +196,14 @@ Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool 
     int n3 = 0, n4 = 0;
     // The engine's sub-block sequence, production code throughout.
     for (int s = 0; s + 32 <= samples; s += 32) {
+        if (moving) {
+            for (int i = 0; i < nk; ++i) {
+                amount[i] = static_cast<float>(std::clamp(amount[i] + maxAmount * r.uni(-0.25, 0.25), 0.0, maxAmount));
+                bank.setSegmentDamper(i, r.uni(0.0, 1.0) < 0.1 ? 0.0f : amount[i]);
+            }
+            bank.beginResponseTick(budget);
+            bank.refineResponses();
+        }
         loop.begin(bank, sb, io.data());
         bank.processSegmentsFree(io.data(), 32);
         loop.collect(bank, io.data(), 32);
@@ -214,6 +233,8 @@ Result runSet(const pm::PianoTable& base, std::uint64_t seed, int samples, bool 
         res.final = e / e0;
     }
     res.lateRise = n3 > 0 && n4 > 0 && q3 > 0.0 ? (q4 / n4) / (q3 / n3) : 0.0;
+    res.approx = static_cast<long>(bank.responseGroupsApproximated());
+    res.exactResponses = static_cast<long>(bank.responseGroupsComputed());
     return res;
 }
 
@@ -248,6 +269,42 @@ TEST(energy_never_grows_random_sets) {
                 "E(end)/E(0) %.4f, worst mean(last quarter)/mean(third quarter) %.4f; %d violations\n",
                 kSets, modes, boardModes, worstPeak, worstFinal, worstLate, bad);
     CHECK(bad == 0);
+}
+
+// The same with the damper amounts moving on every sub-block and a tiny
+// damper-response budget: the loop's responses are mostly the expansion in
+// the amount, or exact at an amount the damper has since left (until the
+// refinement catches up), while the strings always run on their exact
+// coefficients. Such responses must not add energy either.
+TEST(energy_never_grows_moving_dampers) {
+    pm::ScopedFlushDenormals ftz;
+    pm::PianoTable base;
+    pm::buildPianoTable(base);
+    const int kSets = 3000;
+    int bad = 0;
+    long approx = 0, exact = 0;
+    double worstPeak = 0.0, worstFinal = 0.0, worstLate = 0.0;
+    for (int i = 0; i < kSets; ++i) {
+        const int samples = i % 50 == 0 ? 24000 : 1216;
+        const Result r = runSet(base, 50000 + std::uint64_t(i), samples, false, true);
+        approx += r.approx;
+        exact += r.exactResponses;
+        const bool ok = r.finite && r.peak <= 1.03 && r.final <= 1.0 && r.lateRise <= 1.001;
+        if (!ok) {
+            if (bad < 10)
+                std::printf("  set %d: peak %.4f final %.4f late rise %.4f finite %d\n", i, r.peak, r.final, r.lateRise,
+                            r.finite ? 1 : 0);
+            ++bad;
+        }
+        worstPeak = std::max(worstPeak, r.peak);
+        worstFinal = std::max(worstFinal, r.final);
+        worstLate = std::max(worstLate, r.lateRise);
+    }
+    std::printf("  %d random sets, dampers moving (%ld group responses expanded, %ld exact): worst E(t)/E(0) %.4f, "
+                "worst E(end)/E(0) %.4f, worst late rise %.4f; %d violations\n",
+                kSets, approx, exact, worstPeak, worstFinal, worstLate, bad);
+    CHECK(bad == 0);
+    CHECK(approx > exact);
 }
 
 // The test detects a loop that is not passive (runSet, flipped) on the same

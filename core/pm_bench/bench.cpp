@@ -220,6 +220,42 @@ void sceneEvents(Scene s, double fs, std::uint64_t end, std::vector<Event>& out)
             }
             break;
         }
+        case Scene::PedalLift: {
+            // Pedal down; four keys held throughout (re-struck every 2.4 s);
+            // a 12-note chord over both hands every 1.2 s, released 0.2 s
+            // later into the pedal. Every 0.6 s, from 0.9 s, the pedal comes
+            // up for 150 ms and goes down again; three notes are struck 20 ms
+            // after it starts down. Odd changes send CC64 as plain 0 / 127,
+            // even ones as ramps (up over 40 ms in 12 steps, down over 60 ms
+            // in 16 steps).
+            const int held[4] = {33, 45, 52, 57};
+            const int chord[12] = {28, 35, 40, 47, 55, 59, 64, 67, 71, 76, 79, 88};
+            const int lead[6][3] = {{60, 72, 84}, {62, 74, 86}, {58, 70, 82}, {65, 77, 89}, {63, 75, 87}, {61, 73, 85}};
+            add(0, EventType::Sustain, 0, 127);
+            for (std::uint64_t b = 0; b < end; b += at(2.4))
+                for (int n : held) add(b, EventType::NoteOn, n, 80);
+            for (int c = 0; at(1.2 * c) < end; ++c)
+                for (int j = 0; j < 12; ++j) {
+                    const double t = 1.2 * c + 0.004 * j;
+                    add(at(t), EventType::NoteOn, chord[j], 75 + (5 * j + 11 * c) % 40);
+                    add(at(t + 0.2), EventType::NoteOff, chord[j], 64);
+                }
+            for (int c = 0; at(0.9 + 0.6 * c) < end; ++c) {
+                const double up = 0.9 + 0.6 * c, down = up + 0.15;
+                if (c % 2) {
+                    add(at(up), EventType::Sustain, 0, 0);
+                    add(at(down), EventType::Sustain, 0, 127);
+                } else {
+                    for (int j = 1; j <= 12; ++j) add(at(up + 0.040 * (j - 1) / 11.0), EventType::Sustain, 0, 127 - 127 * j / 12);
+                    for (int j = 1; j <= 16; ++j) add(at(down + 0.060 * (j - 1) / 15.0), EventType::Sustain, 0, 127 * j / 16);
+                }
+                for (int n : lead[c % 6]) {
+                    add(at(down + 0.020), EventType::NoteOn, n, 85 + 7 * (c % 4));
+                    add(at(down + 0.35), EventType::NoteOff, n, 64);
+                }
+            }
+            break;
+        }
         case Scene::Idle:
             break;
     }
@@ -252,6 +288,7 @@ BufferDetail detailOf(const RenderInfo& i) {
     d.kernelKeyUpdates = i.kernelKeyUpdates;
     d.responseGroups = i.responseGroups;
     d.damperUpdates = i.damperUpdates;
+    d.approxResponses = i.approxResponses;
     d.hammerSamples = i.hammerSamples;
     d.hammerDampedSamples = i.hammerDampedSamples;
     d.awakeModes = i.awakeModes;
@@ -276,7 +313,7 @@ void accumulate(Phases& acc, const Phases& p, double w) {
 
 // The realistic scenes are appended after the tier cases, so that the
 // earlier cases keep their indices and output order.
-constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 8;
+constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 9;
 
 int caseCount(const Config& c) noexcept { return kBaseCases + (c.allTiers ? kTierCases : 0) + kLiveCases; }
 
@@ -293,6 +330,7 @@ Case caseAt(const Config& c, int i) noexcept {
             case 5: return {"pedalled chords (8 roots, CC64 on/off)", true, Scene::PedalChords, true, t};
             case 6: return {"fresh-key burst (6 new keys, pedal)", true, Scene::FreshBurst, true, t};
             case 7: return {"same-key burst (6 same keys, pedal)", true, Scene::SameBurst, true, t};
+            case 8: return {"pedal lift (pedal up/down, strings sounding)", true, Scene::PedalLift, true, t};
             default: return {"?", true, Scene::Worst, true, t};
         }
     }
@@ -444,6 +482,9 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         const RenderInfo& info = eng.lastRender();
         rebuilds += info.kernelRebuilds;
         keyUpdates += info.kernelKeyUpdates;
+        res.maxDamperUpdates = std::max(res.maxDamperUpdates, info.damperUpdates);
+        res.maxResponseGroups = std::max(res.maxResponseGroups, info.responseGroups);
+        res.maxApproxResponses = std::max(res.maxApproxResponses, info.approxResponses);
         freeBlocks += info.freeGroupBlocks;
         forcedBlocks += info.forcedGroupBlocks;
         members += info.loopMembers;
