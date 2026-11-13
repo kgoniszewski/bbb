@@ -20,7 +20,8 @@ layer (MIDI 1.0 / UMP parsing, event queues from the MIDI and UI threads,
 a prepare gate, a render-load meter with diagnostics and a speed probe, benchmark scenes on the audio thread, per-CPU render statistics, a headroom test with a load multiplier; `core/pm_host`, C API 0.12), an
 offline benchmark library shared by `bench_engine` and the app (`core/pm_bench`), a Swift
 package exposing the C API, and a SwiftUI app for iPad and Mac (see
-[iPad app](#ipad-app); not yet built by anyone, see its checklist). There
+[iPad app](#ipad-app); built and run on an iPad Pro M2 and on a Mac, see
+its checklist for what is still unverified). There
 is no radiation or microphone model, no room, no longitudinal modes or
 duplex yet.
 
@@ -504,12 +505,14 @@ soundboard replaced in the engine.
 
 A minimal SwiftUI app (M2, "first playable") that plays the engine from a
 USB MIDI keyboard (target: Komplete Kontrol M32) on an iPad Pro M2, and
-also runs on a Mac. **It has been written without access to Xcode: nobody
-has compiled it yet.** The C++ part it relies on (`core/pm_host`, the C
-API) is tested by CTest, and the Swift package builds and passes its
-smoke test with `swift build` / `swift test` on Linux (Swift 6.1); the app
-sources were only syntax-checked (`swiftc -parse`), apart from two files
-type-checked against the C API.
+also runs on a Mac. It was written without access to Xcode; it has since
+been built and run on an iPad Pro 11" M2 (iPad14,3, iPadOS 27.0.1; API
+0.12.0, NEON kernel, 2026-11-13) and as an iPad app on a Mac mini M4,
+where the CPU measurements below were taken. The C++ part it relies on
+(`core/pm_host`, the C API) is tested by CTest on Linux x86_64, and the
+Swift package builds and passes its smoke test with `swift build` /
+`swift test` on Linux (Swift 6.1); the CTest suites have not yet run on
+Apple silicon (only the engine itself has run there).
 
 ### Structure
 
@@ -601,6 +604,11 @@ edit the scheme's Run configuration to Release.
 
 ### What to test (M2 acceptance, plan §7)
 
+Status (2026-11-13): the app runs on the iPad Pro M2 at the requested 48
+kHz / 64 frames and its CPU is measured (see Benchmark screen below); none
+of the items below has been reported yet from the device, and there is no
+listening or crackle report from played input so far.
+
 - [ ] **Playable from the M32 over USB.** Notes with velocity, sustain
       pedal in the M32's pedal socket (CC64; continuous values give
       half-pedal), unplug and replug the M32 while holding a chord with the
@@ -642,7 +650,9 @@ The meter is the render time of each buffer divided by the buffer
 period (frames / sample rate), measured inside `pm_host_render`:
 "Now" is smoothed over about 0.5 s, "Mean", "p99" and "Max" are since the
 last Reset, and the counter shows buffers above 70 %. Targets on the iPad
-Pro M2 (CLAUDE.md): mean at most 50 %, worst buffer at most 70 %. Above
+Pro M2 (CLAUDE.md): mean at most 50 %, worst buffer at most 70 % (measured
+for the worst scene on the device's audio thread: 19.6 % and 48.8 %, see
+Benchmark screen). Above
 100 % a buffer was late and you hear a click. Note-on buffers carry the
 hammer solves and are the peaks; the first buffers after a prepare can be
 slow too, so press Reset after the app has settled.
@@ -857,14 +867,73 @@ scenes: none), worst scene mean 4496 µs (38.7 %), max 7556 (65 %); typical
 chord 968 µs mean (359 back to back, 2392 paced); no overruns, highest max
 67 %. The system starts each I/O callback on an efficiency core at a low
 clock and moves it to a performance core part-way through long buffers,
-so "% of buffer" on the audio thread is not headroom; the headroom sweep
-measures whether there is any.
+so "% of buffer" on the audio thread is not headroom. The Headroom sweep
+there (API 0.12, worst scene, mean ÷ load × back-to-back mean in
+brackets): mean 4551 / 5071 / 5258 / 5394 / 7533 / 10258 µs at load
+1 / 2 / 3 / 4 / 6 / 8 (3.60 / 2.00 / 1.38 / 1.07 / 0.99 / 1.01), max 68.4 /
+100.4 / 129.3 / 150.4 / 195.3 / 253.1 %, overruns 0 / 1 / 2 / 3 / 7 / 16;
+buffers ending on a performance core 61 % at load 1, 100 % from load 2. The
+system does speed the thread up as the work grows, but the heaviest
+buffers overrun from load 2. This is not the iPad's configuration.
 
-What to send back from a device: the Benchmark table (Copy), with the
-Speed probe and Phases on, at both buffer settings, back to back and
-paced (Real-time paced on, and once off), with "Run all on audio thread"
-rows (benchmark engine) appended, a Headroom sweep of the worst scene
-after a back-to-back Benchmark run at the I/O buffer size, and Copy diagnostics with Phase timing
+Measured on the target device (2026-11-13; iPad Pro 11" M2, iPad14,3,
+iPadOS 27.0.1; 8 CPUs, taken as 0-3 efficiency and 4-7 performance, an
+assumption from the numbering that the measurements are consistent with;
+48 kHz / 64 frames granted = 1333 µs; API 0.12.0, NEON; tier Full,
+soundboard on; thermal state nominal; one 3 s run per scene). Back to back
+on the benchmark thread (all buffers on CPUs 4-7; probe 4.58 / 5.96 µs),
+mean / p99 / max in % of the buffer:
+
+| Scene | Mean | p99 | Max |
+|---|---|---|---|
+| Worst (88 keys held, pedal) | 15.94 (212.5 µs) | 29.68 | 45.05 |
+| Worst, culling off | 19.14 | 32.29 | 46.58 |
+| Cluster | 9.38 | 33.53 | 37.68 |
+| Bloom | 15.27 | 18.33 | 26.43 |
+| Pedalling | 15.43 | 20.14 | 31.02 |
+| Pedalled chords | 15.38 | 20.76 | 31.52 |
+| Fresh-key burst | 15.42 | 20.33 | 33.67 |
+| Hammer burst | 6.94 | 11.90 | 29.70 |
+| Release of a 10-note chord | 6.32 | 8.56 | 31.80 |
+| Legato | 6.08 | 8.45 | 12.49 |
+| Typical | 4.82 | 6.73 | 14.12 |
+| Idle | 0.02 | 0.03 | 0.04 |
+
+The worst case is 1.34× the Mac mini M4's back-to-back time at the same 48
+kHz / 64 frames (212.5 vs 158.1 µs). Headroom sweep on the real audio
+thread (worst scene, app engine, 2250 buffers per row):
+
+| Load | Mean µs | Max % | Overruns | Mean ÷ (load × back to back) |
+|---|---|---|---|---|
+| ×1 | 261 (19.59 %, p99 35.25 %) | 48.8 (650.8 µs) | 0 | 1.23 |
+| ×2 | 489 | 86.7 | 0 | 1.15 |
+| ×3 | 661 | 126.7 | 16 (0.7 %) | 1.04 |
+| ×4 | 840 | 170.9 | 35 (1.6 %) | 0.99 |
+| ×6 | 1275 | 255.8 | 300 (13.3 %) | 1.00 |
+| ×8 | 1682 | 350.3 | 2247 (99.9 %) | 0.99 |
+
+At load 1, 98 % of the buffers ran on CPU 4, 100 % on performance cores,
+with no mid-buffer migrations. The speed probe at the start of every 8th
+callback read 3-6× slower than full speed at loads 1-3 (24.5 / 19.2 µs at
+load 1) and 1.4× at loads 4-6, while render times stayed within 1.0-1.23×
+of full speed; inference (not measured directly): the clock is low at the
+very start of a callback and rises within tens of microseconds, costing
+about 50 µs per buffer at light load.
+
+So on the device at 64 frames the I/O thread stays on a performance core
+and the worst case meets both limits on the real audio thread (mean 19.6 %
+<= 50 %, worst buffer 48.8 % <= 70 %), with about 2× headroom before the
+heaviest single buffer overruns and about 6× on the mean. The iPad app on
+a Mac at 512 frames behaves differently (above) and must not be used to
+judge the device. Not yet measured on the device: the Balanced and Eco
+tiers, 128- and 256-frame buffers, repeated runs, other devices, and
+sustained load or a raised thermal state.
+
+What to send back from a device next: the Benchmark table and a Headroom
+sweep of the worst scene at 128 and 256 frames and at the Balanced and Eco
+tiers; the same at 64 frames after several minutes of heavy playing
+(thermal state in the diagnostics); a listening report (crackles while
+playing); and Copy diagnostics with Phase timing
 and Speed probe on (after a Benchmark run, for the reference) after (a) a
 minute of normal playing, (b) Reset, then ten notes hard together and
 released together a few times, (c) Reset, then chords with the sustain
