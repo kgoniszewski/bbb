@@ -169,6 +169,7 @@ struct RenderInfo {
     int kernelRebuilds = 0;    // full zone-kernel rebuilds of the soundboard loop (member set changed)
     int kernelKeyUpdates = 0;  // keys whose zone-kernel columns were updated in place (response or membership changed)
     int approxResponses = 0;   // coupled-group responses taken from the damper expansion (over the tick budget)
+    int groupsWoken = 0;       // sleeping coupled groups woken by loop input (ModeBank::groupsWoken)
     // Work counts, to compare buffers of different engine instances or
     // material: hammer-samples stepped by the contact solver (every active
     // hammer, in flight, in contact or waiting for its release; each is one

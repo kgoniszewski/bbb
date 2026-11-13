@@ -299,6 +299,10 @@ public:
     std::uint64_t responseGroupsApproximated() const noexcept { return approxGroups_; }
     // Group x sub-block invocations of the forced kernel (applyCoupledInput), so far.
     std::uint64_t forcedGroupBlocks() const noexcept { return forcedBlocks_; }
+    // Sleeping coupled groups woken by loop input (applyCoupledInput,
+    // wakeAllCoupled), so far: each costs a double-precision start-up of its
+    // modes over the rest of the sub-block.
+    std::uint64_t groupsWoken() const noexcept { return groupsWoken_; }
 
 private:
     int segFirstGroup(int s) const noexcept {
@@ -397,6 +401,7 @@ private:
     std::uint64_t responseGroups_ = 0;
     std::uint64_t approxGroups_ = 0;
     std::uint64_t forcedBlocks_ = 0;
+    std::uint64_t groupsWoken_ = 0;
 };
 
 }  // namespace pm

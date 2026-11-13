@@ -146,6 +146,8 @@ void toWork(const pm::host::WorstBuffer& b, pm_work_detail& w) noexcept {
     w.loop_listeners = b.loopListeners;
     w.loop_entries = b.loopEntries;
     w.out_zones = b.outZones;
+    w.groups_woken = b.groupsWoken;
+    w.approx_responses = b.approxResponses;
 }
 
 // Audio thread, before the buffer's events are forwarded: starts the
@@ -471,6 +473,8 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         rec.loopListeners = info.loopListeners;
         rec.loopEntries = info.loopEntries;
         rec.outZones = info.outZones;
+        rec.groupsWoken = info.groupsWoken;
+        rec.approxResponses = info.approxResponses;
         const pm::EngineProfile& p = e->profile();
         if (e->phaseTiming() && p.totalUs > 0.0) {
             static_assert(pm::EngineProfile::kPhases + 1 == pm::host::kLoadPhases, "phase table out of date");

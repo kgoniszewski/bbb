@@ -794,7 +794,9 @@ final class AppModel: ObservableObject {
         var out: [String] = []
         if r.has_phases == 1 {
             out.append("    phases us (events / hammers / free / forced / board / other): mean " + phaseText(r.mean_phase_us)
-                       + "; top 1 % (\(r.top_count)) " + phaseText(r.top_phase_us) + "; worst " + phaseText(r.worst_phase_us))
+                       + "; top 1 % (\(r.top_count)) " + phaseText(r.top_phase_us) + "; worst " + phaseText(r.worst_phase_us)
+                       + String(format: "; forced max %.1f us (%.2f x mean)", r.forced_max_us,
+                                r.mean_phase_us.3 > 0 ? r.forced_max_us / r.mean_phase_us.3 : 0))
         }
         out.append(workText(meanAwake: r.mean_awake_modes, free: r.free_group_blocks, forced: r.forced_group_blocks,
                             members: r.loop_members, listeners: r.loop_listeners, rebuilds: r.kernel_rebuilds,
@@ -820,7 +822,8 @@ final class AppModel: ObservableObject {
         out += "(\(w.hammer_damped_samples) damped), \(w.hammer_contact_samples) in contact, \(w.newton_evals) Newton / \(w.fallback_solves) fallbacks; "
         out += "\(w.damper_updates) damper updates, \(w.response_groups) responses, kernel \(w.kernel_rebuilds) + \(w.kernel_key_updates); "
         out += "group-blocks free \(w.free_group_blocks) / forced \(w.forced_group_blocks); loop \(w.loop_members) members, "
-        out += "\(w.loop_listeners) listeners, \(w.loop_entries) entries, \(w.out_zones) zones"
+        out += "\(w.loop_listeners) listeners, \(w.loop_entries) entries, \(w.out_zones) zones; "
+        out += "\(w.groups_woken) groups woken, \(w.approx_responses) responses expanded"
         return out
     }
 

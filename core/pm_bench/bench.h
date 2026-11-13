@@ -44,6 +44,13 @@
 //             and lift off about 9000 sounding modes, as in the iPad's
 //             worst live buffer (the damper amounts change on every control
 //             tick while the felts pass through their transition)
+//   pedal lift, cold: the same, with a 32 MiB eviction walk (as with
+//             evictBytes, outside the timing) before every buffer in which
+//             the pedal moves or the dampers are still moving (a sustain
+//             event in the buffer, or damper updates in the one before), so
+//             that those buffers start with the caches other work leaves, as
+//             live (the rest run back to back, warm). Shows the cold cost of
+//             a pedal-motion buffer.
 //   hammer:   cost of one active hammer per buffer, per key, while in
 //             contact and averaged over its life (from the launch until
 //             hammerFinished: the release wait, or since the sample path's
@@ -143,6 +150,7 @@ struct Case {
     Scene scene;
     bool board;
     QualityTier tier;
+    bool coldMotion = false;  // eviction walk before pedal-motion buffers (see "pedal lift, cold")
 };
 
 // Engine scenarios, in bench_engine's order.
@@ -169,6 +177,7 @@ struct BufferDetail {
     int newtonEvals = 0, fallbackSolves = 0;
     int kernelRebuilds = 0, kernelKeyUpdates = 0, responseGroups = 0, damperUpdates = 0;
     int approxResponses = 0;  // coupled-group responses from the damper expansion (over budget)
+    int groupsWoken = 0;      // sleeping coupled groups woken by loop input
     int hammerSamples = 0, hammerDampedSamples = 0;  // RenderInfo: hammer-samples stepped / with a damper on
     int awakeModes = 0, freeGroupBlocks = 0, forcedGroupBlocks = 0;
     int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
@@ -186,6 +195,12 @@ struct ScenarioResult {
     bool hasPhases = false;
     Phases maxBuf, top1, all;  // the most expensive buffer, mean of the top 1 %, mean of all
     int maxIndex = 0, topCount = 0;
+    // Forced phase (phase timing only): the largest of any buffer and its
+    // ratio to the mean over all buffers (a spike in one phase that the
+    // most expensive buffer's split need not show).
+    double forcedMaxUs = 0.0, forcedMaxOverMean = 0.0;
+    int forcedMaxIndex = 0;
+    int coldBuffers = 0;  // coldMotion: buffers preceded by the eviction walk
     BufferDetail maxDetail;    // the most expensive buffer by wall time
     double kernelRebuildsPerBuffer = 0.0, kernelKeyUpdatesPerBuffer = 0.0;
     // Most damper updates and exact / expanded coupled-group responses in

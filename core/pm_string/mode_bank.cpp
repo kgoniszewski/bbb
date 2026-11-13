@@ -53,6 +53,7 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
     sinceCull_ = 0;
     groupBlocks_ = 0;
     forcedBlocks_ = 0;
+    groupsWoken_ = 0;
     responseGroups_ = approxGroups_ = 0;
     tick_ = 0;
     budget_ = tickBudget_ = -1;
@@ -679,7 +680,17 @@ void ModeBank::applyCoupledInput(int s, const float* u, int n, Kernel kernel) no
 // correction, which joins at the same time, then cancels it: no force step
 // reaches the board), advanced with the rest of the sub-block's input. The
 // group's output over the rest of the sub-block is missing from the loop.
-// Rare: double precision, one mode at a time.
+// Double precision. Not rare: when the pedal lifts the dampers off strings
+// that still ring, a hundred groups or more can wake in one sub-block (the
+// input summed since the cull pass crosses their bounds as soon as the
+// damper's raised input threshold drops), and done one mode after the
+// other each mode's recursion is a serial chain of dependent double
+// operations: about 100 us per such sub-block on an M2 performance core
+// (plan §4.1). The group's modes are therefore advanced together, as
+// independent lanes the compiler vectorises, with exactly the operations
+// of the complex expression z = c z + w u (product terms rounded the same
+// way, the same sum order), so the state is bit for bit what the per-mode
+// std::complex loop gave. The start-up value keeps std::complex division.
 void ModeBank::wakeCoupled(int s, float inputBefore, const float* u, int n) noexcept {
     const float thr = cullThreshold_ * segInputScale_[s];
     for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) {
@@ -692,16 +703,49 @@ void ModeBank::wakeCoupled(int s, float inputBefore, const float* u, int n) noex
         }
         if (i == n) continue;
         if (groupStale_[g]) refreshGroup(g);
-        for (int m = g * kGroupSize; m < (g + 1) * kGroupSize; ++m) {
+        const int m0 = g * kGroupSize;
+        alignas(64) double zr[kGroupSize], zi[kGroupSize], cr[kGroupSize], cim[kGroupSize], wr[kGroupSize],
+            wi[kGroupSize];
+        for (int j = 0; j < kGroupSize; ++j) {
+            const int m = m0 + j;
             const std::complex<double> w(wIn_[m], wInIm_[m]);
-            std::complex<double> z = 0.0;
-            if (w != 0.0) {
-                const std::complex<double> c(1.0 + double(dr_[m]), double(ci_[m]));
-                z = w * double(u[i]) / (1.0 - c);
-                for (int k = i + 1; k < n; ++k) z = c * z + w * double(u[k]);
+            const std::complex<double> c(1.0 + double(dr_[m]), double(ci_[m]));
+            const std::complex<double> z = w == 0.0 ? std::complex<double>(0.0) : w * double(u[i]) / (1.0 - c);
+            zr[j] = z.real();
+            zi[j] = z.imag();
+            cr[j] = c.real();
+            cim[j] = c.imag();
+            wr[j] = w.real();
+            wi[j] = w.imag();
+        }
+        // A mode with w = 0 starts at +0 and stays there (every product and
+        // sum below is then +-0, and +0 + -0 = +0), as it was never advanced.
+        // Separate statements: c z is rounded term by term as the complex
+        // product is (no contraction across statements where only
+        // in-expression contraction is allowed; where any is, it is applied
+        // as it was to the lowered complex product).
+        for (int k = i + 1; k < n; ++k) {
+            const double uk = double(u[k]);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC unroll 1
+#endif
+            for (int j = 0; j < kGroupSize; ++j) {
+                const double t1 = cr[j] * zr[j];
+                const double t2 = cim[j] * zi[j];
+                const double rr = t1 - t2;
+                const double t3 = cr[j] * zi[j];
+                const double t4 = cim[j] * zr[j];
+                const double ri = t3 + t4;
+                const double pr = wr[j] * uk;
+                const double pi = wi[j] * uk;
+                zr[j] = rr + pr;
+                zi[j] = ri + pi;
             }
-            zr_[m] = static_cast<float>(z.real());
-            zi_[m] = static_cast<float>(z.imag());
+        }
+        ++groupsWoken_;
+        for (int j = 0; j < kGroupSize; ++j) {
+            zr_[m0 + j] = static_cast<float>(zr[j]);
+            zi_[m0 + j] = static_cast<float>(zi[j]);
         }
         setActive(g, 1);
     }
@@ -719,6 +763,7 @@ void ModeBank::wakeAllCoupled(int s, float u) noexcept {
             zr_[m] = static_cast<float>(z.real());
             zi_[m] = static_cast<float>(z.imag());
         }
+        ++groupsWoken_;
         setActive(g, 1);
     }
 }

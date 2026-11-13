@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 13
+#define PM_API_VERSION_MINOR 14
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -382,6 +382,11 @@ typedef struct pm_work_detail {
     int32_t loop_listeners;          /* keys taking loop input (largest over the sub-blocks) */
     int32_t loop_entries;            /* zone-kernel entries (largest over the sub-blocks) */
     int32_t out_zones;               /* board zones read back per sample (largest over the sub-blocks) */
+    /* API 0.14: */
+    int32_t groups_woken;            /* sleeping coupled groups woken by loop input (each a double-precision
+                                        start-up of its 16 modes over the rest of its sub-block) */
+    int32_t approx_responses;        /* coupled-group responses taken from the damper expansion (pedal motion
+                                        over the tick's response budget: rows of the expansion read) */
     int32_t reserved;
 } pm_work_detail;
 
@@ -557,10 +562,17 @@ typedef struct pm_bench_result {
     int32_t overruns;        /* buffers whose render took longer than the period */
     int32_t paced;           /* 1: paced to real time (2: with the eviction walk) */
     pm_work_detail worst;    /* the most expensive buffer by wall time */
+    /* API 0.14, with has_phases: the forced phase's largest value in any
+     * buffer (not necessarily the most expensive one) and its buffer index. */
+    double forced_max_us;
+    int32_t forced_max_index;
+    int32_t cold_buffers;    /* "pedal lift, cold": buffers preceded by the eviction walk */
 } pm_bench_result;
 
 /* Items: the scenarios (bench.h order; API 0.13 appended "pedal lift",
- * scene 12, after the same-key burst), then the hammer keys. */
+ * scene 12, after the same-key burst; API 0.14 "pedal lift, cold", the
+ * same scene with a 32 MiB eviction walk, untimed, before every buffer with
+ * pedal motion), then the hammer keys. */
 int32_t pm_bench_item_count(const pm_bench_config* config);
 /* Static string; "" for an index out of range. */
 const char* pm_bench_item_name(const pm_bench_config* config, int32_t index);

@@ -108,6 +108,9 @@ int pm_bench_run_item(const pm_bench_config* config, int32_t index, pm_bench_res
         result->overruns = r.overruns;
         result->paced = r.paced ? (r.evictBytes > 0 ? 2 : 1) : 0;
         pm::bench::toWorkDetail(r.maxDetail, result->worst);
+        result->forced_max_us = r.forcedMaxUs;
+        result->forced_max_index = r.forcedMaxIndex;
+        result->cold_buffers = r.coldBuffers;
         eng->describe(tLastConfig, static_cast<int>(sizeof tLastConfig));
         result->ok = 1;
         return 1;

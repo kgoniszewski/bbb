@@ -33,6 +33,8 @@ inline void toWorkDetail(const BufferDetail& d, pm_work_detail& w) noexcept {
     w.loop_listeners = d.loopListeners;
     w.loop_entries = d.loopEntries;
     w.out_zones = d.outZones;
+    w.groups_woken = d.groupsWoken;
+    w.approx_responses = d.approxResponses;
 }
 
 // Per-CPU totals (cpu_id.h) to pm_cpu_usage: sums become means.

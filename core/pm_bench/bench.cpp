@@ -289,6 +289,7 @@ BufferDetail detailOf(const RenderInfo& i) {
     d.responseGroups = i.responseGroups;
     d.damperUpdates = i.damperUpdates;
     d.approxResponses = i.approxResponses;
+    d.groupsWoken = i.groupsWoken;
     d.hammerSamples = i.hammerSamples;
     d.hammerDampedSamples = i.hammerDampedSamples;
     d.awakeModes = i.awakeModes;
@@ -313,7 +314,7 @@ void accumulate(Phases& acc, const Phases& p, double w) {
 
 // The realistic scenes are appended after the tier cases, so that the
 // earlier cases keep their indices and output order.
-constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 9;
+constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 10;
 
 int caseCount(const Config& c) noexcept { return kBaseCases + (c.allTiers ? kTierCases : 0) + kLiveCases; }
 
@@ -331,6 +332,7 @@ Case caseAt(const Config& c, int i) noexcept {
             case 6: return {"fresh-key burst (6 new keys, pedal)", true, Scene::FreshBurst, true, t};
             case 7: return {"same-key burst (6 same keys, pedal)", true, Scene::SameBurst, true, t};
             case 8: return {"pedal lift (pedal up/down, strings sounding)", true, Scene::PedalLift, true, t};
+            case 9: return {"pedal lift, cold (evicted before pedal motion)", true, Scene::PedalLift, true, t, true};
             default: return {"?", true, Scene::Worst, true, t};
         }
     }
@@ -403,7 +405,7 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     res.paced = c.paced;
     res.spin = c.paced && c.spin;
     res.evictBytes = c.paced ? c.evictBytes : 0;
-    std::vector<unsigned char> scratch(res.evictBytes);
+    std::vector<unsigned char> scratch(k.coldMotion ? std::max(res.evictBytes, kDefaultEvictBytes) : res.evictBytes);
     for (std::size_t i = 0; i < scratch.size(); i += 4096) scratch[i] = 1;  // fault the pages in now
     const int warmBlocks = static_cast<int>(warm * fs / block);
     const int blocks = std::max(1, static_cast<int>(c.seconds * fs / block));
@@ -419,11 +421,23 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     int stepCount = 0;
     const bool hook = c.paced && c.paceHook;
     int cpu0 = -1, cpu1 = -1;
+    // Other work on this core between buffers: one read-modify-write per
+    // cache line of a buffer larger than the caches in question.
+    auto evict = [&]() {
+        for (std::size_t i = 0; i < scratch.size(); i += 64) evictSink += ++scratch[i];
+    };
     auto step = [&](double* dt) {
         const std::uint64_t t1 = t + static_cast<std::uint64_t>(block);
+        bool pedal = false;
         for (; next < events.size() && events[next].time < t1; ++next) {
+            pedal = pedal || events[next].type == EventType::Sustain;
             eng.pushEvent(events[next]);
             for (auto& e : extra) e->pushEvent(events[next]);
+        }
+        // Cold variant: pedal motion (an event now, or dampers still moving).
+        if (dt && k.coldMotion && (pedal || eng.lastRender().damperUpdates > 0)) {
+            evict();
+            ++res.coldBuffers;
         }
         if (dt && c.probeEvery > 0 && ++stepCount % c.probeEvery == 0) {
             float sink = 0.0f;
@@ -449,9 +463,7 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         if (hook) c.paceHook(c.paceCtx, 2, 0);
         t += static_cast<std::uint64_t>(block);
         if (c.paced) {
-            // Other work on this core between buffers: one read-modify-write
-            // per cache line of a buffer larger than the caches in question.
-            for (std::size_t i = 0; i < scratch.size(); i += 64) evictSink += ++scratch[i];
+            if (res.evictBytes > 0) evict();
             deadline += periodDur;
             if (c.spin)
                 while (Clock::now() < deadline) {}
@@ -548,6 +560,13 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         res.topCount = std::max(1, blocks - static_cast<int>(0.99 * (blocks - 1)));
         for (int i = 0; i < res.topCount; ++i) accumulate(res.top1, ph[order[i]], 1.0 / res.topCount);
         for (int b = 0; b < blocks; ++b) accumulate(res.all, ph[b], 1.0 / blocks);
+        for (int b = 0; b < blocks; ++b)
+            if (ph[b].us[EngineProfile::ForcedPass] > res.forcedMaxUs) {
+                res.forcedMaxUs = ph[b].us[EngineProfile::ForcedPass];
+                res.forcedMaxIndex = b;
+            }
+        const double fm = res.all.us[EngineProfile::ForcedPass];
+        res.forcedMaxOverMean = fm > 0.0 ? res.forcedMaxUs / fm : 0.0;
     }
     std::sort(dts.begin(), dts.end());
     res.avgPercent = 100.0 * total / (blocks * period);

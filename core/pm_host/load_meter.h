@@ -71,6 +71,9 @@ struct BufferRecord {
     // members, listeners, zone-kernel entries, zones read.
     int hammerSamples = 0, hammerDampedSamples = 0, freeGroupBlocks = 0, forcedGroupBlocks = 0;
     int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
+    // Sleeping coupled groups woken by loop input, and coupled-group
+    // responses taken from the damper expansion (engine RenderInfo).
+    int groupsWoken = 0, approxResponses = 0;
     bool timed = false;                // phaseUs valid
     double phaseUs[kLoadPhases] = {};
     int cpuStart = -1, cpuEnd = -1;    // CPU at the start / end of the render call (-1: not read)
@@ -98,6 +101,7 @@ struct WorstBuffer {
     // members, listeners, zone-kernel entries, zones read.
     int hammerSamples = 0, hammerDampedSamples = 0, freeGroupBlocks = 0, forcedGroupBlocks = 0;
     int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
+    int groupsWoken = 0, approxResponses = 0;
     bool timed = false;
     double phaseUs[kLoadPhases] = {};
     int cpuStart = -1, cpuEnd = -1;
@@ -234,6 +238,8 @@ public:
             wListeners_.store(b.loopListeners, std::memory_order_relaxed);
             wEntries_.store(b.loopEntries, std::memory_order_relaxed);
             wZones_.store(b.outZones, std::memory_order_relaxed);
+            wWoken_.store(b.groupsWoken, std::memory_order_relaxed);
+            wApprox_.store(b.approxResponses, std::memory_order_relaxed);
             wTimed_.store(b.timed, std::memory_order_relaxed);
             for (int p = 0; p < kLoadPhases; ++p) wPhase_[p].store(b.timed ? b.phaseUs[p] : 0.0, std::memory_order_relaxed);
             wCpuStart_.store(b.cpuStart, std::memory_order_relaxed);
@@ -322,6 +328,8 @@ public:
             w.hammerDampedSamples = wHamDamped_.load(std::memory_order_relaxed);
             w.freeGroupBlocks = wFree_.load(std::memory_order_relaxed);
             w.forcedGroupBlocks = wForced_.load(std::memory_order_relaxed);
+            w.groupsWoken = wWoken_.load(std::memory_order_relaxed);
+            w.approxResponses = wApprox_.load(std::memory_order_relaxed);
             w.loopMembers = wMembers_.load(std::memory_order_relaxed);
             w.loopListeners = wListeners_.load(std::memory_order_relaxed);
             w.loopEntries = wEntries_.load(std::memory_order_relaxed);
@@ -570,6 +578,7 @@ private:
     std::atomic<int> wKeyUpd_{0}, wMaxContact_{0}, wContactSamples_{0}, wNewton_{0}, wFallback_{0};
     std::atomic<int> wHamSamples_{0}, wHamDamped_{0}, wFree_{0}, wForced_{0};
     std::atomic<int> wMembers_{0}, wListeners_{0}, wEntries_{0}, wZones_{0};
+    std::atomic<int> wWoken_{0}, wApprox_{0};
     // Speed probe: the whole probe and its two parts.
     Series probeTotal_, probeLatency_, probeThroughput_;
     std::atomic<std::uint64_t> probeCount_{0};

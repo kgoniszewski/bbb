@@ -279,16 +279,17 @@ int main(int argc, char** argv) {
 
     std::printf("  most expensive buffer: hammers that touched a string / most at once / contact samples,\n"
                 "  Newton evaluations / fallbacks; zone kernel per buffer on average: full rebuilds, key updates;\n"
-                "  most in one buffer of the run: damper updates, coupled-group responses exact / expanded\n");
+                "  most in one buffer of the run: damper updates, coupled-group responses exact / expanded;\n"
+                "  most expensive buffer: coupled groups woken by loop input, responses expanded\n");
     for (int i = 0; i < nCases; ++i) {
         if (!selected(i)) continue;
         const pm::bench::ScenarioResult& r = results[static_cast<std::size_t>(i)];
         const pm::bench::BufferDetail& d = r.maxDetail;
         std::printf("    %-35s hammers %2d / %2d / %5d, Newton %6d / %d; kernel %.2f rebuilds, %.2f key updates;"
-                    " dampers %d, responses %d / %d\n",
+                    " dampers %d, responses %d / %d; woken %d, expanded %d\n",
                     pm::bench::caseAt(cfg, i).name, d.hammersInContact, d.maxHammersInContact, d.hammerContactSamples,
                     d.newtonEvals, d.fallbackSolves, r.kernelRebuildsPerBuffer, r.kernelKeyUpdatesPerBuffer,
-                    r.maxDamperUpdates, r.maxResponseGroups, r.maxApproxResponses);
+                    r.maxDamperUpdates, r.maxResponseGroups, r.maxApproxResponses, d.groupsWoken, d.approxResponses);
     }
     std::printf("  work counts: most expensive buffer (hammer-samples stepped / with damper on; group-blocks free /\n"
                 "  forced; loop members / listeners / kernel entries / zones read) | means per buffer (free / forced\n"
@@ -325,6 +326,10 @@ int main(int argc, char** argv) {
                 for (int p = 0; p < pm::bench::kPhaseCount; ++p) std::printf(" %7.1f", rows[j]->us[p]);
                 std::printf(" %8.1f\n", rows[j]->total);
             }
+            std::printf("    %-35s forced max %.1f us (#%d) = %.2f x its mean", "", r.forcedMaxUs, r.forcedMaxIndex,
+                        r.forcedMaxOverMean);
+            if (r.coldBuffers > 0) std::printf("; %d buffers cold (eviction walk before each)", r.coldBuffers);
+            std::printf("\n");
         }
         std::printf("  (events: event handling, control tick, wake-ups, impulse-response cache and kernel\n"
                     "   updates; hammer: contact solves; free: the bank's block pass (board off: the whole\n"

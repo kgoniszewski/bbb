@@ -1040,7 +1040,7 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     const std::uint64_t responses0 = bank_.responseGroupsComputed(), approx0 = bank_.responseGroupsApproximated(),
                         rebuilds0 = loop_.kernelRebuilds(),
                         keyUpdates0 = loop_.kernelKeyUpdates(), free0 = bank_.groupBlocksProcessed(),
-                        forced0 = bank_.forcedGroupBlocks();
+                        forced0 = bank_.forcedGroupBlocks(), woken0 = bank_.groupsWoken();
     readParams();
     drainQueue(clock);
 
@@ -1097,6 +1097,7 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     info_.kernelKeyUpdates = static_cast<int>(loop_.kernelKeyUpdates() - keyUpdates0);
     info_.freeGroupBlocks = static_cast<int>(bank_.groupBlocksProcessed() - free0);
     info_.forcedGroupBlocks = static_cast<int>(bank_.forcedGroupBlocks() - forced0);
+    info_.groupsWoken = static_cast<int>(bank_.groupsWoken() - woken0);
     if (profiling_) {
         // Time before the first sub-block (parameters, queue) and between
         // sub-blocks without a lap is "other" (totalUs minus the phases).
