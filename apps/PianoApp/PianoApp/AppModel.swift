@@ -155,6 +155,29 @@ final class AppModel: ObservableObject {
     @Published var benchLines: [String] = []
     @Published var benchAllTiers = false
     @Published var benchLiveIO = false  // 512 frames at 44.1 kHz (what an iPad app on a Mac is granted)
+    /// Sleep to each buffer's real-time deadline between render calls, as
+    /// an audio thread does (PM_BENCH_PACED).
+    @Published var benchPaced = false
+    /// Paced, and walk a 32 MiB buffer between render calls (other work on the core).
+    @Published var benchEvict = false
+    /// Phase timing during the scenarios (the live meter's phase split uses it too).
+    @Published var benchPhases = true
+    /// Scenario run on the audio thread ("Run on audio thread"), an index into sceneNames.
+    @Published var sceneItem = 0
+    /// Run the scene on a private engine prepared as the benchmark's (not the app's instance).
+    @Published var sceneFreshEngine = false
+    @Published var sceneRunning = false
+    /// The scenario names (benchmark items without the hammer micro-benchmark).
+    let sceneNames: [String] = {
+        var c = pm_bench_config()
+        c.flags = Int32(PM_BENCH_NO_HAMMER.rawValue)
+        let n = Int(pm_bench_item_count(&c))
+        return (0..<n).map { String(cString: pm_bench_item_name(&c, Int32($0))) }
+    }()
+    private var sceneTimer: Timer?
+    private var sceneName = ""
+    private var benchConfigText = ""   // the benchmark engine's configuration (last scenario run)
+    private var sceneConfigText = ""   // the audio-thread run's engine configuration
     private var benchHeader = ""
     private let benchQueue = DispatchQueue(label: "piano.benchmark", qos: .userInteractive)
     // Controls
@@ -530,6 +553,7 @@ final class AppModel: ObservableObject {
             out += "worst buffer hammers: \(w.hammers_in_contact) touched strings, at most \(w.max_hammers_in_contact) at once, "
             out += "\(w.hammer_contact_samples) hammer-samples in contact, \(d.worst_hammers_active) still active at its end; "
             out += "\(w.newton_evals) Newton evaluations, \(w.fallback_solves) fallback solves\n"
+            out += "worst buffer work: " + AppModel.workDetailText(host.worstWork()) + "\n"
         }
         if pd.phase_timing == 1 || pd.timed_buffers > 0 {
             out += "phase timing: \(pd.phase_timing == 1 ? "on" : "off"), \(pd.timed_buffers) buffers timed; us per buffer, "
@@ -549,6 +573,7 @@ final class AppModel: ObservableObject {
         out += processCpuText() + "\n"
         out += "UI cost test: \(uiCost.mode.label)\n"
         out += "(loads are render time / each buffer's own period; p99 is the upper edge of a 0.25 % bin)\n"
+        out += "engine configuration:\n" + host.describeEngine()
         return out
     }
 
@@ -600,11 +625,8 @@ final class AppModel: ObservableObject {
     /// Runs the bench_engine scenarios on a background thread (QoS
     /// userInteractive) with audio output paused, so that the numbers are the
     /// engine's alone. Results arrive line by line.
-    func runBenchmark() {
-        guard !benchRunning, host != nil else { return }
-        benchRunning = true
-        benchLines = []
-        benchProgress = "Pausing audio"
+    /// The benchmark configuration of the Benchmark tab's switches.
+    private func benchConfig() -> pm_bench_config {
         var config = pm_bench_config()
         let rate = benchLiveIO ? 44100.0 : 48000.0
         let frames = benchLiveIO ? 512 : 64
@@ -613,10 +635,28 @@ final class AppModel: ObservableObject {
         config.block_frames = Int32(frames)
         config.tier = Int32(tier.rawValue)
         config.hammer_strikes = 200
-        config.flags = benchAllTiers ? Int32(PM_BENCH_ALL_TIERS.rawValue) : 0
+        var flags: UInt32 = 0
+        if benchAllTiers { flags |= PM_BENCH_ALL_TIERS.rawValue }
+        if benchPhases { flags |= PM_BENCH_PHASE_TIMING.rawValue }
+        if benchPaced { flags |= PM_BENCH_PACED.rawValue }
+        if benchEvict { flags |= PM_BENCH_PACED_EVICT.rawValue }
+        config.flags = Int32(flags)
+        return config
+    }
+
+    func runBenchmark() {
+        guard !benchRunning, !sceneRunning, host != nil else { return }
+        benchRunning = true
+        benchLines = []
+        benchProgress = "Pausing audio"
+        let config = benchConfig()
+        let rate = config.sample_rate
+        let frames = Int(config.block_frames)
         benchHeader = "Piano benchmark, \(Date())\n" + environmentText()
         benchHeader += String(format: "fs %.0f Hz, %d-frame buffers (%.0f us), ", rate, frames, Double(frames) / rate * 1e6)
-        benchHeader += "board-on cases at tier \(tier.label), 3 s per case; audio paused during the run\n"
+        benchHeader += "board-on cases at tier \(tier.label), 3 s per case; audio paused during the run; "
+        benchHeader += benchEvict ? "paced to real time with a 32 MiB eviction walk between buffers" : (benchPaced ? "paced to real time" : "buffers back to back")
+        benchHeader += benchPhases ? ", phase timing on\n" : ", phase timing off\n"
         if let ac = audioController {
             ac.suspendOutput { [weak self] in
                 self?.startBenchmark(config)
@@ -647,9 +687,12 @@ final class AppModel: ObservableObject {
                 }
                 var r = pm_bench_result()
                 let ok = pm_bench_run_item(&c, Int32(i), &r) == 1
-                let line = AppModel.benchLine(name: name, result: r, ok: ok)
+                var lines = [AppModel.benchLine(name: name, result: r, ok: ok)]
+                if ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue) { lines += AppModel.benchDetailLines(r) }
+                let conf = ok && r.kind == Int32(PM_BENCH_SCENARIO.rawValue) ? AppModel.benchLastConfig() : nil
                 DispatchQueue.main.async {
-                    self?.benchLines.append(line)
+                    self?.benchLines.append(contentsOf: lines)
+                    if let conf = conf { self?.benchConfigText = conf }
                 }
             }
             DispatchQueue.main.async {
@@ -675,9 +718,148 @@ final class AppModel: ObservableObject {
                      r.mean_load * 100, r.p99_load * 100, r.max_load * 100)
     }
 
+    static func benchLastConfig() -> String {
+        var buf = [CChar](repeating: 0, count: 4096)
+        _ = pm_bench_last_config(&buf, Int32(buf.count))
+        return String(cString: buf)
+    }
+
+    /// Phase split and work counts of a benchmark row (the same lines as an
+    /// audio-thread run's, so the two can be compared line by line).
+    static func benchDetailLines(_ r: pm_bench_result) -> [String] {
+        var out: [String] = []
+        if r.has_phases == 1 {
+            out.append("    phases us (events / hammers / free / forced / board / other): mean " + phaseText(r.mean_phase_us)
+                       + "; top 1 % (\(r.top_count)) " + phaseText(r.top_phase_us) + "; worst " + phaseText(r.worst_phase_us))
+        }
+        out.append(workText(meanAwake: r.mean_awake_modes, free: r.free_group_blocks, forced: r.forced_group_blocks,
+                            members: r.loop_members, listeners: r.loop_listeners, rebuilds: r.kernel_rebuilds,
+                            keyUpdates: r.kernel_key_updates, usPerSample: r.hammer_us_per_sample,
+                            usPerContact: r.hammer_us_per_contact_sample, overruns: r.overruns, worst: r.worst))
+        return out
+    }
+
+    static func workText(meanAwake: Double, free: Double, forced: Double, members: Double, listeners: Double,
+                         rebuilds: Double, keyUpdates: Double, usPerSample: Double, usPerContact: Double,
+                         overruns: Int32, worst w: pm_work_detail) -> String {
+        var out = String(format: "    per buffer: awake modes %.0f, group-blocks free %.0f / forced %.0f, loop members %.1f / listeners %.1f, ",
+                         meanAwake, free, forced, members, listeners)
+        out += String(format: "kernel %.2f rebuilds / %.2f key updates; hammers phase %.3f us per hammer-sample (%.3f per contact sample); %d overruns\n",
+                      rebuilds, keyUpdates, usPerSample, usPerContact, overruns)
+        out += "    worst buffer: " + workDetailText(w)
+        return out
+    }
+
+    static func workDetailText(_ w: pm_work_detail) -> String {
+        var out = "\(w.note_ons) on / \(w.note_offs) off / \(w.pedal_events) pedal, \(w.awake_modes) modes awake; "
+        out += "hammers \(w.hammers_in_contact) touched (\(w.max_hammers_in_contact) at once), \(w.hammer_samples) hammer-samples stepped "
+        out += "(\(w.hammer_damped_samples) damped), \(w.hammer_contact_samples) in contact, \(w.newton_evals) Newton / \(w.fallback_solves) fallbacks; "
+        out += "\(w.damper_updates) damper updates, \(w.response_groups) responses, kernel \(w.kernel_rebuilds) + \(w.kernel_key_updates); "
+        out += "group-blocks free \(w.free_group_blocks) / forced \(w.forced_group_blocks); loop \(w.loop_members) members, "
+        out += "\(w.loop_listeners) listeners, \(w.loop_entries) entries, \(w.out_zones) zones"
+        return out
+    }
+
     func benchmarkExport() -> String {
         var out = benchHeader + AppModel.benchColumns + "\n"
         for line in benchLines { out += line + "\n" }
+        if !benchConfigText.isEmpty {
+            out += "benchmark engine configuration (last scenario run):\n" + benchConfigText
+        }
+        if !sceneConfigText.isEmpty {
+            out += "audio-thread run engine configuration (\(sceneName)):\n" + sceneConfigText
+        }
+        if let host = host {
+            out += "app engine configuration now:\n" + host.describeEngine()
+        }
+        return out
+    }
+
+    // MARK: - Benchmark scene on the audio thread
+
+    /// Plays the selected scenario's events through the real host and audio
+    /// render path in real time (audible), on the app's engine (reset to its
+    /// just-prepared state first) or, with sceneFreshEngine, on a private
+    /// engine prepared as the benchmark's; then appends a row with the same
+    /// statistics, phase split and counts as a benchmark row, and the speed
+    /// probe over the run. Uses the Benchmark tab's seconds, tier and phase
+    /// timing; the frame count and sample rate are the device's.
+    func runOnAudioThread() {
+        guard let host = host, !benchRunning, !sceneRunning else { return }
+        guard sceneItem >= 0 && sceneItem < sceneNames.count else { return }
+        var config = benchConfig()
+        config.flags &= ~Int32(PM_BENCH_ALL_TIERS.rawValue)  // sceneNames are the default item list
+        if sceneFreshEngine { config.flags |= Int32(PM_BENCH_SCENE_FRESH_ENGINE.rawValue) }
+        sceneName = sceneNames[sceneItem]
+        sceneRunning = true
+        benchProgress = "Starting \(sceneName) on the audio thread"
+        if benchHeader.isEmpty { benchHeader = "Piano benchmark, \(Date())\n" + environmentText() }
+        host.startScene(config: config, item: sceneItem) { [weak self] ok in
+            guard let self = self else { return }
+            guard ok else {
+                self.sceneRunning = false
+                self.benchProgress = "Could not start the scene (audio not running or engine not prepared)"
+                return
+            }
+            self.sceneConfigText = host.sceneConfig()
+            self.benchProgress = "Playing \(self.sceneName) on the audio thread (\(self.sceneFreshEngine ? "benchmark-prepared engine" : "app engine")); leave the keyboard alone"
+            let t = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.pollScene() }
+            RunLoop.main.add(t, forMode: .common)
+            self.sceneTimer = t
+        }
+    }
+
+    func cancelScene() {
+        host?.cancelScene()
+    }
+
+    private func pollScene() {
+        guard let host = host else { return }
+        let r = host.sceneResult()
+        if r.state == Int32(PM_SCENE_RUNNING.rawValue) { return }
+        sceneTimer?.invalidate()
+        sceneTimer = nil
+        sceneRunning = false
+        guard r.state == Int32(PM_SCENE_DONE.rawValue) else {
+            benchProgress = "Scene cancelled"
+            return
+        }
+        benchProgress = "Done: \(sceneName) on the audio thread"
+        benchLines.append(contentsOf: AppModel.sceneLines(name: sceneName, result: r, benchProbe: benchProbe))
+        // The engine keeps playing from the scene's end state: silence it.
+        host.allNotesOff()
+        host.pushNow(PM_EVENT_SUSTAIN, value: 0)
+    }
+
+    static func sceneLines(name: String, result r: pm_host_scene_result, benchProbe: pm_speed_probe_stats?) -> [String] {
+        let label = (r.fresh_engine == 1 ? "audio thread, bench engine: " : "audio thread, app engine: ") + name
+        var head = String(label.prefix(38)).padding(toLength: 38, withPad: " ", startingAt: 0)
+        head += String(format: " %8.1f %8.1f %8.1f %8.2f %7.2f %7.2f", r.mean_us, r.p99_us, r.max_us,
+                       r.mean_load * 100, r.p99_load * 100, r.max_load * 100)
+        head += String(format: "   (%d buffers of %d-%d frames at %.0f Hz; p99 to the meter's 1.5 %% bins)",
+                       r.buffers, r.min_frames, r.max_frames, r.sample_rate)
+        var out = [head]
+        if r.has_phases == 1 {
+            out.append("    phases us (events / hammers / free / forced / board / other): mean " + phaseText(r.mean_phase_us)
+                       + "; top 1 % (\(r.top_count)) " + phaseText(r.top_phase_us)
+                       + (r.worst_timed == 1 ? "; worst " + phaseText(r.worst_phase_us) : ""))
+        }
+        out.append(workText(meanAwake: r.mean_awake_modes, free: r.free_group_blocks, forced: r.forced_group_blocks,
+                            members: r.loop_members, listeners: r.loop_listeners, rebuilds: r.kernel_rebuilds,
+                            keyUpdates: r.kernel_key_updates, usPerSample: r.hammer_us_per_sample,
+                            usPerContact: r.hammer_us_per_contact_sample, overruns: r.overruns, worst: r.worst))
+        let p = r.probe
+        if p.runs > 0 {
+            var line = String(format: "    speed probe over the run (%llu runs): min %.1f / median %.1f / mean %.1f / max %.1f us",
+                              p.runs, p.min_us, p.median_us, p.mean_us, p.max_us)
+            if let b = benchProbe, p.mean_us > 0, p.median_us > 0 {
+                line += String(format: "; benchmark thread %.1f us -> %.2fx (mean), %.2fx (median)", b.median_us,
+                               b.median_us / p.mean_us, b.median_us / p.median_us)
+            }
+            out.append(line)
+        } else {
+            out.append("    speed probe: off (switch it on in Diagnostics to compare clocks)")
+        }
         return out
     }
 

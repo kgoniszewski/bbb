@@ -61,16 +61,19 @@ final class PianoCoreTests: XCTestCase {
 
     func testBenchmarkItems() {
         var config = pm_bench_config()
-        // 13 scenarios (the live-playing ones from index 7: four in API 0.8,
-        // hammer burst and pedalled chords in 0.9) + 8 hammer keys.
-        XCTAssertEqual(pm_bench_item_count(&config), 21)
+        // 15 scenarios (the live-playing ones from index 7: four in API 0.8,
+        // hammer burst and pedalled chords in 0.9, fresh- and same-key
+        // bursts in 0.10) + 8 hammer keys.
+        XCTAssertEqual(pm_bench_item_count(&config), 23)
         XCTAssertEqual(String(cString: pm_bench_item_name(&config, 3)), "cluster (12 notes ff every 100 ms)")
         XCTAssertEqual(String(cString: pm_bench_item_name(&config, 10)), "idle (nothing sounding)")
         XCTAssertEqual(String(cString: pm_bench_item_name(&config, 11)), "hammer burst (10 notes at 127, one sample)")
+        XCTAssertEqual(String(cString: pm_bench_item_name(&config, 13)), "fresh-key burst (6 new keys, pedal)")
+        XCTAssertEqual(pm_bench_item_scene(&config, 13), 10)
         XCTAssertFalse(String(cString: pm_build_info()).isEmpty)
         config.hammer_strikes = 2
         var result = pm_bench_result()
-        XCTAssertEqual(pm_bench_run_item(&config, 20, &result), 1)  // hammer, key 88
+        XCTAssertEqual(pm_bench_run_item(&config, 22, &result), 1)  // hammer, key 88
         XCTAssertEqual(result.key, 88)
         XCTAssertGreaterThan(result.contact_us, 0)
     }

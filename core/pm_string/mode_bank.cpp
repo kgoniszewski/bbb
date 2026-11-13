@@ -42,6 +42,7 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
     nSeg_ = ok ? segments : 0;
     sinceCull_ = 0;
     groupBlocks_ = 0;
+    forcedBlocks_ = 0;
     return ok;
 }
 
@@ -495,6 +496,7 @@ void ModeBank::applyCoupledInput(int s, const float* u, int n, Kernel kernel) no
             detail::forcedSimd(view, activeList_.data(), nActive, u, n);
         else
             detail::forcedScalar(view, activeList_.data(), nActive, u, n);
+        forcedBlocks_ += static_cast<std::uint64_t>(nActive);
     }
     if (!cullEnabled_) return;
     float l1 = 0.0f;

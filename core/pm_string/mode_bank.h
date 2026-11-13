@@ -249,6 +249,8 @@ public:
     std::uint64_t groupBlocksProcessed() const noexcept { return groupBlocks_; }
     // Coupled groups whose impulse response coupledResponse() recomputed, so far.
     std::uint64_t responseGroupsComputed() const noexcept { return responseGroups_; }
+    // Group x sub-block invocations of the forced kernel (applyCoupledInput), so far.
+    std::uint64_t forcedGroupBlocks() const noexcept { return forcedBlocks_; }
 
 private:
     int segFirstGroup(int s) const noexcept {
@@ -317,6 +319,7 @@ private:
     int activeCount_ = 0;
     std::uint64_t groupBlocks_ = 0;
     std::uint64_t responseGroups_ = 0;
+    std::uint64_t forcedBlocks_ = 0;
 };
 
 }  // namespace pm

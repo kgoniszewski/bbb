@@ -228,6 +228,10 @@ public:
 
     // Inspection: keys in the loop (awake coupled groups) during the last sub-block.
     int memberCount() const noexcept { return nMembers_; }
+    // Keys taking loop input during the last sub-block, and zone-kernel
+    // entries carried by the members.
+    int listenerCount() const noexcept { return nListen_; }
+    int activeEntryCount() const noexcept { return nAct_; }
     int entryCount() const noexcept { return nEnt_; }
     // Full zone-kernel rebuilds so far (member set or gains changed).
     std::uint64_t kernelRebuilds() const noexcept { return rebuilds_; }

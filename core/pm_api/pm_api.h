@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 9
+#define PM_API_VERSION_MINOR 10
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -360,6 +360,41 @@ typedef struct pm_host_worst_detail {
 void pm_host_get_worst_detail(const pm_host* host, pm_host_worst_detail* detail);
 
 /* ------------------------------------------------------------------------
+ * Work counts of one buffer (API 0.10), the same for the live meter's worst
+ * buffer (pm_host_get_worst_work), a benchmark scenario's most expensive
+ * buffer (pm_bench_result.worst) and an audio-thread scene run
+ * (pm_host_scene_result.worst), so that two instances or two kinds of run
+ * can be compared count by count. */
+typedef struct pm_work_detail {
+    int32_t note_ons, note_offs, pedal_events;
+    int32_t awake_modes;             /* at the end of the buffer, excluding group padding */
+    int32_t hammers_in_contact, max_hammers_in_contact, hammer_contact_samples;
+    int32_t hammer_samples;          /* hammer-samples stepped: every active hammer (in flight, in contact or
+                                        waiting to be released), one pass over its key's modes per sample */
+    int32_t hammer_damped_samples;   /* of those, with the key's damper on (two more passes per sample) */
+    int32_t newton_evals, fallback_solves;
+    int32_t damper_updates, response_groups, kernel_rebuilds, kernel_key_updates;
+    int32_t free_group_blocks;       /* bank group x sub-block invocations of the free pass */
+    int32_t forced_group_blocks;     /* ... of the forced pass (soundboard-loop input) */
+    int32_t loop_members;            /* keys with awake coupled groups (largest over the sub-blocks) */
+    int32_t loop_listeners;          /* keys taking loop input (largest over the sub-blocks) */
+    int32_t loop_entries;            /* zone-kernel entries (largest over the sub-blocks) */
+    int32_t out_zones;               /* board zones read back per sample (largest over the sub-blocks) */
+    int32_t reserved;
+} pm_work_detail;
+
+void pm_host_get_worst_work(const pm_host* host, pm_work_detail* detail);
+
+/* Effective engine configuration as text (sample rate, block limits, tier,
+ * loop band, board, culling, parameters, mode counts, SIMD kernel, array
+ * placement modulo 16 KiB), one "key value" per line, for diffing the app's
+ * engine against the benchmark's (pm_bench_last_config). Writes at most
+ * size bytes including the terminating zero; returns the length. Main
+ * thread; prepare-time values are read without synchronisation (stable
+ * between prepares). */
+int32_t pm_engine_describe(const pm_engine* engine, char* buffer, int32_t size);
+
+/* ------------------------------------------------------------------------
  * Speed probe (API 0.9): how fast the audio thread actually executes. A
  * fixed workload (core/pm_host/speed_probe.h: SIMD one-pole modes and a
  * scalar Newton chain, a few microseconds on a fast core; no allocation,
@@ -400,7 +435,18 @@ const char* pm_build_info(void);
 enum pm_bench_flags {
     PM_BENCH_ALL_TIERS = 1,  /* also worst/cluster/bloom at Balanced and Eco */
     PM_BENCH_NO_HAMMER = 2,
-    PM_BENCH_PHASE_TIMING = 4  /* API 0.9: phase timing on during the scenarios (its cost included) */
+    PM_BENCH_PHASE_TIMING = 4, /* API 0.9: phase timing on during the scenarios (its cost included) */
+    /* API 0.10: sleep to each buffer's real-time deadline between render
+     * calls, as an audio thread does (only the render call is timed); with
+     * EVICT also walk a 32 MiB scratch buffer between buffers (other work on
+     * the core). EVICT implies PACED. */
+    PM_BENCH_PACED = 8,
+    PM_BENCH_PACED_EVICT = 16,
+    /* API 0.10, pm_host_scene_start only: render the scene on the audio
+     * thread with a private engine prepared exactly as the benchmark
+     * prepares the item's (instead of the app's engine instance), to tell
+     * the instance from the thread. */
+    PM_BENCH_SCENE_FRESH_ENGINE = 32
 };
 
 enum pm_bench_kind {
@@ -431,6 +477,20 @@ typedef struct pm_bench_result {
     int32_t key, strings, modes, oversampling;
     double contact_us;       /* first buffer after the launch: in contact */
     double life_us;          /* mean per buffer until the hammer is released */
+    /* API 0.10, PM_BENCH_SCENARIO: */
+    int32_t has_phases;      /* PM_BENCH_PHASE_TIMING: the phase splits below are valid */
+    int32_t top_count;       /* buffers in the top-1 % mean */
+    double worst_phase_us[PM_PHASE_COUNT];  /* the most expensive buffer (by the engine's own total) */
+    double top_phase_us[PM_PHASE_COUNT];
+    double mean_phase_us[PM_PHASE_COUNT];
+    double hammer_us_per_sample;          /* hammers phase per hammer-sample stepped (0: no hammer work) */
+    double hammer_us_per_contact_sample;  /* ... per hammer-sample in contact */
+    double free_group_blocks, forced_group_blocks;  /* means per buffer */
+    double loop_members, loop_listeners;            /* means per buffer */
+    double kernel_rebuilds, kernel_key_updates;     /* means per buffer */
+    int32_t overruns;        /* buffers whose render took longer than the period */
+    int32_t paced;           /* 1: paced to real time (2: with the eviction walk) */
+    pm_work_detail worst;    /* the most expensive buffer by wall time */
 } pm_bench_result;
 
 int32_t pm_bench_item_count(const pm_bench_config* config);
@@ -438,6 +498,81 @@ int32_t pm_bench_item_count(const pm_bench_config* config);
 const char* pm_bench_item_name(const pm_bench_config* config, int32_t index);
 /* Returns 1 and fills result on success. */
 int pm_bench_run_item(const pm_bench_config* config, int32_t index, pm_bench_result* result);
+/* API 0.10: the effective configuration (pm_engine_describe format) of the
+ * engine of the last scenario run on the calling thread; "" before any. */
+int32_t pm_bench_last_config(char* buffer, int32_t size);
+/* API 0.10: the scene (pm_bench_scene) of scenario item 'index', or -1. */
+int32_t pm_bench_item_scene(const pm_bench_config* config, int32_t index);
+
+/* ------------------------------------------------------------------------
+ * Scene on the audio thread (API 0.10): the events of a benchmark scenario
+ * (the same sceneEvents, at the host's sample rate) played through the real
+ * host and audio render path, in real time and audible, so that identical
+ * material can be measured three ways: back to back on the benchmark
+ * thread, paced on the benchmark thread (PM_BENCH_PACED) and on the real
+ * audio thread with the app's engine instance.
+ *
+ * pm_host_scene_start (non-real-time; briefly closes the prepare gate, so
+ * the audio thread outputs one buffer or so of silence): builds the event
+ * list, resets the engine to its just-prepared state (silence, pedals up,
+ * sample time 0; the app's parameters and tables are kept) and arms the
+ * player; with PM_BENCH_PHASE_TIMING in config->flags phase timing is on for
+ * the run. The audio thread then pushes each buffer's events into the
+ * engine before rendering it (no allocation, no lock), resets the load
+ * meter when the warm-up is over (0.5 s, none for the worst scene, as the
+ * benchmark), measures config->seconds and publishes the result: the load
+ * meter's statistics over exactly the measured buffers (mean exact; p99 as
+ * the meter's histogram, about 1.5 %), the phase splits, the work counts of
+ * the worst buffer and means per buffer, and the speed probe over the run
+ * (if the probe is on). MIDI and UI events keep arriving and are rendered
+ * too; leave the keyboard alone. The engine keeps playing from the scene's
+ * end state afterwards (send a panic or all-notes-off). Returns 0 if the
+ * host is not prepared or the item is not a scenario. */
+enum pm_scene_state {
+    PM_SCENE_IDLE = 0,
+    PM_SCENE_RUNNING = 1,
+    PM_SCENE_DONE = 2
+};
+
+typedef struct pm_host_scene_result {
+    int32_t state;           /* pm_scene_state */
+    int32_t buffers;         /* measured */
+    double sample_rate;
+    int32_t min_frames, max_frames;
+    double period_us;        /* of the last buffer */
+    double mean_us, p99_us, max_us;
+    double mean_load, p99_load, max_load;
+    double mean_awake_modes;
+    double free_group_blocks, forced_group_blocks, loop_members, loop_listeners;  /* means per buffer */
+    double kernel_rebuilds, kernel_key_updates;  /* means per buffer */
+    double hammer_us_per_sample, hammer_us_per_contact_sample;
+    int32_t overruns;        /* buffers whose render took longer than their period */
+    int32_t has_phases;
+    int32_t top_count;
+    int32_t worst_timed;
+    double worst_phase_us[PM_PHASE_COUNT];
+    double top_phase_us[PM_PHASE_COUNT];
+    double mean_phase_us[PM_PHASE_COUNT];
+    pm_work_detail worst;
+    double worst_us;
+    pm_speed_probe_stats probe;  /* audio-thread probe over the measured buffers (runs = 0: off) */
+    int32_t fresh_engine;    /* 1: rendered with a private, benchmark-prepared engine */
+    int32_t reserved;
+} pm_host_scene_result;
+
+int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t item_index);
+/* Any thread: stops a running scene (no result). */
+void pm_host_scene_cancel(pm_host* host);
+/* Main thread: the state, and once PM_SCENE_DONE the result. */
+void pm_host_scene_get_result(const pm_host* host, pm_host_scene_result* result);
+/* With PM_BENCH_SCENE_FRESH_ENGINE: a private engine is prepared first (on
+ * the calling thread, about a second) for the item's case at the host's
+ * sample rate and maximum frame count, and the audio thread renders it, and
+ * feeds it the MIDI and UI events, until the scene is done or cancelled;
+ * then it returns to the app's engine, which kept its state. The private
+ * engine is freed at the next pm_host_scene_start or pm_host_destroy. */
+/* The engine configuration captured when the scene started (pm_engine_describe). */
+int32_t pm_host_scene_config(const pm_host* host, char* buffer, int32_t size);
 
 #ifdef __cplusplus
 }

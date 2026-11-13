@@ -7,6 +7,7 @@
 #include "pm_api/pm_api.h"
 #include "pm_base/simd.h"
 #include "pm_bench/bench.h"
+#include "pm_api/work_detail.h"
 
 namespace {
 
@@ -20,8 +21,14 @@ pm::bench::Config toConfig(const pm_bench_config* c) {
     if (c->hammer_strikes > 0) k.hammerStrikes = c->hammer_strikes;
     k.allTiers = (c->flags & PM_BENCH_ALL_TIERS) != 0;
     k.phaseTiming = (c->flags & PM_BENCH_PHASE_TIMING) != 0;
+    k.paced = (c->flags & (PM_BENCH_PACED | PM_BENCH_PACED_EVICT)) != 0;
+    k.evictBytes = (c->flags & PM_BENCH_PACED_EVICT) != 0 ? pm::bench::kDefaultEvictBytes : 0;
     return k;
 }
+
+// The last scenario's engine configuration, per thread (the app runs the
+// benchmark on one background thread).
+thread_local char tLastConfig[4096] = {};
 
 bool withHammer(const pm_bench_config* c) { return !c || (c->flags & PM_BENCH_NO_HAMMER) == 0; }
 
@@ -64,6 +71,25 @@ int pm_bench_run_item(const pm_bench_config* config, int32_t index, pm_bench_res
         result->first_100ms_load = r.first100msPercent / 100.0;
         result->mean_awake_modes = r.meanAwakeModes;
         result->awake_modes_end = r.awakeModesEnd;
+        result->has_phases = r.hasPhases ? 1 : 0;
+        result->top_count = r.topCount;
+        for (int p = 0; p < PM_PHASE_COUNT && p < pm::bench::kPhaseCount; ++p) {
+            result->worst_phase_us[p] = r.maxBuf.us[p];
+            result->top_phase_us[p] = r.top1.us[p];
+            result->mean_phase_us[p] = r.all.us[p];
+        }
+        result->hammer_us_per_sample = r.hammerUsPerSample;
+        result->hammer_us_per_contact_sample = r.hammerUsPerContactSample;
+        result->free_group_blocks = r.freeGroupBlocksPerBuffer;
+        result->forced_group_blocks = r.forcedGroupBlocksPerBuffer;
+        result->loop_members = r.loopMembersMean;
+        result->loop_listeners = r.loopListenersMean;
+        result->kernel_rebuilds = r.kernelRebuildsPerBuffer;
+        result->kernel_key_updates = r.kernelKeyUpdatesPerBuffer;
+        result->overruns = r.overruns;
+        result->paced = r.paced ? (r.evictBytes > 0 ? 2 : 1) : 0;
+        pm::bench::toWorkDetail(r.maxDetail, result->worst);
+        eng->describe(tLastConfig, static_cast<int>(sizeof tLastConfig));
         result->ok = 1;
         return 1;
     }
@@ -81,6 +107,23 @@ int pm_bench_run_item(const pm_bench_config* config, int32_t index, pm_bench_res
         return 1;
     }
     return 0;
+}
+
+int32_t pm_bench_last_config(char* buffer, int32_t size) {
+    if (!buffer || size <= 0) return 0;
+    int32_t n = 0;
+    while (n < size - 1 && tLastConfig[n]) {
+        buffer[n] = tLastConfig[n];
+        ++n;
+    }
+    buffer[n] = 0;
+    return n;
+}
+
+int32_t pm_bench_item_scene(const pm_bench_config* config, int32_t index) {
+    const pm::bench::Config k = toConfig(config);
+    if (index < 0 || index >= pm::bench::caseCount(k)) return -1;
+    return static_cast<int32_t>(pm::bench::caseAt(k, index).scene);
 }
 
 const char* pm_build_info(void) {

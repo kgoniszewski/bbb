@@ -155,6 +155,18 @@ struct RenderInfo {
     int responseGroups = 0;    // coupled groups whose impulse response was recomputed
     int kernelRebuilds = 0;    // full zone-kernel rebuilds of the soundboard loop (member set changed)
     int kernelKeyUpdates = 0;  // keys whose zone-kernel columns were updated in place (response changed)
+    // Work counts, to compare buffers of different engine instances or
+    // material: hammer-samples stepped by the contact solver (every active
+    // hammer, in flight, in contact or waiting for its release; each is one
+    // pass over its key's modes per sample, board on) and those whose key's
+    // damper was on (two more passes per sample); bank group x sub-block
+    // invocations of the free pass and of the forced pass (loop input);
+    // the soundboard loop's members (keys with awake coupled groups),
+    // listeners (keys taking loop input), zone-kernel entries and zones
+    // read back, each the largest over the buffer's sub-blocks.
+    int hammerSamples = 0, hammerDampedSamples = 0;
+    int freeGroupBlocks = 0, forcedGroupBlocks = 0;
+    int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
 };
 
 // Per-phase wall time of the last render() call, in microseconds, while
@@ -352,8 +364,27 @@ public:
     void setPhaseTiming(bool on) noexcept { phaseTiming_.store(on, std::memory_order_relaxed); }
     bool phaseTiming() const noexcept { return phaseTiming_.load(std::memory_order_relaxed); }
 
+    // Back to the state right after prepare() (silence, dampers seated,
+    // pedals up, sample time 0), keeping the prepared tables, parameters and
+    // caches: what a freshly prepared engine renders from here on, this one
+    // renders too. Not concurrently with render() (an app calls it inside
+    // the host's prepare gate).
+    void reset() noexcept {
+        Event drop;
+        while (queue_.pop(drop)) {}
+        if (prepared_) resetState();
+    }
+    // The effective configuration (sample rate, block limits, tier, loop
+    // band, board, culling, parameters, mode counts, kernel, and where the
+    // main arrays fall modulo 16 KiB) as text, one "key value" per line;
+    // returns the length written (truncated to size - 1). For diffing two
+    // instances (bench vs app). Reads prepare-time state: not concurrently
+    // with prepare().
+    int describe(char* buf, int size) const noexcept;
+
     // Inspection, for tools and tests (not thread-safe against render()).
     double sampleRate() const noexcept { return fs_; }
+    int maxFrames() const noexcept { return maxFrames_; }
     std::uint64_t sampleTime() const noexcept { return sampleTime_; }
     const PianoTable& table() const noexcept { return table_; }
     const ModeBank& bank() const noexcept { return bank_; }

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdint>
+#include <cstdio>
 #include <numbers>
 #include <vector>
 
@@ -796,13 +798,19 @@ void Engine::processBoard(int n) noexcept {
     for (int a = 0; a < activeCount_; ++a) {
         const int k = hammers_[active_[a]].key;
         uPrev_[k] = bank_.coupledInputHistory(k);
+        info_.hammerSamples += n;
+        if (hView_[a].damped) info_.hammerDampedSamples += n;
     }
+    info_.loopMembers = std::max(info_.loopMembers, loop_.memberCount());
+    info_.loopListeners = std::max(info_.loopListeners, loop_.listenerCount());
+    info_.loopEntries = std::max(info_.loopEntries, loop_.activeEntryCount());
     PM_PROF_LAP(Events);  // since the last lap: events, control tick, loop begin
     bank_.processSegmentsFree(io_.data(), n);
     PM_PROF_LAP(FreePass);
     loop_.collect(bank_, io_.data(), n);
     const int* outZones = nullptr;
     const int nOut = loop_.outZones(outZones);
+    info_.outZones = std::max(info_.outZones, nOut);
 
     const int zones = board_.zoneCount();
     const float pi2 = 2.0f * static_cast<float>(kPi);
@@ -930,6 +938,8 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
         for (int a = 0; a < activeCount_; ++a) {
             Hammer& h = hammers_[active_[a]];
             const HammerKeyModes m = contact_.view(bank_, h.key);
+            info_.hammerSamples += n;
+            if (m.damped) info_.hammerDampedSamples += n;
             const std::int64_t c0 = h.state.contactSubsteps;
             runHammer(h.state, h.params, m, io_[h.key].out, n);
             io_[h.key].skip = true;
@@ -1012,6 +1022,8 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     info_.events = info_.noteOns = info_.noteOffs = info_.pedalEvents = 0;
     info_.hammersInContact = info_.maxHammersInContact = info_.hammerContactSamples = 0;
     info_.newtonEvals = info_.fallbackSolves = 0;
+    info_.hammerSamples = info_.hammerDampedSamples = 0;
+    info_.loopMembers = info_.loopListeners = info_.loopEntries = info_.outZones = 0;
     contactSamples_ = 0.0;
     profiling_ = phaseTiming_.load(std::memory_order_relaxed);
     ProfClock::time_point tRender{};
@@ -1021,7 +1033,8 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     }
     const std::uint64_t damperUpdates0 = damperUpdates_;
     const std::uint64_t responses0 = bank_.responseGroupsComputed(), rebuilds0 = loop_.kernelRebuilds(),
-                        keyUpdates0 = loop_.kernelKeyUpdates();
+                        keyUpdates0 = loop_.kernelKeyUpdates(), free0 = bank_.groupBlocksProcessed(),
+                        forced0 = bank_.forcedGroupBlocks();
     readParams();
     drainQueue(clock);
 
@@ -1069,11 +1082,68 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     info_.responseGroups = static_cast<int>(bank_.responseGroupsComputed() - responses0);
     info_.kernelRebuilds = static_cast<int>(loop_.kernelRebuilds() - rebuilds0);
     info_.kernelKeyUpdates = static_cast<int>(loop_.kernelKeyUpdates() - keyUpdates0);
+    info_.freeGroupBlocks = static_cast<int>(bank_.groupBlocksProcessed() - free0);
+    info_.forcedGroupBlocks = static_cast<int>(bank_.forcedGroupBlocks() - forced0);
     if (profiling_) {
         // Time before the first sub-block (parameters, queue) and between
         // sub-blocks without a lap is "other" (totalUs minus the phases).
         prof_.totalUs = std::chrono::duration<double, std::micro>(ProfClock::now() - tRender).count();
     }
+}
+
+int Engine::describe(char* buf, int size) const noexcept {
+    if (!buf || size <= 0) return 0;
+    int len = 0;
+    auto put = [&](const char* fmt, auto... args) {
+        if (len >= size - 1) return;
+        const int w = std::snprintf(buf + len, static_cast<std::size_t>(size - len), fmt, args...);
+        if (w > 0) len = std::min(size - 1, len + w);
+    };
+    // Where an array starts modulo 16 KiB (Apple silicon's L1 way size): two
+    // instances whose hot arrays fall differently can differ in L1 conflicts.
+    auto mod16k = [](const void* p) { return static_cast<int>(reinterpret_cast<std::uintptr_t>(p) % 16384u); };
+    static const char* const kTier[3] = {"full", "balanced", "eco"};
+    const int tier = static_cast<int>(boardCfg_.tier);
+    put("prepared %d\n", prepared_ ? 1 : 0);
+    put("sample_rate %.1f\n", fs_);
+    put("max_frames %d\n", maxFrames_);
+    put("sub_block %d\n", kSubBlock);
+    put("simd %s\n", simdKernelName());
+    put("board %d\n", boardOn_ ? 1 : 0);
+    put("tier %s\n", tier >= 0 && tier < 3 ? kTier[tier] : "?");
+    put("loop_cutoff_hz %.1f\n", boardOn_ ? loopCutoffForTier(boardCfg_.tier, boardCfg_.plate) : 0.0);
+    put("loop_cutoff_override_hz %.1f\n", boardCfg_.loopCutoffHz);
+    put("sympathetic_gain %.4f\n", static_cast<double>(symGain_));
+    put("board_modes %d\n", board_.modeCount());
+    put("board_zones %d\n", board_.zoneCount());
+    put("total_modes %d\n", totalModes_);
+    put("bank_groups %d\n", bank_.groupCount());
+    int coupled = 0;
+    for (int k = 0; k < kNumKeys; ++k) coupled += keyCoupled_[k];
+    put("coupled_modes %d\n", coupled);
+    put("culling %d\n", cullOn_.load(std::memory_order_relaxed) ? 1 : 0);
+    put("cull_threshold_db %.2f\n", static_cast<double>(cullDb_.load(std::memory_order_relaxed)));
+    put("cull_offset_db %.2f\n", static_cast<double>(cullOffsetDb_));
+    put("damped_cull_offset_db %.2f\n", static_cast<double>(dampedCullDb_.load(std::memory_order_relaxed)));
+    put("idle_sleep %d\n", idleOn_.load(std::memory_order_relaxed) ? 1 : 0);
+    put("knock_level %.4f\n", static_cast<double>(knockLevel_.load(std::memory_order_relaxed)));
+    put("damper_noise_level %.4f\n", static_cast<double>(liftNoiseLevel_.load(std::memory_order_relaxed)));
+    put("half_pedal %.3f %.3f %.3f\n", static_cast<double>(hpP0T_.load(std::memory_order_relaxed)),
+        static_cast<double>(hpP0B_.load(std::memory_order_relaxed)), static_cast<double>(hpW_.load(std::memory_order_relaxed)));
+    put("stereo_width %.3f\n", static_cast<double>(width_.load(std::memory_order_relaxed)));
+    put("master_gain_db %.2f\n", static_cast<double>(masterGainDb_.load(std::memory_order_relaxed)));
+    put("scheduling %d latency %d\n", schedMode_.load(std::memory_order_relaxed), latency_.load(std::memory_order_relaxed));
+    put("phase_timing %d\n", phaseTiming() ? 1 : 0);
+    put("velocity_m_per_s at 0.25/0.5/1.0: %.3f %.3f %.3f\n", hammerVelocityFor(0.25), hammerVelocityFor(0.5),
+        hammerVelocityFor(1.0));
+    put("key 40 modes %d coupled %d strings %d R %d\n", keyModes_[39], keyCoupled_[39], table_.keys[39].strings,
+        table_.keys[39].contactOversampling);
+    put("key49_f0_hz %.3f\n", table_.keys[48].f0);
+    put("layout mod 16 KiB: zr %d zi %d wOut %d wIn %d dampAm1 %d keyBuf %d\n", mod16k(bank_.stateReData()),
+        mod16k(bank_.stateImData()), mod16k(bank_.weightOutData()), mod16k(bank_.weightInReData()),
+        mod16k(bank_.damperFactorMinusOneData()), mod16k(keyBuf_.data()));
+    put("engine object %p (mod 16 KiB %d)\n", static_cast<const void*>(this), mod16k(this));
+    return len;
 }
 
 void Engine::profLap(int phase) noexcept {

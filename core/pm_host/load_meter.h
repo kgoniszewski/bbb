@@ -59,6 +59,11 @@ struct BufferRecord {
     int damperUpdates = 0, responseGroups = 0, kernelRebuilds = 0;
     int kernelKeyUpdates = 0;
     int maxHammersInContact = 0, hammerContactSamples = 0, newtonEvals = 0, fallbackSolves = 0;
+    // Work counts (engine RenderInfo): hammer-samples stepped / with the
+    // damper on, bank group-blocks of the free / forced pass, soundboard-loop
+    // members, listeners, zone-kernel entries, zones read.
+    int hammerSamples = 0, hammerDampedSamples = 0, freeGroupBlocks = 0, forcedGroupBlocks = 0;
+    int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
     bool timed = false;                // phaseUs valid
     double phaseUs[kLoadPhases] = {};
 };
@@ -80,6 +85,11 @@ struct WorstBuffer {
     int damperUpdates = 0, responseGroups = 0, kernelRebuilds = 0;
     int kernelKeyUpdates = 0;
     int maxHammersInContact = 0, hammerContactSamples = 0, newtonEvals = 0, fallbackSolves = 0;
+    // Work counts (engine RenderInfo): hammer-samples stepped / with the
+    // damper on, bank group-blocks of the free / forced pass, soundboard-loop
+    // members, listeners, zone-kernel entries, zones read.
+    int hammerSamples = 0, hammerDampedSamples = 0, freeGroupBlocks = 0, forcedGroupBlocks = 0;
+    int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
     bool timed = false;
     double phaseUs[kLoadPhases] = {};
 };
@@ -198,6 +208,14 @@ public:
             wContactSamples_.store(b.hammerContactSamples, std::memory_order_relaxed);
             wNewton_.store(b.newtonEvals, std::memory_order_relaxed);
             wFallback_.store(b.fallbackSolves, std::memory_order_relaxed);
+            wHamSamples_.store(b.hammerSamples, std::memory_order_relaxed);
+            wHamDamped_.store(b.hammerDampedSamples, std::memory_order_relaxed);
+            wFree_.store(b.freeGroupBlocks, std::memory_order_relaxed);
+            wForced_.store(b.forcedGroupBlocks, std::memory_order_relaxed);
+            wMembers_.store(b.loopMembers, std::memory_order_relaxed);
+            wListeners_.store(b.loopListeners, std::memory_order_relaxed);
+            wEntries_.store(b.loopEntries, std::memory_order_relaxed);
+            wZones_.store(b.outZones, std::memory_order_relaxed);
             wTimed_.store(b.timed, std::memory_order_relaxed);
             for (int p = 0; p < kLoadPhases; ++p) wPhase_[p].store(b.timed ? b.phaseUs[p] : 0.0, std::memory_order_relaxed);
             worstSeq_.store(seq + 2, std::memory_order_release);
@@ -280,6 +298,14 @@ public:
             w.hammerContactSamples = wContactSamples_.load(std::memory_order_relaxed);
             w.newtonEvals = wNewton_.load(std::memory_order_relaxed);
             w.fallbackSolves = wFallback_.load(std::memory_order_relaxed);
+            w.hammerSamples = wHamSamples_.load(std::memory_order_relaxed);
+            w.hammerDampedSamples = wHamDamped_.load(std::memory_order_relaxed);
+            w.freeGroupBlocks = wFree_.load(std::memory_order_relaxed);
+            w.forcedGroupBlocks = wForced_.load(std::memory_order_relaxed);
+            w.loopMembers = wMembers_.load(std::memory_order_relaxed);
+            w.loopListeners = wListeners_.load(std::memory_order_relaxed);
+            w.loopEntries = wEntries_.load(std::memory_order_relaxed);
+            w.outZones = wZones_.load(std::memory_order_relaxed);
             w.timed = wTimed_.load(std::memory_order_relaxed);
             for (int p = 0; p < kLoadPhases; ++p) w.phaseUs[p] = wPhase_[p].load(std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_acquire);
@@ -427,6 +453,8 @@ private:
     std::atomic<int> wFrames_{0}, wContact_{0}, wActive_{0}, wModes_{0}, wEvents_{0}, wSub_{0};
     std::atomic<int> wIdle_{0}, wOn_{0}, wOff_{0}, wPedal_{0}, wDamper_{0}, wResp_{0}, wKernel_{0};
     std::atomic<int> wKeyUpd_{0}, wMaxContact_{0}, wContactSamples_{0}, wNewton_{0}, wFallback_{0};
+    std::atomic<int> wHamSamples_{0}, wHamDamped_{0}, wFree_{0}, wForced_{0};
+    std::atomic<int> wMembers_{0}, wListeners_{0}, wEntries_{0}, wZones_{0};
     // Speed probe: audio-thread totals and the published values.
     std::uint64_t probeN_ = 0;
     double probeSum_ = 0.0, probeMin_ = 0.0, probeMax_ = 0.0;

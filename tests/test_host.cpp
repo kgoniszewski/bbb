@@ -12,7 +12,10 @@
 #include <thread>
 #include <vector>
 
+#include <chrono>
+
 #include "pm_api/pm_api.h"
+#include "pm_bench/bench.h"
 #include "pm_engine/events.h"
 #include "test_harness.h"
 
@@ -469,6 +472,193 @@ TEST(worst_buffer_hammer_detail) {
     pm_host_destroy(h);
 }
 
+// Scene on the audio path (0.10): a benchmark scene's events played through
+// pm_host_render. The host's engine is reset to its just-prepared state, so
+// the output is bit-identical to a freshly prepared engine fed the same
+// events; the measurement covers exactly the benchmark's buffers, the
+// audio path does not allocate, and phase timing is restored afterwards.
+TEST(scene_on_audio_path) {
+    pm_host* h = makeHost(true);
+    CHECK(h != nullptr);
+    if (!h) return;
+    std::vector<float> l(kFrames), r(kFrames);
+    // Something sounding and the pedal down before the scene: the reset
+    // must clear it.
+    pm_event on = sampleEvent(PM_EVENT_NOTE_ON, 0, 40, 60000), ped = sampleEvent(PM_EVENT_SUSTAIN, 0, 0, 65535);
+    pm_host_push_event(h, &on);
+    pm_host_push_event(h, &ped);
+    for (int buf = 0; buf < 10; ++buf) pm_host_render(h, l.data(), r.data(), kFrames, 0);
+    pm_host_set_speed_probe(h, 4);
+    pm_bench_config cfg;
+    std::memset(&cfg, 0, sizeof cfg);
+    cfg.sample_rate = kFs;
+    cfg.seconds = 0.4;
+    cfg.block_frames = kFrames;
+    cfg.flags = PM_BENCH_PHASE_TIMING | PM_BENCH_NO_HAMMER;
+    int typical = -1;
+    for (int i = 0; i < pm_bench_item_count(&cfg); ++i)
+        if (pm_bench_item_scene(&cfg, i) == static_cast<int>(pm::bench::Scene::Typical)) typical = i;
+    CHECK(typical >= 0);
+    pm_host_scene_result res;
+    pm_host_scene_get_result(h, &res);
+    CHECK(res.state == PM_SCENE_IDLE);
+    CHECK(pm_host_scene_start(h, &cfg, -1) == 0);
+    CHECK(pm_host_scene_start(h, &cfg, typical) == 1);
+    char conf[4096];
+    CHECK(pm_host_scene_config(h, conf, sizeof conf) > 100);
+    CHECK(std::strstr(conf, "board 0") != nullptr);
+
+    // Reference: a fresh engine, prepared the same way, fed the same events.
+    pm_engine* ref = pm_engine_create();
+    pm_engine_set_param(ref, PM_PARAM_SOUNDBOARD_ENABLED, 0.0);
+    CHECK(pm_engine_prepare(ref, kFs, kFrames) == 1);
+    std::vector<pm::Event> events;
+    pm::bench::sceneEvents(pm::bench::Scene::Typical, kFs, static_cast<std::uint64_t>(2.0 * kFs), events);
+    std::vector<float> rl(kFrames), rr(kFrames);
+    std::size_t next = 0;
+    std::uint64_t t = 0;
+    bool same = true;
+    int buffers = 0;
+    gAllocs.store(0);
+    gArmed.store(true);
+    while (buffers < 400) {
+        pm_host_render(h, l.data(), r.data(), kFrames, 0);
+        ++buffers;
+        gArmed.store(false);
+        for (; next < events.size() && events[next].time < t + kFrames; ++next) {
+            pm_event c = sampleEvent(static_cast<std::uint8_t>(events[next].type), events[next].time, events[next].note,
+                                     events[next].value);
+            pm_engine_push_event(ref, &c);
+        }
+        pm_engine_render(ref, rl.data(), rr.data(), kFrames, nullptr);
+        t += kFrames;
+        same = same && std::memcmp(l.data(), rl.data(), sizeof(float) * kFrames) == 0 &&
+               std::memcmp(r.data(), rr.data(), sizeof(float) * kFrames) == 0;
+        pm_host_scene_get_result(h, &res);
+        gArmed.store(true);
+        if (res.state == PM_SCENE_DONE) break;
+    }
+    gArmed.store(false);
+    const int warm = static_cast<int>(0.5 * kFs / kFrames), measured = static_cast<int>(0.4 * kFs / kFrames);
+    std::printf("  scene: %d buffers rendered (%d warm-up + %d measured: %d), mean %.1f / p99 %.1f / max %.1f us, "
+                "awake %.0f, phases %d (top %d), probe runs %llu; bit-identical to a fresh engine: %s; "
+                "allocations %ld\n",
+                buffers, warm, measured, res.buffers, res.mean_us, res.p99_us, res.max_us, res.mean_awake_modes,
+                res.has_phases, res.top_count, static_cast<unsigned long long>(res.probe.runs), same ? "yes" : "NO",
+                gAllocs.load());
+    CHECK(res.state == PM_SCENE_DONE);
+    CHECK(buffers == warm + measured && res.buffers == measured);
+    CHECK(same);
+    CHECK(gAllocs.load() == 0);
+    CHECK(res.has_phases == 1 && res.mean_us > 0.0 && res.p99_us <= res.max_us && res.mean_awake_modes > 100.0);
+    CHECK(res.free_group_blocks > 0.0 && res.min_frames == kFrames && res.max_frames == kFrames);
+    CHECK(res.probe.runs == static_cast<std::uint64_t>(measured / 4) || res.probe.runs == static_cast<std::uint64_t>(measured / 4 + 1));
+    double sum = 0.0;
+    for (int p = 0; p < PM_PHASE_COUNT; ++p) sum += res.mean_phase_us[p];
+    CHECK(sum > 0.0 && sum <= res.mean_us * 1.001);
+    pm_host_phase_diagnostics pd;
+    pm_host_get_phase_diagnostics(h, &pd);
+    CHECK(pd.phase_timing == 0);  // restored
+    // A private, benchmark-prepared engine on the audio path: its result
+    // has the same shape, and afterwards the host's engine (which kept its
+    // state) renders again.
+    {
+        pm_bench_config fc = cfg;
+        fc.flags |= PM_BENCH_SCENE_FRESH_ENGINE;
+        fc.seconds = 0.1;
+        int idle = -1;
+        for (int i = 0; i < pm_bench_item_count(&fc); ++i)
+            if (pm_bench_item_scene(&fc, i) == static_cast<int>(pm::bench::Scene::Idle)) idle = i;
+        CHECK(pm_host_scene_start(h, &fc, idle) == 1);
+        CHECK(pm_host_scene_config(h, conf, sizeof conf) > 100 && std::strstr(conf, "board 1") != nullptr);
+        int n = 0;
+        do {
+            pm_host_render(h, l.data(), r.data(), kFrames, 0);
+            pm_host_scene_get_result(h, &res);
+        } while (res.state == PM_SCENE_RUNNING && ++n < 400);
+        std::printf("  fresh-engine idle scene: %d buffers measured, mean %.1f us, fresh %d\n", res.buffers, res.mean_us,
+                    res.fresh_engine);
+        CHECK(res.state == PM_SCENE_DONE && res.fresh_engine == 1 && res.buffers == static_cast<int>(0.1 * kFs / kFrames));
+        pm_host_render(h, l.data(), r.data(), kFrames, 0);
+        pm_host_diagnostics d;
+        pm_host_get_diagnostics(h, &d);
+        CHECK(d.buffers >= 1);
+    }
+    // Cancel: back to idle without a result.
+    CHECK(pm_host_scene_start(h, &cfg, typical) == 1);
+    for (int buf = 0; buf < 3; ++buf) pm_host_render(h, l.data(), r.data(), kFrames, 0);
+    pm_host_scene_cancel(h);
+    pm_host_render(h, l.data(), r.data(), kFrames, 0);
+    pm_host_scene_get_result(h, &res);
+    CHECK(res.state == PM_SCENE_IDLE);
+    pm_engine_destroy(ref);
+    pm_host_destroy(h);
+}
+
+// The burst scenes of the benchmark (0.10): fresh keys are never struck
+// twice within 6 s, the same-key scene repeats the first burst's keys, and
+// both have identical timing.
+TEST(burst_scenes) {
+    std::vector<pm::Event> fresh, same;
+    const double fs = 44100.0;
+    const auto end = static_cast<std::uint64_t>(20.0 * fs);
+    pm::bench::sceneEvents(pm::bench::Scene::FreshBurst, fs, end, fresh);
+    pm::bench::sceneEvents(pm::bench::Scene::SameBurst, fs, end, same);
+    CHECK(fresh.size() == same.size());
+    double last[128];
+    for (double& x : last) x = -1e9;
+    int strikes = 0, repeats = 0, sameKeys = 0, timing = 0;
+    for (std::size_t i = 0; i < fresh.size() && i < same.size(); ++i) {
+        timing += fresh[i].time != same[i].time || fresh[i].type != same[i].type;
+        if (fresh[i].type != pm::EventType::NoteOn || fresh[i].time == 0) continue;
+        const double t = fresh[i].time / fs;
+        ++strikes;
+        repeats += t - last[fresh[i].note] < 6.0;
+        last[fresh[i].note] = t;
+    }
+    bool firstKeys[128] = {}, sameSeen[128] = {};
+    int firstCount = 0;
+    for (const pm::Event& e : fresh)
+        if (e.type == pm::EventType::NoteOn && e.time != 0 && firstCount < 6 && !firstKeys[e.note]) {
+            firstKeys[e.note] = true;
+            ++firstCount;
+        }
+    int outside = 0;
+    for (const pm::Event& e : same)
+        if (e.type == pm::EventType::NoteOn && e.time != 0) {
+            outside += !firstKeys[e.note];
+            if (!sameSeen[e.note]) ++sameKeys;
+            sameSeen[e.note] = true;
+        }
+    std::printf("  %d burst strikes in 20 s, %d repeated within 6 s; timing differences %d\n", strikes, repeats, timing);
+    CHECK(strikes == 6 * 33 && repeats == 0 && timing == 0 && sameKeys == 6 && outside == 0);
+}
+
+// Paced benchmark (0.10): the render calls are spread over real time.
+TEST(paced_benchmark) {
+    pm_bench_config cfg;
+    std::memset(&cfg, 0, sizeof cfg);
+    cfg.sample_rate = 48000.0;
+    cfg.seconds = 0.3;
+    cfg.block_frames = 256;
+    cfg.flags = PM_BENCH_NO_HAMMER | PM_BENCH_PACED;
+    int idle = -1;
+    for (int i = 0; i < pm_bench_item_count(&cfg); ++i)
+        if (pm_bench_item_scene(&cfg, i) == static_cast<int>(pm::bench::Scene::Idle)) idle = i;
+    CHECK(idle >= 0);
+    pm_bench_result res;
+    const auto a = std::chrono::steady_clock::now();
+    CHECK(pm_bench_run_item(&cfg, idle, &res) == 1);
+    const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+    char conf[4096];
+    const int n = pm_bench_last_config(conf, sizeof conf);
+    std::printf("  paced idle scene: %.2f s wall for 0.8 s of audio, mean %.1f us, %d overruns; config %d bytes\n", wall,
+                res.mean_us, res.overruns, n);
+    CHECK(res.ok == 1 && res.paced == 1);
+    CHECK(wall >= 0.79);  // 0.5 s warm-up + 0.3 s measured, slept to real time
+    CHECK(n > 100 && std::strstr(conf, "sample_rate 48000.0") != nullptr);
+}
+
 TEST(null_tolerance) {
     pm_event e = sampleEvent(PM_EVENT_NOTE_ON, 0, 60, 1);
     pm_midi_monitor_entry m;
@@ -493,6 +683,16 @@ TEST(null_tolerance) {
     pm_host_reset_load(nullptr);
     pm_host_set_load_budget(nullptr, 0.5);
     pm_host_get_counters(nullptr, &c);
+    pm_work_detail w;
+    pm_host_get_worst_work(nullptr, &w);
+    pm_host_scene_result sr;
+    pm_host_scene_get_result(nullptr, &sr);
+    CHECK(sr.state == PM_SCENE_IDLE);
+    pm_host_scene_cancel(nullptr);
+    CHECK(pm_host_scene_start(nullptr, nullptr, 0) == 0);
+    char cbuf[8];
+    CHECK(pm_host_scene_config(nullptr, cbuf, sizeof cbuf) == 0 && cbuf[0] == 0);
+    CHECK(pm_engine_describe(nullptr, cbuf, sizeof cbuf) == 0);
     pm_host* h = makeHost(false);
     CHECK(h != nullptr);
     if (!h) return;
@@ -501,5 +701,6 @@ TEST(null_tolerance) {
     pm_host_midi_ump(h, nullptr, 3, 0, 0);
     CHECK(pm_host_push_event(h, nullptr) == 0);
     pm_host_render(h, nullptr, buf, 4, 0);
+    CHECK(pm_host_scene_start(h, nullptr, 0) == 0);  // not prepared, no config
     pm_host_destroy(h);
 }

@@ -162,6 +162,55 @@ final class EngineHost {
         return d
     }
 
+    /// Work counts of the worst buffer (hammer-samples stepped, group-blocks
+    /// of the free and forced passes, soundboard-loop members, ...).
+    func worstWork() -> pm_work_detail {
+        var w = pm_work_detail()
+        pm_host_get_worst_work(raw, &w)
+        return w
+    }
+
+    /// The engine's effective configuration, one "key value" per line.
+    func describeEngine() -> String {
+        var buf = [CChar](repeating: 0, count: 4096)
+        _ = pm_engine_describe(engine, &buf, Int32(buf.count))
+        return String(cString: buf)
+    }
+
+    // MARK: - Benchmark scene on the audio thread
+
+    /// Starts a benchmark scene on the real audio path (pm_host_scene_start)
+    /// on the prepare queue (it closes the prepare gate briefly, and with
+    /// PM_BENCH_SCENE_FRESH_ENGINE prepares a private engine first); calls
+    /// completion on the main thread.
+    func startScene(config: pm_bench_config, item: Int, completion: @escaping (Bool) -> Void) {
+        let hostBits = Int(bitPattern: raw)
+        prepareQueue.async { [self] in
+            var c = config
+            let ok = withExtendedLifetime(self) {
+                pm_host_scene_start(OpaquePointer(bitPattern: hostBits), &c, Int32(item)) == 1
+            }
+            DispatchQueue.main.async {
+                completion(ok)
+            }
+        }
+    }
+
+    func sceneResult() -> pm_host_scene_result {
+        var r = pm_host_scene_result()
+        pm_host_scene_get_result(raw, &r)
+        return r
+    }
+
+    func cancelScene() { pm_host_scene_cancel(raw) }
+
+    /// The configuration of the engine the scene runs on (captured at its start).
+    func sceneConfig() -> String {
+        var buf = [CChar](repeating: 0, count: 4096)
+        _ = pm_host_scene_config(raw, &buf, Int32(buf.count))
+        return String(cString: buf)
+    }
+
     /// Speed probe on the audio thread every `everyBuffers` render calls (0: off).
     func setSpeedProbe(everyBuffers: Int) { pm_host_set_speed_probe(raw, Int32(max(0, everyBuffers))) }
 
