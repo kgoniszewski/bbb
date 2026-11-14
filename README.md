@@ -1002,12 +1002,33 @@ double-precision dependency chains; few instructions, but
 latency-bound. API 0.14 advances each group's modes together
 (bit-identical output); on the x86 container that buffer's forced phase
 went from 284 to 158 µs, the still buffers' maximum being 154 µs (plan
-§4.1). Not yet measured on the device after the change.
+§4.1).
 
-What to send back from a device next (API 0.14): the Benchmark rows
-"pedal lift" and "pedal lift, cold" with Phase timing on (forced max and
-its ratio to the mean), and Copy diagnostics after a few minutes of
-pedalled playing (worst buffer: groups woken, responses expanded); also the Benchmark table and a Headroom
+Measured on the device after the change (iPad Pro 11" M2, API 0.14.0,
+2026-11-14, tier Full, 48 kHz / 64 frames): in the benchmark (back to
+back, phase timing) the pedal lift's forced-phase max fell from 201.7 to
+96.3 µs (mean 52.4 µs both); the scene max went 362.6 -> 358.6 µs
+(26.9 %), its worst buffer now a hammer buffer (5 note-ons). "Pedal
+lift, cold": forced max 91.5 µs, buffer max 350.2 µs, no measurable
+cold-cache penalty. Other rows unchanged within noise (mean / max: worst
+16.13 / 42.56 %, worst culling off 19.19 / 43.71 %, typical 4.82 /
+13.80 %, pedalled chords 15.45 / 32.72 %). Live playing with much
+pedalling (95095 buffers, phase timing and thread CPU time on): mean 193
+µs (14.5 %), p99 300 µs (22.5 %), max 520 µs (39.0 %), none over 70 %,
+wall minus CPU 0 µs, all on performance cores; before the fix the live
+worst was 735-783 µs (55.1-58.7 %) in three captures, now it is below
+the benchmark's worst buffer (48.8 %). That worst buffer (pedal motion,
+no hammer or event, 450 groups woken) split events 310.2 / hammers 0 /
+free 76.3 / forced 51.0 / board 76.5 / other 5.7 µs: the forced spike is
+gone. The 310 µs under events is, by inference, the pedal-driven
+wake-ups and coefficient refreshes of those groups; not addressed at 39 %
+(spreading wake-ups over sub-blocks would be the option). No crackles or
+dropouts reported. The CTest suites, including the lockstep wake-up test
+(`test_kernels` `coupled_wake_matches_per_mode_reference`), have still
+not been run on Apple silicon.
+
+What to send back from a device next: the CTest suites run on Apple
+silicon (above); also the Benchmark table and a Headroom
 sweep of the worst scene at 128 and 256 frames and at the Balanced and Eco
 tiers; the same at 64 frames after several minutes of heavy playing
 (thermal state in the diagnostics); a listening report (crackles while
