@@ -146,15 +146,28 @@ inline void zonesToKeys(const KeyZone* kz, const float* zoneDisp, int keys, floa
 // per-sample loop rearranged by superposition, not an approximation: the
 // trajectory is the same up to rounding, so stability and passivity are
 // those of the per-sample loop (soundboard_model.h, test_passivity).
-// h_k changes with the key's damper amount and awake set; it is recomputed
-// (about one free pass of the key's coupled modes) only when it changes.
-// G is then updated only in the columns (zone pairs, taps) of the keys whose
-// h_k changed, each column re-summed from zero over its member keys in the
-// same order as a full rebuild, so the result is bit-identical to one; the
-// whole kernel is rebuilt only when the member set, the gain or a tap gain
-// changes. (Wake-ups and cull decisions change awake sets, hence h_k, on
-// most sub-blocks of a sustained chord; a full rebuild there cost about as
-// much as everything else in the event phase.)
+// h_k changes with the key's damper amount and awake set; it is re-read from
+// the bank (ModeBank::coupledResponse) only when it changes. G is then
+// updated only in the columns (zone pairs, taps) of the keys whose h_k
+// changed, each column re-summed from zero over its member keys in the same
+// order as a full rebuild, so the result is bit-identical to one. A key that
+// joins or leaves the members (a hammer takes it over or hands it back, its
+// coupled groups wake or are all culled) is handled the same way when the
+// packed entry list stays the same (the entries the members use, in the
+// order the rebuild packs them: some lower member already uses each of the
+// key's entries); only otherwise, or when the gain or a tap gain changes,
+// is the whole kernel rebuilt. (Wake-ups and cull decisions change awake
+// sets, hence h_k, on most sub-blocks of a sustained chord; a full rebuild
+// there cost about as much as everything else in the event phase.)
+//
+// A key whose new h_k is approximate (the bank's damper-response budget was
+// spent, ModeBank::coupledResponse) adds the change of its h_k to its
+// columns instead (G += w (h_new - h_old)): a pedal stroke changes about
+// half of the keys per control tick, which would otherwise re-sum nearly
+// every column on every tick. Such a column differs from the re-summed one
+// by rounding until it is re-summed, which happens when the key's h_k
+// becomes exact (or any other re-sum or rebuild of the column), so at rest
+// G is again bit-identical to a full rebuild.
 //
 // Keys owned by a hammer solver (io[k].skip) are not part of G: the caller
 // steps them per sample with keyInput() and adds their force itself.
@@ -237,13 +250,23 @@ public:
     std::uint64_t kernelRebuilds() const noexcept { return rebuilds_; }
     // Keys whose kernel columns were updated in place so far (h_k changed).
     std::uint64_t kernelKeyUpdates() const noexcept { return keyUpdates_; }
+    // Keys whose kernel columns took an approximate response's change
+    // (G += w dh) so far, and columns whose sum carries such a change now.
+    std::uint64_t kernelDeltaUpdates() const noexcept { return deltaUpdates_; }
+    int deltaColumns() const noexcept;
     // Tests: rebuild the whole kernel on every change (the reference for the
     // in-place update, which must match it bit for bit).
     void setAlwaysRebuild(bool on) noexcept { alwaysRebuild_ = on; }
+    // Tests (not RT): whether the kernel equals a full rebuild bit for bit.
+    bool kernelMatchesRebuild() noexcept;
 
 private:
     void rebuildKernel() noexcept;
     void updateColumns() noexcept;
+    // Packs the entries the current members use, in the rebuild's order,
+    // into ent[] (entry ids); returns their number.
+    int packEntries(int* ent) const noexcept;
+    bool samePacking() const noexcept;
     float entryWeight(int k, int code) const noexcept;
 
     int keys_ = 0, zones_ = 0, taps_ = 0, nEnt_ = 0, entPad_ = 0;
@@ -266,8 +289,16 @@ private:
     bool hasH_[kMaxKeys]{}, member_[kMaxKeys]{}, listen_[kMaxKeys]{}, newListener_[kMaxKeys]{};
     int members_[kMaxKeys]{}, listenList_[kMaxKeys]{};
     int nMembers_ = 0, nListen_ = 0;
-    std::uint64_t rebuilds_ = 0, keyUpdates_ = 0;
+    std::uint64_t rebuilds_ = 0, keyUpdates_ = 0, deltaUpdates_ = 0;
     bool alwaysRebuild_ = false;
+    int actEnt_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{};  // entry id per packed column
+    // Keys whose approximate h changed (their h_new - h_old in dh_), and
+    // columns that carry such a change since their last re-sum.
+    int delta_[kMaxKeys]{};
+    int nDelta_ = 0;
+    AlignedArray<float> dh_;          // kMaxKeys x kMaxBlock
+    AlignedArray<float> Gref_;        // kernelMatchesRebuild
+    bool colDelta_[kMaxEntries + kMaxTaps * Soundboard::kMaxZones]{};
     // In-place updates: keys whose h changed since the last kernel build,
     // the packed column of every entry (-1: not used by the members), and
     // per entry the keys that can contribute to it, ascending, with a code

@@ -9,7 +9,9 @@
 
 #include "pm_api/pm_api.h"
 #include "pm_api/pm_api_internal.h"
+#include "pm_api/work_detail.h"
 #include "pm_bench/bench.h"
+#include "pm_host/cpu_id.h"
 #include "pm_host/host.h"
 #include "pm_host/speed_probe.h"
 
@@ -41,6 +43,12 @@ struct pm_host {
         int warmBuffers = -1, measureBuffers = 0;  // fixed at the first buffer (from its frame count)
         int buffer = 0;                            // buffers rendered since the start
         bool restoreTiming = false;
+        bool restoreProbe = false;                 // the probe was switched on for the run
+        // CPU trace totals (pm_scene_load) over the measured buffers.
+        std::uint64_t traced = 0, migrated = 0;
+        double subBlocks = 0.0, usBefore = 0.0, subBlocksBefore = 0.0;
+        std::uint32_t endCpu[PM_MAX_CPUS] = {}, movedTo[PM_MAX_CPUS] = {};
+        std::uint32_t leftAfter[PM_SCENE_LEFT_BINS] = {};
         // Totals over the measured buffers.
         int measured = 0, overruns = 0, minFrames = 0, maxFrames = 0;
         double awake = 0.0, freeBlocks = 0.0, forcedBlocks = 0.0, members = 0.0, listeners = 0.0;
@@ -50,12 +58,32 @@ struct pm_host {
     std::atomic<int32_t> sceneState{PM_SCENE_IDLE};
     std::atomic<bool> sceneCancel{false};
     pm_host_scene_result sceneResult{};
+    pm_cpu_usage sceneCpu{};            // published with sceneResult
+    pm_speed_probe_split sceneProbe{};
     char sceneConfig[4096] = {};
     // PM_BENCH_SCENE_FRESH_ENGINE: the private engine (owned; replaced or
     // freed only inside the prepare gate) and whether the audio thread
     // renders it (audio-thread state, like 'scene').
     pm::Engine* sceneEngine = nullptr;
     bool sceneFresh = false;
+    // Load multiplier: the other K - 1 engines (owned, benchmark-prepared;
+    // replaced or freed only inside the prepare gate), their scratch output
+    // and the number in use (audio-thread state, like 'scene').
+    pm::Engine* loadEngines[PM_SCENE_MAX_LOAD - 1] = {};
+    std::vector<float> loadScratch;  // 2 x kScratchFrames
+    static constexpr int kScratchFrames = 1024;
+    int sceneLoad = 1;
+    std::uint64_t engineBytes = 0;   // of one benchmark-prepared engine (0: not measured)
+    pm_scene_load sceneLoadResult{};  // published with sceneResult
+    // CPU trace of the current buffer (audio thread): the CPU at the start
+    // of the render call, the sub-blocks begun so far over all engines and
+    // the first one found on another CPU.
+    struct Trace {
+        bool armed = false;
+        int cpuStart = -1, index = 0, first = -1, movedTo = -1;
+        std::chrono::steady_clock::time_point t0{};
+        double usAtChange = 0.0;
+    } trace;
 };
 
 namespace {
@@ -71,6 +99,28 @@ double threadCpuSeconds() noexcept {
         return static_cast<double>(ts.tv_sec) + 1e-9 * static_cast<double>(ts.tv_nsec);
 #endif
     return -1.0;
+}
+
+// Engine sub-block hook (audio thread): until the first change in the
+// buffer, one CPU-number read per sub-block (cpu_id.h: a per-CPU register
+// read) and, at the change, one clock read.
+void traceSubBlock(void* ctx) noexcept {
+    pm_host::Trace& t = static_cast<pm_host*>(ctx)->trace;
+    if (!t.armed) return;
+    const int i = t.index++;
+    if (t.first >= 0) return;
+    const int c = pm::host::currentCpu();
+    if (c >= 0 && c != t.cpuStart) {
+        t.first = i;
+        t.movedTo = c;
+        t.usAtChange = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t.t0).count();
+    }
+}
+
+void toSplit(const pm::host::ProbeSnapshot& p, pm_speed_probe_split& o) noexcept {
+    o = pm_speed_probe_split{};
+    pm::bench::toProbeSeries(p.latency, o.latency);
+    pm::bench::toProbeSeries(p.throughput, o.throughput);
 }
 
 void toWork(const pm::host::WorstBuffer& b, pm_work_detail& w) noexcept {
@@ -96,16 +146,29 @@ void toWork(const pm::host::WorstBuffer& b, pm_work_detail& w) noexcept {
     w.loop_listeners = b.loopListeners;
     w.loop_entries = b.loopEntries;
     w.out_zones = b.outZones;
+    w.groups_woken = b.groupsWoken;
+    w.approx_responses = b.approxResponses;
 }
 
 // Audio thread, before the buffer's events are forwarded: starts the
 // measurement after the warm-up and pushes the scene events due in this
 // buffer (sample times from the reset, i.e. the engine's own clock).
+// Audio thread, when the scene ends (done or cancelled): undoes what the
+// start switched on, and returns the render path to the app's engine.
+void sceneFinish(pm_host* host, pm::Engine& eng) noexcept {
+    pm_host::Scene& sc = host->scene;
+    if (sc.restoreTiming) eng.setPhaseTiming(false);
+    if (sc.restoreProbe) host->probeEvery.store(0, std::memory_order_relaxed);
+    if (pm::Engine* app = pmEngineOf(host->engine)) app->setSubBlockHook(nullptr, nullptr);  // this thread renders it
+    host->trace.armed = false;
+    host->sceneFresh = false;
+    host->sceneLoad = 1;
+}
+
 void sceneBeforeRender(pm_host* host, pm::Engine& eng, int32_t frames) noexcept {
     pm_host::Scene& sc = host->scene;
     if (host->sceneCancel.exchange(false, std::memory_order_acq_rel)) {
-        if (sc.restoreTiming) eng.setPhaseTiming(false);
-        host->sceneFresh = false;
+        sceneFinish(host, eng);
         host->sceneState.store(PM_SCENE_IDLE, std::memory_order_release);
         return;
     }
@@ -117,17 +180,48 @@ void sceneBeforeRender(pm_host* host, pm::Engine& eng, int32_t frames) noexcept 
     }
     if (sc.buffer == sc.warmBuffers) host->core.meter().requestReset();  // applied at this buffer's first record
     const std::uint64_t t1 = eng.sampleTime() + static_cast<std::uint64_t>(frames);
-    for (; sc.next < sc.events.size() && sc.events[sc.next].time < t1; ++sc.next) eng.pushEvent(sc.events[sc.next]);
+    for (; sc.next < sc.events.size() && sc.events[sc.next].time < t1; ++sc.next) {
+        eng.pushEvent(sc.events[sc.next]);
+        for (int i = 0; i + 1 < host->sceneLoad; ++i) host->loadEngines[i]->pushEvent(sc.events[sc.next]);
+    }
 }
 
 // Audio thread, after the buffer was recorded in the meter.
-void sceneAfterRender(pm_host* host, pm::Engine& eng, int32_t frames, double renderUs, double periodUs) noexcept {
+void sceneAfterRender(pm_host* host, pm::Engine& eng, int32_t frames, double renderUs, double periodUs,
+                      int cpuEnd) noexcept {
     pm_host::Scene& sc = host->scene;
     if (host->sceneState.load(std::memory_order_relaxed) != PM_SCENE_RUNNING) return;
     const int b = sc.buffer++;
-    if (b < sc.warmBuffers) return;
+    if (b < sc.warmBuffers) {
+        host->trace.armed = false;
+        return;
+    }
     const pm::RenderInfo& info = eng.lastRender();
     ++sc.measured;
+    pm_host::Trace& tr = host->trace;
+    if (tr.armed && tr.cpuStart >= 0 && tr.cpuStart < PM_MAX_CPUS && cpuEnd >= 0 && cpuEnd < PM_MAX_CPUS) {
+        ++sc.traced;
+        ++sc.endCpu[cpuEnd];
+        sc.subBlocks += tr.index;
+        int at = -1, to = -1;
+        double us = 0.0;
+        if (tr.first >= 0) {
+            at = tr.first;
+            to = tr.movedTo;
+            us = tr.usAtChange;
+        } else if (cpuEnd != tr.cpuStart) {
+            at = tr.index;  // seen only at the end of the call
+            to = cpuEnd;
+            us = renderUs;
+        }
+        if (at >= 0) {
+            ++sc.migrated;
+            ++sc.leftAfter[std::min(at, PM_SCENE_LEFT_BINS - 1)];
+            if (to >= 0 && to < PM_MAX_CPUS) ++sc.movedTo[to];
+            sc.usBefore += us;
+            sc.subBlocksBefore += at;
+        }
+    }
     if (renderUs > periodUs) ++sc.overruns;
     if (sc.minFrames == 0 || frames < sc.minFrames) sc.minFrames = frames;
     sc.maxFrames = std::max(sc.maxFrames, static_cast<int>(frames));
@@ -141,6 +235,7 @@ void sceneAfterRender(pm_host* host, pm::Engine& eng, int32_t frames, double ren
     sc.hammerSamples += info.hammerSamples;
     sc.contactSamples += info.hammerContactSamples;
     if (eng.phaseTiming()) sc.hammerUs += eng.profile().us[pm::EngineProfile::Hammers];
+    host->trace.armed = false;
     if (sc.measured < sc.measureBuffers) return;
     // Done: publish (the snapshot reads the meter's histograms; no
     // allocation, no lock).
@@ -187,8 +282,26 @@ void sceneAfterRender(pm_host* host, pm::Engine& eng, int32_t frames, double ren
     r.probe.mean_us = s.probe.meanUs;
     r.probe.max_us = s.probe.maxUs;
     r.fresh_engine = host->sceneFresh ? 1 : 0;
-    if (sc.restoreTiming) eng.setPhaseTiming(false);
-    host->sceneFresh = false;
+    pm::bench::toCpuUsage(s.cpu, host->sceneCpu);
+    toSplit(s.probe, host->sceneProbe);
+    pm_scene_load& L = host->sceneLoadResult;
+    L = pm_scene_load{};
+    L.load = host->sceneLoad;
+    L.engine_bytes = host->engineBytes;
+    L.cpu_tracked = sc.traced > 0 ? 1 : 0;
+    L.buffers = sc.traced;
+    L.migrated = sc.migrated;
+    if (sc.traced > 0) L.mean_sub_blocks = sc.subBlocks / static_cast<double>(sc.traced);
+    if (sc.migrated > 0) {
+        L.mean_us_before_migration = sc.usBefore / static_cast<double>(sc.migrated);
+        L.mean_sub_blocks_before_migration = sc.subBlocksBefore / static_cast<double>(sc.migrated);
+    }
+    for (int i = 0; i < PM_MAX_CPUS; ++i) {
+        L.end_cpu[i] = sc.endCpu[i];
+        L.moved_to[i] = sc.movedTo[i];
+    }
+    for (int i = 0; i < PM_SCENE_LEFT_BINS; ++i) L.left_after[i] = sc.leftAfter[i];
+    sceneFinish(host, eng);
     host->sceneState.store(PM_SCENE_DONE, std::memory_order_release);
 }
 
@@ -226,6 +339,7 @@ pm_host* pm_host_create(void) {
 void pm_host_destroy(pm_host* host) {
     if (!host) return;
     delete host->sceneEngine;
+    for (pm::Engine* e : host->loadEngines) delete e;
     pm_engine_destroy(host->engine);
     delete host;
 }
@@ -282,22 +396,52 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         if (++host->probeCounter >= every) {
             host->probeCounter = 0;
             float sink = 0.0f;
-            const double us = pm::host::timeSpeedProbe(&sink);
+            const int cpuNow = pm::host::currentCpu();
+            const pm::host::ProbeTimes pt = pm::host::timeSpeedProbeSplit(&sink);
             host->probeSink.store(sink, std::memory_order_relaxed);
-            host->core.meter().recordProbe(us);
+            host->core.meter().recordProbe(pt.latencyUs, pt.throughputUs, cpuNow);
         }
     }
     const bool cpu = host->cpuTiming.load(std::memory_order_relaxed);
+    // CPU numbers while any diagnostic is on (two register reads).
+    const bool trackCpu = cpu || eng->phaseTiming() || host->probeEvery.load(std::memory_order_relaxed) > 0;
+    const int cpuStart = trackCpu ? pm::host::currentCpu() : -1;
     const double c0 = cpu ? threadCpuSeconds() : -1.0;
     const auto t0 = std::chrono::steady_clock::now();
+    // Load multiplier and CPU trace: only while the scene runs (set up by
+    // pm_host_scene_start_load inside the gate).
+    const bool sceneOn = sceneEngine && host->sceneState.load(std::memory_order_relaxed) == PM_SCENE_RUNNING;
+    const int extra = sceneOn ? host->sceneLoad - 1 : 0;
+    if (sceneOn && trackCpu) {
+        pm_host::Trace& tr = host->trace;
+        tr.armed = true;
+        tr.cpuStart = cpuStart;
+        tr.index = 0;
+        tr.first = tr.movedTo = -1;
+        tr.t0 = t0;
+        tr.usAtChange = 0.0;
+    }
     host->core.forwardEvents([eng](const pm::Event& e) { eng->pushEvent(e); });  // a full engine queue counts the drop
     pm::ClockMapping clock;
     clock.hostTimeAtBufferStart = host_time;
     clock.hostTicksPerSample = host->ticksPerSample;
     eng->render(left, right, frames, host_time != 0 ? &clock : nullptr);
+    if (extra > 0) {
+        float* xl = host->loadScratch.data();
+        float* xr = xl + pm_host::kScratchFrames;
+        for (int i = 0; i < extra; ++i)
+            for (int32_t done = 0; done < frames;) {
+                const int32_t n = std::min<int32_t>(frames - done, pm_host::kScratchFrames);
+                host->loadEngines[i]->render(xl, xr, n, nullptr);
+                done += n;
+            }
+    }
     const auto t1 = std::chrono::steady_clock::now();
     const double c1 = cpu ? threadCpuSeconds() : -1.0;
+    const int cpuEnd = trackCpu ? pm::host::currentCpu() : -1;
     pm::host::BufferRecord rec;
+    rec.cpuStart = cpuStart;
+    rec.cpuEnd = cpuEnd;
     rec.renderSeconds = std::chrono::duration<double>(t1 - t0).count();
     rec.periodSeconds = frames / host->sampleRate;
     rec.cpuSeconds = c0 >= 0.0 && c1 >= 0.0 ? c1 - c0 : -1.0;
@@ -329,6 +473,8 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         rec.loopListeners = info.loopListeners;
         rec.loopEntries = info.loopEntries;
         rec.outZones = info.outZones;
+        rec.groupsWoken = info.groupsWoken;
+        rec.approxResponses = info.approxResponses;
         const pm::EngineProfile& p = e->profile();
         if (e->phaseTiming() && p.totalUs > 0.0) {
             static_assert(pm::EngineProfile::kPhases + 1 == pm::host::kLoadPhases, "phase table out of date");
@@ -343,7 +489,8 @@ void pm_host_render(pm_host* host, float* left, float* right, int32_t frames, ui
         }
     }
     host->core.meter().record(rec);
-    if (sceneEngine) sceneAfterRender(host, *sceneEngine, frames, 1e6 * rec.renderSeconds, 1e6 * rec.periodSeconds);
+    if (sceneEngine)
+        sceneAfterRender(host, *sceneEngine, frames, 1e6 * rec.renderSeconds, 1e6 * rec.periodSeconds, cpuEnd);
     host->lastFrames.store(frames, std::memory_order_relaxed);
     host->core.exitRender();
 }
@@ -485,7 +632,12 @@ void pm_host_get_worst_work(const pm_host* host, pm_work_detail* d) {
 }
 
 int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t item_index) {
+    return pm_host_scene_start_load(host, config, item_index, 1);
+}
+
+int pm_host_scene_start_load(pm_host* host, const pm_bench_config* config, int32_t item_index, int32_t load) {
     if (!host || !config || !host->core.ready()) return 0;
+    if (load < 1 || load > PM_SCENE_MAX_LOAD) return 0;
     const int32_t scene = pm_bench_item_scene(config, item_index);
     if (scene < 0) return 0;
     pm::Engine* eng = pmEngineOf(host->engine);
@@ -498,36 +650,77 @@ int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t it
     std::vector<pm::Event> events;
     pm::bench::sceneEvents(sc, fs, static_cast<std::uint64_t>((warm + seconds + 1.0) * fs), events);
     const bool timing = (config->flags & PM_BENCH_PHASE_TIMING) != 0;
-    // A private engine, prepared as the benchmark prepares the item's.
-    pm::Engine* fresh = nullptr;
-    if ((config->flags & PM_BENCH_SCENE_FRESH_ENGINE) != 0) {
+    const bool probe = (config->flags & PM_BENCH_SPEED_PROBE) != 0;
+    // Private engines, prepared as the benchmark prepares the item's: the
+    // first one is heard (PM_BENCH_SCENE_FRESH_ENGINE, implied by load > 1),
+    // the others are the load multiplier's.
+    const bool wantFresh = load > 1 || (config->flags & PM_BENCH_SCENE_FRESH_ENGINE) != 0;
+    pm::Engine* fresh[PM_SCENE_MAX_LOAD] = {};
+    std::uint64_t bytes = 0;
+    std::vector<float> scratch;
+    auto freeAll = [&fresh] {
+        for (pm::Engine*& e : fresh) {
+            delete e;
+            e = nullptr;
+        }
+    };
+    if (wantFresh) {
         pm::bench::Config k;
         k.allTiers = (config->flags & PM_BENCH_ALL_TIERS) != 0;
         if (config->tier >= 0 && config->tier <= 2) k.tier = static_cast<pm::QualityTier>(config->tier);
-        fresh = new (std::nothrow) pm::Engine;
-        if (!fresh || !pm::bench::prepareForCase(pm::bench::caseAt(k, item_index), *fresh, fs,
-                                                 std::max(1, eng->maxFrames()))) {
-            delete fresh;
-            return 0;
+        const pm::bench::Case c = pm::bench::caseAt(k, item_index);
+        for (int i = 0; i < load; ++i) {
+            fresh[i] = new (std::nothrow) pm::Engine;
+            std::size_t b = 0;
+            if (!fresh[i] || !pm::bench::prepareForCase(c, *fresh[i], fs, std::max(1, eng->maxFrames()), &b)) {
+                freeAll();
+                return 0;
+            }
+            if (i == 0) bytes = b;
         }
+        if (load > 1) scratch.assign(2 * static_cast<std::size_t>(pm_host::kScratchFrames), 0.0f);
     }
-    pm::Engine* old = nullptr;
+    pm::Engine* old[PM_SCENE_MAX_LOAD] = {};
     const int ok = host->core.runExclusive([&] {
                if (!eng->prepared()) return false;
-               old = host->sceneEngine;
-               host->sceneEngine = fresh;
-               host->sceneFresh = fresh != nullptr;
-               pm::Engine* run = fresh ? fresh : eng;
+               // A scene still running loses its result: undo what it switched on.
+               if (host->sceneState.load(std::memory_order_relaxed) == PM_SCENE_RUNNING) {
+                   if (host->scene.restoreProbe) host->probeEvery.store(0, std::memory_order_relaxed);
+                   if (host->scene.restoreTiming) (host->sceneFresh ? host->sceneEngine : eng)->setPhaseTiming(false);
+               }
+               old[0] = host->sceneEngine;
+               for (int i = 0; i + 1 < PM_SCENE_MAX_LOAD; ++i) {
+                   old[i + 1] = host->loadEngines[i];
+                   host->loadEngines[i] = fresh[i + 1];
+               }
+               host->sceneEngine = fresh[0];
+               host->sceneFresh = fresh[0] != nullptr;
+               host->sceneLoad = load;
+               host->engineBytes = bytes;
+               host->loadScratch.swap(scratch);
+               eng->setSubBlockHook(nullptr, nullptr);
+               pm::Engine* run = fresh[0] ? fresh[0] : eng;
                pm_host::Scene& s = host->scene;
                s = pm_host::Scene{};
                s.events.swap(events);
                s.warmSeconds = warm;
                s.seconds = seconds;
                s.restoreTiming = timing && !run->phaseTiming();
+               s.restoreProbe = probe && host->probeEvery.load(std::memory_order_relaxed) == 0;
+               if (s.restoreProbe) host->probeEvery.store(8, std::memory_order_relaxed);
+               host->trace = pm_host::Trace{};
+               for (int i = 0; i < load; ++i) {
+                   pm::Engine* e = i == 0 ? run : host->loadEngines[i - 1];
+                   if (i > 0) e->setPhaseTiming(timing || run->phaseTiming());  // the same work as the first
+                   e->setSubBlockHook(traceSubBlock, host);
+                   e->reset();
+               }
                if (timing) run->setPhaseTiming(true);
-               run->reset();
                run->describe(host->sceneConfig, static_cast<int>(sizeof host->sceneConfig));
                host->sceneResult = pm_host_scene_result{};
+               host->sceneCpu = pm_cpu_usage{};
+               host->sceneProbe = pm_speed_probe_split{};
+               host->sceneLoadResult = pm_scene_load{};
                host->sceneResult.state = PM_SCENE_RUNNING;
                host->sceneCancel.store(false, std::memory_order_relaxed);
                host->sceneState.store(PM_SCENE_RUNNING, std::memory_order_release);
@@ -535,8 +728,11 @@ int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t it
            })
                ? 1
                : 0;
-    delete old;  // swapped out inside the gate: the audio thread no longer sees it
-    if (!ok && host->sceneEngine != fresh) delete fresh;  // refused before it was installed
+    if (ok) {
+        for (pm::Engine* e : old) delete e;  // swapped out inside the gate: the audio thread no longer sees them
+    } else {
+        freeAll();  // refused before they were installed
+    }
     return ok;
 }
 
@@ -604,6 +800,68 @@ double pm_speed_probe_run_us(int32_t runs, pm_speed_probe_stats* stats) {
         stats->checksum = sink;
     }
     return median;
+}
+
+void pm_host_get_speed_probe_split(const pm_host* host, pm_speed_probe_split* split) {
+    if (!split) return;
+    *split = pm_speed_probe_split{};
+    if (host) toSplit(host->core.meter().probeSnapshot(), *split);
+}
+
+double pm_speed_probe_run_split(int32_t runs, pm_speed_probe_split* split) {
+    constexpr int kMax = 4096;
+    double lat[kMax], thr[kMax];
+    const int n = runs < 1 ? 1 : (runs > kMax ? kMax : runs);
+    for (int i = 0; i < n; ++i) {
+        float r = 0.0f;  // the work is kept live inside timeSpeedProbeSplit
+        const pm::host::ProbeTimes t = pm::host::timeSpeedProbeSplit(&r);
+        lat[i] = t.latencyUs;
+        thr[i] = t.throughputUs;
+    }
+    auto fill = [n](double* t, pm_probe_series& o) {
+        double sum = 0.0;
+        for (int i = 0; i < n; ++i) sum += t[i];
+        std::sort(t, t + n);
+        o.runs = static_cast<uint64_t>(n);
+        o.min_us = t[0];
+        o.max_us = t[n - 1];
+        o.median_us = n % 2 ? t[n / 2] : 0.5 * (t[n / 2 - 1] + t[n / 2]);
+        o.mean_us = sum / n;
+    };
+    pm_speed_probe_split s{};
+    fill(lat, s.latency);
+    fill(thr, s.throughput);
+    if (split) *split = s;
+    return s.throughput.median_us;
+}
+
+int32_t pm_current_cpu(void) { return pm::host::currentCpu(); }
+
+void pm_host_get_cpu_usage(const pm_host* host, pm_cpu_usage* usage) {
+    if (!usage) return;
+    *usage = pm_cpu_usage{};
+    usage->worst_cpu_start = usage->worst_cpu_end = -1;
+    if (!host) return;
+    pm::bench::toCpuUsage(host->core.meter().snapshot().cpu, *usage);
+}
+
+void pm_host_scene_get_cpu_usage(const pm_host* host, pm_cpu_usage* usage) {
+    if (!usage) return;
+    *usage = pm_cpu_usage{};
+    usage->worst_cpu_start = usage->worst_cpu_end = -1;
+    if (host && host->sceneState.load(std::memory_order_acquire) == PM_SCENE_DONE) *usage = host->sceneCpu;
+}
+
+void pm_host_scene_get_probe_split(const pm_host* host, pm_speed_probe_split* split) {
+    if (!split) return;
+    *split = pm_speed_probe_split{};
+    if (host && host->sceneState.load(std::memory_order_acquire) == PM_SCENE_DONE) *split = host->sceneProbe;
+}
+
+void pm_host_scene_get_load(const pm_host* host, pm_scene_load* result) {
+    if (!result) return;
+    *result = pm_scene_load{};
+    if (host && host->sceneState.load(std::memory_order_acquire) == PM_SCENE_DONE) *result = host->sceneLoadResult;
 }
 
 void pm_host_set_cpu_timing(pm_host* host, int enabled) {

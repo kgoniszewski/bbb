@@ -124,8 +124,15 @@ TEST(idle_sleep_is_buffer_size_invariant) {
 
 // The soundboard loop's zone kernel is updated in place, column by column,
 // when only some keys' impulse responses change (wake-ups and cull
-// decisions under a sustained chord); the result must be the full rebuild's
-// bit for bit (CouplingLoop, soundboard.h).
+// decisions under a sustained chord) or keys join or leave the members
+// (hammers, culling); the result must be the full rebuild's bit for bit
+// (CouplingLoop, soundboard.h). Both engines use exact damper responses:
+// the pedal stroke at the start (its lift noise wakes every key) changes
+// more responses per tick than the budget, and an approximate response's
+// change is added to its columns rather than re-summed (rounding-level
+// differences by design until the key's response is exact again; that the
+// kernel is then a full rebuild's bit for bit is checked in test_half_pedal,
+// pedal_sweep_bounded_and_exact_at_rest).
 TEST(kernel_column_update_matches_full_rebuild) {
     auto at = [](double s) { return static_cast<std::uint64_t>(s * kFs); };
     std::vector<pm::Event> ev = {sustain(0, true)};
@@ -139,6 +146,9 @@ TEST(kernel_column_update_matches_full_rebuild) {
     const int n = static_cast<int>(2.4 * kFs), block = 256;
     pm::Engine ref, upd;
     ref.setKernelAlwaysRebuild(true);
+    ref.setExactDamperResponses(true);
+    upd.setExactDamperResponses(true);
+
     ref.prepare(kFs, block);
     upd.prepare(kFs, block);
     Stereo a, b;

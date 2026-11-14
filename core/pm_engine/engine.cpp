@@ -225,6 +225,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
 
 void Engine::resetState() noexcept {
     bank_.clearState();
+    bank_.resetResponses();
     for (int k = 0; k < kNumKeys; ++k) {
         keyDown_[k] = false;
         hammerOfKey_[k] = -1;
@@ -739,6 +740,9 @@ void Engine::controlTick(std::int64_t now) noexcept {
     noiseAmp_ = boardOn_ && level > 0.0f && withDamper > 0 ? level * speed * float(moved) / float(withDamper) : 0.0f;
     changed = changed || noiseAmp_ != 0.0f;
     stableTicks_ = changed ? 0 : std::min(stableTicks_ + 1, 2);
+    // Exact responses for keys whose damper came to rest (before the loop
+    // reads them at this tick, so the schedule is the tick grid's).
+    if (boardOn_) bank_.refineResponses();
 }
 
 // True when controlTick(now) would leave every piece of state as it is: the
@@ -756,6 +760,7 @@ bool Engine::tickIsNoOp() const noexcept {
 
 void Engine::readParams() noexcept {
     idleSleep_ = idleOn_.load(std::memory_order_relaxed);
+    exactRespApplied_ = exactResp_.load(std::memory_order_relaxed);
     const float w = std::clamp(width_.load(std::memory_order_relaxed), 0.0f, 1.0f);
     if (w != appliedWidth_) {
         appliedWidth_ = w;
@@ -1032,9 +1037,10 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
         tRender = profT_ = ProfClock::now();
     }
     const std::uint64_t damperUpdates0 = damperUpdates_;
-    const std::uint64_t responses0 = bank_.responseGroupsComputed(), rebuilds0 = loop_.kernelRebuilds(),
+    const std::uint64_t responses0 = bank_.responseGroupsComputed(), approx0 = bank_.responseGroupsApproximated(),
+                        rebuilds0 = loop_.kernelRebuilds(),
                         keyUpdates0 = loop_.kernelKeyUpdates(), free0 = bank_.groupBlocksProcessed(),
-                        forced0 = bank_.forcedGroupBlocks();
+                        forced0 = bank_.forcedGroupBlocks(), woken0 = bank_.groupsWoken();
     readParams();
     drainQueue(clock);
 
@@ -1047,13 +1053,19 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             for (int i = 0; i < pendingCount_; ++i) pending_[i] = pending_[i + 1];
             applyEvent(e, now);
         }
-        if (now % kSubBlock == 0 && !tickIsNoOp()) controlTick(now);
+        if (now % kSubBlock == 0) {
+            // The response budget belongs to the tick (absolute grid), not to
+            // the host buffer or the sub-block.
+            bank_.beginResponseTick(exactRespApplied_ ? -1 : kResponseBudget);
+            if (!tickIsNoOp()) controlTick(now);
+        }
         std::int64_t len = std::min<std::int64_t>(nFrames - pos, kSubBlock - now % kSubBlock);
         if (pendingCount_ > 0) len = std::min<std::int64_t>(len, pending_[0].when - now);
         for (int a = 0; a < activeCount_; ++a) {
             const std::int64_t age = now - static_cast<std::int64_t>(hammers_[active_[a]].launchTime);
             len = std::min<std::int64_t>(len, kSubBlock - age % kSubBlock);
         }
+        if (subBlockHook_) subBlockHook_(subBlockCtx_);
         processSubBlock(left + pos, right + pos, static_cast<int>(len), now);
         pos += len;
     }
@@ -1080,10 +1092,12 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     pub_.peakPre.store(peakPre_, std::memory_order_relaxed);
     info_.damperUpdates = static_cast<int>(damperUpdates_ - damperUpdates0);
     info_.responseGroups = static_cast<int>(bank_.responseGroupsComputed() - responses0);
+    info_.approxResponses = static_cast<int>(bank_.responseGroupsApproximated() - approx0);
     info_.kernelRebuilds = static_cast<int>(loop_.kernelRebuilds() - rebuilds0);
     info_.kernelKeyUpdates = static_cast<int>(loop_.kernelKeyUpdates() - keyUpdates0);
     info_.freeGroupBlocks = static_cast<int>(bank_.groupBlocksProcessed() - free0);
     info_.forcedGroupBlocks = static_cast<int>(bank_.forcedGroupBlocks() - forced0);
+    info_.groupsWoken = static_cast<int>(bank_.groupsWoken() - woken0);
     if (profiling_) {
         // Time before the first sub-block (parameters, queue) and between
         // sub-blocks without a lap is "other" (totalUs minus the phases).

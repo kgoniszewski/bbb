@@ -35,6 +35,22 @@
 //   same-key burst: identical, except that every burst strikes the same six
 //             keys (the warm counterpart: compare the hammer phase per
 //             hammer-sample of the two)
+//   pedal lift: many strings sounding under the held sustain pedal (a
+//             two-hand chord of 12 notes struck every 1.2 s and released
+//             into the pedal, four bass and middle keys held throughout);
+//             every 0.6 s the pedal comes up for 150 ms and goes down
+//             again (alternately CC64 on/off and ramps of many values), and
+//             three notes are struck as it goes down: the dampers land on
+//             and lift off about 9000 sounding modes, as in the iPad's
+//             worst live buffer (the damper amounts change on every control
+//             tick while the felts pass through their transition)
+//   pedal lift, cold: the same, with a 32 MiB eviction walk (as with
+//             evictBytes, outside the timing) before every buffer in which
+//             the pedal moves or the dampers are still moving (a sustain
+//             event in the buffer, or damper updates in the one before), so
+//             that those buffers start with the caches other work leaves, as
+//             live (the rest run back to back, warm). Shows the cold cost of
+//             a pedal-motion buffer.
 //   hammer:   cost of one active hammer per buffer, per key, while in
 //             contact and averaged over its life (from the launch until
 //             hammerFinished: the release wait, or since the sample path's
@@ -55,6 +71,27 @@
 // back to back isolates nothing but the gap, spin + eviction the caches
 // alone, and sleep against spin the core's power state and clock.
 //
+// Scheduling class: the paced loop runs on the calling thread, in whatever
+// scheduling class that thread has. A real audio thread is a time-constraint
+// (real-time) thread in the audio device's workgroup, whose deadlines the
+// system's performance controller sees; an ordinary thread that sleeps
+// between buffers is not. Config::paceHook lets the caller put the paced
+// loop into an audio thread's class (the app: time-constraint policy and an
+// audio work interval, start / finish per buffer with its deadline) without
+// platform code here.
+//
+// Load multiplier (Config::load = K, 1..kMaxLoad): every buffer is rendered
+// by K independent engines, each prepared for the case and fed the same
+// events, one after the other inside the timed interval; the first engine's
+// output and work counts are reported, the others render into scratch. The
+// work per buffer is then exactly K times the scene's, with K times its
+// working set (about 6 MB per engine), which shows whether a thread whose
+// core and clock the system chooses gets K times the work done in time.
+// Phase splits are the first engine's.
+//
+// CPU numbers (cpu_id.h) are read right before and after every measured
+// render call (outside the timed interval) and tallied per CPU.
+//
 // Phase timing (Config::phaseTiming) is the engine's run-time switch, the
 // same one the app's diagnostics use; bench_engine turns it on for its
 // per-phase breakdown and can run every case with it off as well, to
@@ -66,6 +103,7 @@
 #include <vector>
 
 #include "pm_engine/engine.h"
+#include "pm_host/cpu_id.h"
 
 namespace pm::bench {
 
@@ -81,6 +119,11 @@ struct Config {
     bool spin = false;        // paced only: busy-wait to the deadline instead of sleeping (core stays awake)
     std::size_t evictBytes = 0;  // paced only: scratch walked between buffers (0: none)
     int probeEvery = 0;       // > 0: the speed probe right before every Nth render call (untimed), as the host does
+    int load = 1;             // engines rendered per buffer (load multiplier, see above), 1..kMaxLoad
+    // Paced only: called on this thread (event: 0 begin, ns = period; 1
+    // before a render call, ns = time to its deadline; 2 after it; 3 end).
+    void (*paceHook)(void* ctx, int event, std::int64_t ns) = nullptr;
+    void* paceCtx = nullptr;
 };
 
 // Default eviction buffer of --paced-evict / PM_BENCH_PACED_EVICT: larger
@@ -88,10 +131,13 @@ struct Config {
 // 1-2 MiB per core) and than most last-level caches' share per core.
 inline constexpr std::size_t kDefaultEvictBytes = std::size_t{32} << 20;
 
+// Largest load multiplier: 8 engines of about 6 MB each.
+inline constexpr int kMaxLoad = 8;
+
 enum class Scene : int {
     Worst = 0, Typical = 1, Cluster = 2, Bloom = 3,
     Legato = 4, Pedalling = 5, ChordRelease = 6, Idle = 7,
-    HammerBurst = 8, PedalChords = 9, FreshBurst = 10, SameBurst = 11
+    HammerBurst = 8, PedalChords = 9, FreshBurst = 10, SameBurst = 11, PedalLift = 12
 };
 
 // Every event of a scene up to sample 'end' (sample-time stamps), in time
@@ -104,6 +150,7 @@ struct Case {
     Scene scene;
     bool board;
     QualityTier tier;
+    bool coldMotion = false;  // eviction walk before pedal-motion buffers (see "pedal lift, cold")
 };
 
 // Engine scenarios, in bench_engine's order.
@@ -129,6 +176,8 @@ struct BufferDetail {
     int hammersInContact = 0, maxHammersInContact = 0, hammerContactSamples = 0;
     int newtonEvals = 0, fallbackSolves = 0;
     int kernelRebuilds = 0, kernelKeyUpdates = 0, responseGroups = 0, damperUpdates = 0;
+    int approxResponses = 0;  // coupled-group responses from the damper expansion (over budget)
+    int groupsWoken = 0;      // sleeping coupled groups woken by loop input
     int hammerSamples = 0, hammerDampedSamples = 0;  // RenderInfo: hammer-samples stepped / with a damper on
     int awakeModes = 0, freeGroupBlocks = 0, forcedGroupBlocks = 0;
     int loopMembers = 0, loopListeners = 0, loopEntries = 0, outZones = 0;
@@ -146,8 +195,17 @@ struct ScenarioResult {
     bool hasPhases = false;
     Phases maxBuf, top1, all;  // the most expensive buffer, mean of the top 1 %, mean of all
     int maxIndex = 0, topCount = 0;
+    // Forced phase (phase timing only): the largest of any buffer and its
+    // ratio to the mean over all buffers (a spike in one phase that the
+    // most expensive buffer's split need not show).
+    double forcedMaxUs = 0.0, forcedMaxOverMean = 0.0;
+    int forcedMaxIndex = 0;
+    int coldBuffers = 0;  // coldMotion: buffers preceded by the eviction walk
     BufferDetail maxDetail;    // the most expensive buffer by wall time
     double kernelRebuildsPerBuffer = 0.0, kernelKeyUpdatesPerBuffer = 0.0;
+    // Most damper updates and exact / expanded coupled-group responses in
+    // one buffer over the run (RenderInfo).
+    int maxDamperUpdates = 0, maxResponseGroups = 0, maxApproxResponses = 0;
     // Means per buffer over the measured buffers (RenderInfo).
     double freeGroupBlocksPerBuffer = 0.0, forcedGroupBlocksPerBuffer = 0.0;
     double loopMembersMean = 0.0, loopListenersMean = 0.0;
@@ -163,14 +221,25 @@ struct ScenarioResult {
     // and mean (us). After a sleep it shows whether the core itself is
     // slower on waking (clock, power state) rather than its caches colder.
     int probeRuns = 0;
-    double probeMedianUs = 0.0, probeMeanUs = 0.0;
+    double probeMedianUs = 0.0, probeMeanUs = 0.0;  // the whole probe
+    struct ProbeStats {
+        int runs = 0;
+        double minUs = 0.0, medianUs = 0.0, meanUs = 0.0, maxUs = 0.0;
+    };
+    ProbeStats probeLatency, probeThroughput;  // its two parts (speed_probe.h)
+    host::CpuUsage cpu;  // CPUs of the measured render calls
+    int load = 1;                    // engines rendered per buffer
+    std::size_t engineBytes = 0;     // load > 1: memory of one prepared engine (object + aligned arrays)
     bool paced = false, spin = false;
     std::size_t evictBytes = 0;
 };
 
 // Configures 'eng' for the case (culling, soundboard, tier) and prepares it
-// (non-real-time, about a second).
-bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames);
+// (non-real-time, about a second). bytes (optional): the memory the prepared
+// engine holds, sizeof(Engine) plus its aligned arrays (measured as the
+// change of the process-wide aligned-array total, so only exact while no
+// other thread allocates aligned arrays at the same time).
+bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames, std::size_t* bytes = nullptr);
 
 // Prepares 'eng' for the case (culling, soundboard, tier) and runs it.
 // Returns false if the engine could not be prepared.

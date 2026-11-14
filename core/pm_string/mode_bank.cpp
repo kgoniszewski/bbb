@@ -25,6 +25,11 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
                     segWakeGain_.allocate(ns) && groupK0_.allocate(ng) && groupK1_.allocate(ng) &&
                     segInPrev_.allocate(ns) && groupH_.allocate(ng * kResponseTaps) &&
                     groupHValid_.allocate(ng) && groupH0_.allocate(ng * kResponseTaps) && groupH0Valid_.allocate(ng) && hList_.allocate(ng) &&
+                    groupHAmount_.allocate(ng) && groupD1_.allocate(ng * kResponseTaps) &&
+                    groupD2_.allocate(ng * kResponseTaps) && groupTaylorValid_.allocate(ng) &&
+                    groupApprox_.allocate(ng) && segApprox_.allocate(ns) && segDampTick_.allocate(ns) &&
+                    segT_.allocate(ns * 3 * kResponseTaps) && segAwakeVer_.allocate(ns) && segTVer_.allocate(ns) &&
+                    segTValid_.allocate(ns) &&
                     segCullScale_.allocate(ns) && segInputScale_.allocate(ns) &&
                     segDamp_.allocate(ns) && segInput_.allocate(ns) &&
                     scratch_.allocate(static_cast<std::size_t>(kCullInterval) * simd::kWidth);
@@ -35,6 +40,11 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
             groupStale_[g] = 0;
             groupSeg_[g] = 0;
             active_[g] = 0;
+            groupHValid_[g] = groupH0Valid_[g] = groupTaylorValid_[g] = groupApprox_[g] = 0;
+        }
+        for (std::size_t i = 0; i < ns; ++i) {
+            segApprox_[i] = segTValid_[i] = 0;
+            segDampTick_[i] = segAwakeVer_[i] = segTVer_[i] = 0;
         }
     }
     activeCount_ = 0;
@@ -43,6 +53,12 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
     sinceCull_ = 0;
     groupBlocks_ = 0;
     forcedBlocks_ = 0;
+    groupsWoken_ = 0;
+    responseGroups_ = approxGroups_ = 0;
+    tick_ = 0;
+    budget_ = tickBudget_ = -1;
+    tickDemand_ = 0;
+    refineCursor_ = 0;
     return ok;
 }
 
@@ -126,7 +142,7 @@ void ModeBank::applyDamper(int i) noexcept {
         s = static_cast<int>(std::upper_bound(segGroups_.data(), segGroups_.data() + nSeg_ + 1, g) -
                              segGroups_.data()) - 1;
     const float am1 = damperAm1(segDamp_[s] * dampRate_[i]);
-    invalidateResponse(g, true);
+    invalidateResponse(g);
     dampAm1_[i] = am1;
     dr_[i] = dr0_[i] + am1 + dr0_[i] * am1;
     ci_[i] = ci0_[i] * (1.0f + am1);
@@ -136,7 +152,12 @@ void ModeBank::setSegmentDamper(int s, float amount) noexcept {
     amount = std::max(amount, 0.0f);
     if (segDamp_[s] == amount) return;
     segDamp_[s] = amount;
-    for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) invalidateResponse(g, false);
+    // The cached responses keep the amount they were computed for (see
+    // coupledResponse); only the segment's response is out of date.
+    ++segVersion_[s];
+    segDampTick_[s] = tick_;
+    if (amount != 0.0f)
+        for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) tickDemand_ += active_[g];
     for (int g = segFirstGroup(s); g < segFirstGroup(s + 1); ++g) {
         if (active_[g]) refreshGroup(g);
         else groupStale_[g] = 1;
@@ -148,15 +169,15 @@ void ModeBank::refreshGroup(int g) noexcept {
     const float amount = segDamp_[singleSegment_ ? 0 : groupSeg_[g]];
     const int i0 = g * kGroupSize;
     float x[kGroupSize];
-    bool series = true;
+    int outside = 0;  // an integer OR (not a short-circuit chain), so the loop vectorises
     for (int j = 0; j < kGroupSize; ++j) {
         x[j] = amount * dampRate_[i0 + j];
-        series = series && x[j] < 0.05f;
+        outside |= x[j] >= 0.05f ? 1 : 0;
     }
     // The usual case (every x in the series range) as a branch-free loop
     // the compiler vectorises; damperAm1() evaluates the same expression.
     float am1[kGroupSize];
-    if (series)
+    if (!outside)
         for (int j = 0; j < kGroupSize; ++j)
             am1[j] = -x[j] * (1.0f - x[j] * (0.5f - x[j] * (1.0f / 6.0f - x[j] * (1.0f / 24.0f))));
     else
@@ -203,7 +224,7 @@ void ModeBank::setWeights(int i, float wInRe, float wInIm, float wOut) noexcept 
     wInIm_[i] = wInIm;
     wOut_[i] = wOut;
     updateGroupGain(i / kGroupSize);
-    invalidateResponse(i / kGroupSize, true);
+    invalidateResponse(i / kGroupSize);
 }
 
 void ModeBank::setState(int i, float re, float im) noexcept {
@@ -414,58 +435,182 @@ void ModeBank::processSegmentsFree(SegmentIO* io, int nFrames, Kernel kernel) no
     }
 }
 
-bool ModeBank::coupledResponse(int s, float* h, float* k1, Kernel kernel) noexcept {
+void ModeBank::computeResponses(const int* list, int n, bool lifted, Kernel kernel) noexcept {
     constexpr int T = kResponseTaps;
-    // With the damper lifted the coefficients are the free ones: the lifted
-    // cache applies (its rows were computed with the same float values).
-    const bool lifted = segDamp_[s] == 0.0f;
     float* cache = lifted ? groupH0_.data() : groupH_.data();
     std::uint8_t* valid = lifted ? groupH0Valid_.data() : groupHValid_.data();
+    const detail::BankView view{zr_.data(), zi_.data(), dr_.data(),  ci_.data(),
+                                wIn_.data(), wInIm_.data(), wOut_.data()};
+    responseGroups_ += static_cast<std::uint64_t>(n);
+    // Responses of consecutive groups land in consecutive rows (the usual
+    // case: a damper change), one kernel call per run.
+    int a = 0;
+    while (a < n) {
+        int b = a + 1;
+        while (b < n && list[b] == list[b - 1] + 1) ++b;
+        float* row = cache + std::size_t(list[a]) * T;
+        if (kernel == Kernel::Simd)
+            detail::impulseSimd(view, list + a, b - a, row + 1, T, T - 1);
+        else
+            detail::impulseScalar(view, list + a, b - a, row + 1, T, T - 1);
+        for (int q = a; q < b; ++q) {
+            const int g = list[q];
+            float h0 = 0.0f;
+            for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i) h0 += wOut_[i] * wInIm_[i];
+            cache[std::size_t(g) * T] = h0;
+            valid[g] = 1;
+            if (!lifted) groupHAmount_[g] = segDamp_[groupSeg_[g]];
+        }
+        a = b;
+    }
+}
+
+bool ModeBank::coupledResponse(int s, float* h, float* k1, Kernel kernel, bool* exact) noexcept {
+    constexpr int T = kResponseTaps;
+    const float amount = segDamp_[s];
+    // With the damper lifted the coefficients are the free ones: the lifted
+    // cache applies (its rows were computed with the same float values).
+    const bool lifted = amount == 0.0f;
     int nActive = 0, nStale = 0;
+    bool expandable = true;
     for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) {
         if (!active_[g]) continue;
         activeList_[nActive++] = g;
-        if (!valid[g]) hList_[nStale++] = g;
-    }
-    if (nActive == 0) return false;
-    responseGroups_ += static_cast<std::uint64_t>(nStale);
-    if (nStale > 0) {
-        // Responses of consecutive stale groups land in consecutive rows
-        // when the groups are consecutive (the usual case: a damper change).
-        const detail::BankView view{zr_.data(), zi_.data(), dr_.data(),  ci_.data(),
-                                    wIn_.data(), wInIm_.data(), wOut_.data()};
-        int a = 0;
-        while (a < nStale) {
-            int b = a + 1;
-            while (b < nStale && hList_[b] == hList_[b - 1] + 1) ++b;
-            float* row = cache + std::size_t(hList_[a]) * T;
-            if (kernel == Kernel::Simd)
-                detail::impulseSimd(view, hList_.data() + a, b - a, row + 1, T, T - 1);
-            else
-                detail::impulseScalar(view, hList_.data() + a, b - a, row + 1, T, T - 1);
-            for (int q = a; q < b; ++q) {
-                const int g = hList_[q];
-                float h0 = 0.0f;
-                for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i) h0 += wOut_[i] * wInIm_[i];
-                cache[std::size_t(g) * T] = h0;
-                valid[g] = 1;
-            }
-            a = b;
+        groupApprox_[g] = 0;
+        const bool stale = lifted ? !groupH0Valid_[g] : !groupHValid_[g] || groupHAmount_[g] != amount;
+        if (stale) {
+            hList_[nStale++] = g;
+            expandable = expandable && groupTaylorValid_[g];
         }
     }
+    // Exact responses for the stale groups, if the tick's budget covers all
+    // of them: not for a key whose damper moved this tick when the tick's
+    // damper changes as a whole exceed the budget (a pedal stroke: the
+    // budget then goes to keys at rest, refineResponses). Without the
+    // expansion rows (a bank not set up by precomputeCoupledResponses) and
+    // for the lifted cache, always exact.
+    bool approx = false;
+    if (nStale > 0 && !lifted && expandable && budget_ >= 0) {
+        const bool moving = segDampTick_[s] == tick_;
+        approx = nStale > budget_ || (moving && tickDemand_ > tickBudget_);
+    }
+    segApprox_[s] = approx ? 1 : 0;
+    if (exact) *exact = !approx;
+    if (nActive == 0) return false;
+    if (nStale > 0 && !approx) {
+        computeResponses(hList_.data(), nStale, lifted, kernel);
+        if (budget_ > 0) budget_ = std::max(0, budget_ - nStale);
+    }
     float K0 = 0.0f, K1 = 0.0f;
-    for (int k = 0; k < T; ++k) h[k] = 0.0f;
     for (int q = 0; q < nActive; ++q) {
-        const int g = activeList_[q];
-        K0 += groupK0_[g];
-        K1 += groupK1_[g];
-        const float* row = cache + std::size_t(g) * T;
-        for (int k = 0; k < T; ++k) h[k] += row[k];
+        K0 += groupK0_[activeList_[q]];
+        K1 += groupK1_[activeList_[q]];
+    }
+    const float d = std::min(amount, 1.0f);
+    if (approx && nStale == nActive) {
+        // Every awake group expanded (a key whose damper moves): the
+        // expansion rows summed over the awake set, kept while it lasts.
+        float* t = segT_.data() + std::size_t(s) * 3 * T;
+        if (!segTValid_[s] || segTVer_[s] != segAwakeVer_[s]) {
+            for (int k = 0; k < 3 * T; ++k) t[k] = 0.0f;
+            for (int q = 0; q < nActive; ++q) {
+                const std::size_t r = std::size_t(activeList_[q]) * T;
+                const float* h0 = groupH0_.data() + r;
+                const float* d1 = groupD1_.data() + r;
+                const float* d2 = groupD2_.data() + r;
+                for (int k = 0; k < T; ++k) {
+                    t[k] += h0[k];
+                    t[T + k] += d1[k];
+                    t[2 * T + k] += d2[k];
+                }
+            }
+            segTValid_[s] = 1;
+            segTVer_[s] = segAwakeVer_[s];
+        }
+        for (int k = 0; k < T; ++k) h[k] = t[k] + d * (t[T + k] + d * t[2 * T + k]);
+        for (int q = 0; q < nActive; ++q) groupApprox_[activeList_[q]] = 1;
+        approxGroups_ += static_cast<std::uint64_t>(nActive);
+    } else {
+        if (approx)
+            for (int q = 0; q < nStale; ++q) groupApprox_[hList_[q]] = 1;
+        const float* cache = lifted ? groupH0_.data() : groupH_.data();
+        for (int k = 0; k < T; ++k) h[k] = 0.0f;
+        for (int q = 0; q < nActive; ++q) {
+            const int g = activeList_[q];
+            const std::size_t r = std::size_t(g) * T;
+            if (groupApprox_[g]) {
+                ++approxGroups_;
+                const float* h0 = groupH0_.data() + r;
+                const float* d1 = groupD1_.data() + r;
+                const float* d2 = groupD2_.data() + r;
+                for (int k = 0; k < T; ++k) h[k] += h0[k] + d * (d1[k] + d * d2[k]);
+            } else {
+                const float* row = cache + r;
+                for (int k = 0; k < T; ++k) h[k] += row[k];
+            }
+        }
     }
     h[0] -= K0;
     h[1] -= K1;
     *k1 = K1;
     return true;
+}
+
+void ModeBank::refineResponses(Kernel kernel) noexcept {
+    if (budget_ <= 0 || nSeg_ == 0) return;
+    // Keep what this tick's own damper changes need, when they fit.
+    const int reserve = tickDemand_ <= tickBudget_ ? tickDemand_ : 0;
+    int avail = budget_ - reserve;
+    if (avail <= 0) return;
+    budget_ = reserve;
+    for (int c = 0; c < nSeg_; ++c) {
+        const int s = (refineCursor_ + c) % nSeg_;
+        // Still moving: the sustain pedal moves a damper on every second tick.
+        if (!segApprox_[s] || tick_ - segDampTick_[s] < 2u) continue;
+        const float amount = segDamp_[s];
+        int n = 0;
+        bool more = false;
+        for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) {
+            if (!active_[g] || (groupHValid_[g] && groupHAmount_[g] == amount)) continue;
+            if (n == avail) {
+                more = true;
+                break;
+            }
+            hList_[n++] = g;
+        }
+        if (n > 0) {
+            computeResponses(hList_.data(), n, false, kernel);
+            ++segVersion_[s];  // re-summed at its next coupledResponse
+            avail -= n;
+        } else {
+            segApprox_[s] = 0;  // its approximate groups went to sleep
+        }
+        if (more || avail == 0) {
+            refineCursor_ = more ? s : (s + 1) % nSeg_;
+            break;
+        }
+    }
+    budget_ += avail;  // unspent: left to the loop's wake-ups this tick
+}
+
+void ModeBank::resetResponses() noexcept {
+    for (int g = 0; g < groupCount(); ++g) groupHValid_[g] = groupApprox_[g] = 0;
+    for (int s = 0; s < nSeg_; ++s) {
+        segApprox_[s] = 0;
+        segDampTick_[s] = 0;
+    }
+    tick_ = 0;
+    budget_ = -1;
+    refineCursor_ = 0;
+}
+
+int ModeBank::approximateGroups() const noexcept {
+    int n = 0;
+    for (int s = 0; s < nSeg_; ++s) {
+        if (!segApprox_[s]) continue;
+        for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) n += active_[g] && groupApprox_[g];
+    }
+    return n;
 }
 
 void ModeBank::precomputeCoupledResponses() noexcept {
@@ -480,6 +625,28 @@ void ModeBank::precomputeCoupledResponses() noexcept {
             for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i) h0 += wOut_[i] * wInIm_[i];
             row[0] = h0;
             groupH0Valid_[g] = 1;
+            // Expansion rows, in double from the float coefficients the
+            // kernels use: m_k = sum wOut r^j Im(c0^k wIn), j = 1, 2.
+            double m1[T] = {}, m2[T] = {};
+            for (int i = g * kGroupSize; i < (g + 1) * kGroupSize; ++i) {
+                const double r = dampRate_[i];
+                if (wOut_[i] == 0.0f || r == 0.0) continue;
+                const std::complex<double> c(1.0 + double(dr0_[i]), double(ci0_[i]));
+                std::complex<double> z(wIn_[i], wInIm_[i]);
+                for (int k = 0; k < T; ++k) {
+                    const double y = double(wOut_[i]) * z.imag();
+                    m1[k] += r * y;
+                    m2[k] += r * r * y;
+                    z *= c;
+                }
+            }
+            float* d1 = groupD1_.data() + std::size_t(g) * T;
+            float* d2 = groupD2_.data() + std::size_t(g) * T;
+            for (int k = 0; k < T; ++k) {
+                d1[k] = static_cast<float>(-double(k) * m1[k]);
+                d2[k] = static_cast<float>(0.5 * double(k) * double(k) * m2[k]);
+            }
+            groupTaylorValid_[g] = 1;
         }
 }
 
@@ -513,7 +680,17 @@ void ModeBank::applyCoupledInput(int s, const float* u, int n, Kernel kernel) no
 // correction, which joins at the same time, then cancels it: no force step
 // reaches the board), advanced with the rest of the sub-block's input. The
 // group's output over the rest of the sub-block is missing from the loop.
-// Rare: double precision, one mode at a time.
+// Double precision. Not rare: when the pedal lifts the dampers off strings
+// that still ring, a hundred groups or more can wake in one sub-block (the
+// input summed since the cull pass crosses their bounds as soon as the
+// damper's raised input threshold drops), and done one mode after the
+// other each mode's recursion is a serial chain of dependent double
+// operations, latency-bound: about 150 us extra in such a buffer on an M2
+// performance core, back to back (plan §4.1). The group's modes are therefore advanced together, as
+// independent lanes the compiler vectorises, with exactly the operations
+// of the complex expression z = c z + w u (product terms rounded the same
+// way, the same sum order), so the state is bit for bit what the per-mode
+// std::complex loop gave. The start-up value keeps std::complex division.
 void ModeBank::wakeCoupled(int s, float inputBefore, const float* u, int n) noexcept {
     const float thr = cullThreshold_ * segInputScale_[s];
     for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) {
@@ -526,16 +703,49 @@ void ModeBank::wakeCoupled(int s, float inputBefore, const float* u, int n) noex
         }
         if (i == n) continue;
         if (groupStale_[g]) refreshGroup(g);
-        for (int m = g * kGroupSize; m < (g + 1) * kGroupSize; ++m) {
+        const int m0 = g * kGroupSize;
+        alignas(64) double zr[kGroupSize], zi[kGroupSize], cr[kGroupSize], cim[kGroupSize], wr[kGroupSize],
+            wi[kGroupSize];
+        for (int j = 0; j < kGroupSize; ++j) {
+            const int m = m0 + j;
             const std::complex<double> w(wIn_[m], wInIm_[m]);
-            std::complex<double> z = 0.0;
-            if (w != 0.0) {
-                const std::complex<double> c(1.0 + double(dr_[m]), double(ci_[m]));
-                z = w * double(u[i]) / (1.0 - c);
-                for (int k = i + 1; k < n; ++k) z = c * z + w * double(u[k]);
+            const std::complex<double> c(1.0 + double(dr_[m]), double(ci_[m]));
+            const std::complex<double> z = w == 0.0 ? std::complex<double>(0.0) : w * double(u[i]) / (1.0 - c);
+            zr[j] = z.real();
+            zi[j] = z.imag();
+            cr[j] = c.real();
+            cim[j] = c.imag();
+            wr[j] = w.real();
+            wi[j] = w.imag();
+        }
+        // A mode with w = 0 starts at +0 and stays there (every product and
+        // sum below is then +-0, and +0 + -0 = +0), as it was never advanced.
+        // Separate statements: c z is rounded term by term as the complex
+        // product is (no contraction across statements where only
+        // in-expression contraction is allowed; where any is, it is applied
+        // as it was to the lowered complex product).
+        for (int k = i + 1; k < n; ++k) {
+            const double uk = double(u[k]);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC unroll 1
+#endif
+            for (int j = 0; j < kGroupSize; ++j) {
+                const double t1 = cr[j] * zr[j];
+                const double t2 = cim[j] * zi[j];
+                const double rr = t1 - t2;
+                const double t3 = cr[j] * zi[j];
+                const double t4 = cim[j] * zr[j];
+                const double ri = t3 + t4;
+                const double pr = wr[j] * uk;
+                const double pi = wi[j] * uk;
+                zr[j] = rr + pr;
+                zi[j] = ri + pi;
             }
-            zr_[m] = static_cast<float>(z.real());
-            zi_[m] = static_cast<float>(z.imag());
+        }
+        ++groupsWoken_;
+        for (int j = 0; j < kGroupSize; ++j) {
+            zr_[m0 + j] = static_cast<float>(zr[j]);
+            zi_[m0 + j] = static_cast<float>(zi[j]);
         }
         setActive(g, 1);
     }
@@ -553,6 +763,7 @@ void ModeBank::wakeAllCoupled(int s, float u) noexcept {
             zr_[m] = static_cast<float>(z.real());
             zi_[m] = static_cast<float>(z.imag());
         }
+        ++groupsWoken_;
         setActive(g, 1);
     }
 }

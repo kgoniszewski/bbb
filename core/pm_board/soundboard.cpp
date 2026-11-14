@@ -302,7 +302,8 @@ bool CouplingLoop::configure(const KeyZone* kz, int keys, int zones, int taps) n
     });
     entPad_ = (nEnt_ + simd::kWidth - 1) / simd::kWidth * simd::kWidth;
     const std::size_t ep = static_cast<std::size_t>(entPad_);  // bounds the packed width
-    if (!h_.allocate(std::size_t{kMaxKeys} * kMaxBlock) || !G_.allocate(kMaxBlock * ep) ||
+    if (!h_.allocate(std::size_t{kMaxKeys} * kMaxBlock) || !dh_.allocate(std::size_t{kMaxKeys} * kMaxBlock) ||
+        !G_.allocate(kMaxBlock * ep) || !Gref_.allocate(kMaxBlock * ep) ||
         !dE_.allocate(kMaxBlock * ep) || !acc_.allocate(ep) || !d_.allocate((kMaxBlock + 1) * std::size_t{kZ}) ||
         !f0_.allocate(kMaxBlock * std::size_t{kZ + kMaxTaps}) || !u_.allocate(kMaxBlock))
         return false;
@@ -318,7 +319,8 @@ void CouplingLoop::reset() noexcept {
     for (int z = 0; z < kZ; ++z) zoneOut_[z] = zoneOutPrev_[z] = false;
     for (int i = 0; i <= kMaxBlock; ++i)
         for (int z = 0; z < kZ; ++z) d_[i * kZ + z] = 0.0f;
-    nMembers_ = nListen_ = nOut_ = nChanged_ = 0;
+    nMembers_ = nListen_ = nOut_ = nChanged_ = nDelta_ = 0;
+    for (bool& c : colDelta_) c = false;
     dirty_ = true;
 }
 
@@ -339,17 +341,16 @@ inline void addColumn(float* G, std::size_t ep, int e, float w, const float* h) 
 }
 }  // namespace
 
-void CouplingLoop::rebuildKernel() noexcept {
-    ++rebuilds_;
-    // Pack the entries the members use.
-    for (int e = 0; e < nEnt_; ++e) packed_[e] = -1;
-    nAct_ = 0;
+// The entries the members use, in order of first use by the members in
+// ascending key order (each key: its zone pairs, then its tap entries).
+int CouplingLoop::packEntries(int* ent) const noexcept {
+    bool seen[kMaxEntries + kMaxTaps * kZ];
+    for (int e = 0; e < nEnt_; ++e) seen[e] = false;
+    int n = 0;
     auto use = [&](int e) {
-        if (packed_[e] < 0) {
-            packed_[e] = nAct_;
-            actDst_[nAct_] = entDst_[e];
-            actSrc_[nAct_] = entSrc_[e];
-            ++nAct_;
+        if (!seen[e]) {
+            seen[e] = true;
+            ent[n++] = e;
         }
     };
     for (int m = 0; m < nMembers_; ++m) {
@@ -358,6 +359,31 @@ void CouplingLoop::rebuildKernel() noexcept {
             if (keyEnt_[k][q] >= 0) use(keyEnt_[k][q]);
         for (int t = 0; t < taps_; ++t)
             for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a) use(tapEnt_[t][kz_[k].z0 + a]);
+    }
+    return n;
+}
+
+bool CouplingLoop::samePacking() const noexcept {
+    int ent[kMaxEntries + kMaxTaps * kZ];
+    const int n = packEntries(ent);
+    if (n != nAct_) return false;
+    for (int i = 0; i < n; ++i)
+        if (ent[i] != actEnt_[i]) return false;
+    return true;
+}
+
+void CouplingLoop::rebuildKernel() noexcept {
+    ++rebuilds_;
+    for (int e = 0; e < nEnt_; ++e) {
+        packed_[e] = -1;
+        colDelta_[e] = false;
+    }
+    nAct_ = packEntries(actEnt_);
+    for (int i = 0; i < nAct_; ++i) {
+        const int e = actEnt_[i];
+        packed_[e] = i;
+        actDst_[i] = entDst_[e];
+        actSrc_[i] = entSrc_[e];
     }
     actPad_ = (nAct_ + simd::kWidth - 1) / simd::kWidth * simd::kWidth;
     const std::size_t ep = static_cast<std::size_t>(actPad_);
@@ -374,7 +400,7 @@ void CouplingLoop::rebuildKernel() noexcept {
                 addColumn(G_.data(), ep, packed_[tapEnt_[t][kz_[k].z0 + a]], entryWeight(k, 4 + 2 * t + a), h);
     }
     dirty_ = false;
-    nChanged_ = 0;
+    nChanged_ = nDelta_ = 0;
 }
 
 // The member set is unchanged and only the keys in changed_ have a new h:
@@ -397,11 +423,29 @@ void CouplingLoop::updateColumns() noexcept {
         for (int t = 0; t < taps_; ++t)
             for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a) mark(tapEnt_[t][kz_[k].z0 + a]);
     }
-    keyUpdates_ += static_cast<std::uint64_t>(nChanged_);
+    keyUpdates_ += static_cast<std::uint64_t>(nChanged_ + nDelta_);
+    deltaUpdates_ += static_cast<std::uint64_t>(nDelta_);
     nChanged_ = 0;
+    // Approximate changes go to the columns not re-summed below (a re-summed
+    // column already holds every member's current h).
+    for (int c = 0; c < nDelta_; ++c) {
+        const int k = delta_[c];
+        const float* dh = dh_.data() + std::size_t(k) * kMaxBlock;
+        auto add = [&](int e, int code) {
+            if (colDirty_[e]) return;
+            addColumn(G_.data(), ep, packed_[e], entryWeight(k, code), dh);
+            colDelta_[e] = true;
+        };
+        for (int q = 0; q < 4; ++q)
+            if (keyEnt_[k][q] >= 0) add(keyEnt_[k][q], q);
+        for (int t = 0; t < taps_; ++t)
+            for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a) add(tapEnt_[t][kz_[k].z0 + a], 4 + 2 * t + a);
+    }
+    nDelta_ = 0;
     for (int c = 0; c < nCols; ++c) {
         const int e = cols[c];
         colDirty_[e] = false;
+        colDelta_[e] = false;
         const int col = packed_[e];
         for (int j = 0; j < kMaxBlock; ++j) G_[j * ep + col] = 0.0f;
         for (int i = entFirst_[e]; i < entFirst_[e + 1]; ++i) {
@@ -409,6 +453,32 @@ void CouplingLoop::updateColumns() noexcept {
             if (member_[k]) addColumn(G_.data(), ep, col, entryWeight(k, entCode_[i]), h_.data() + std::size_t(k) * kMaxBlock);
         }
     }
+}
+
+int CouplingLoop::deltaColumns() const noexcept {
+    int n = 0;
+    for (int i = 0; i < nAct_; ++i) n += colDelta_[actEnt_[i]] ? 1 : 0;
+    return n;
+}
+
+bool CouplingLoop::kernelMatchesRebuild() noexcept {
+    const std::size_t ep = static_cast<std::size_t>(actPad_);
+    if (dirty_) return false;
+    int ent[kMaxEntries + kMaxTaps * kZ];
+    if (packEntries(ent) != nAct_) return false;
+    for (std::size_t i = 0; i < kMaxBlock * ep; ++i) Gref_[i] = 0.0f;
+    for (int m = 0; m < nMembers_; ++m) {
+        const int k = members_[m];
+        const float* h = h_.data() + std::size_t(k) * kMaxBlock;
+        for (int q = 0; q < 4; ++q)
+            if (keyEnt_[k][q] >= 0) addColumn(Gref_.data(), ep, packed_[keyEnt_[k][q]], entryWeight(k, q), h);
+        for (int t = 0; t < taps_; ++t)
+            for (int a = 0; a < (kz_[k].w1 != 0.0f ? 2 : 1); ++a)
+                addColumn(Gref_.data(), ep, packed_[tapEnt_[t][kz_[k].z0 + a]], entryWeight(k, 4 + 2 * t + a), h);
+    }
+    for (std::size_t i = 0; i < kMaxBlock * ep; ++i)
+        if (Gref_[i] != G_[i]) return false;
+    return true;
 }
 
 void CouplingLoop::begin(ModeBank& bank, const Soundboard& board, const SegmentIO* io, Kernel kernel) noexcept {
@@ -451,26 +521,44 @@ void CouplingLoop::begin(ModeBank& bank, const Soundboard& board, const SegmentI
 
     // Members and impulse responses.
     int nm = 0;
+    bool joined = false;
     for (int k = 0; k < keys_; ++k) {
         bool mem = false;
         if (listen_[k] && !io[k].skip) {
             const std::uint32_t v = bank.coupledVersion(k);
             if (v != ver_[k] || !hasH_[k]) {
-                hasH_[k] = bank.coupledResponse(k, h_.data() + std::size_t(k) * kMaxBlock, &k1_[k], kernel);
+                float* h = h_.data() + std::size_t(k) * kMaxBlock;
+                float* dh = dh_.data() + std::size_t(k) * kMaxBlock;
+                const bool had = hasH_[k] && member_[k];
+                if (had)
+                    for (int j = 0; j < kMaxBlock; ++j) dh[j] = h[j];
+                bool exact = true;
+                hasH_[k] = bank.coupledResponse(k, h, &k1_[k], kernel, &exact);
                 ver_[k] = v;
-                // A member whose h changed: its columns (if it stays a member).
-                if (hasH_[k] && member_[k]) changed_[nChanged_++] = k;
-                else if (hasH_[k] || member_[k]) dirty_ = true;
+                // A member whose h changed: its columns (if it stays a
+                // member); the change only, while h is approximate.
+                if (hasH_[k] && had) {
+                    if (exact || alwaysRebuild_) {
+                        changed_[nChanged_++] = k;
+                    } else {
+                        for (int j = 0; j < kMaxBlock; ++j) dh[j] = h[j] - dh[j];
+                        delta_[nDelta_++] = k;
+                    }
+                }
             }
             mem = hasH_[k];
         }
-        if (mem != member_[k]) dirty_ = true;
+        // A key that joins or leaves: its columns, if the packing stays.
+        if (mem != member_[k]) {
+            joined = true;
+            changed_[nChanged_++] = k;
+        }
         member_[k] = mem;
         if (mem) members_[nm++] = k;
     }
     nMembers_ = nm;
-    if (dirty_ || (alwaysRebuild_ && nChanged_ > 0)) rebuildKernel();
-    else if (nChanged_ > 0) updateColumns();
+    if (dirty_ || (alwaysRebuild_ && nChanged_ > 0) || (joined && !samePacking())) rebuildKernel();
+    else if (nChanged_ > 0 || nDelta_ > 0) updateColumns();
 }
 
 void CouplingLoop::collect(ModeBank& bank, const SegmentIO* io, int n) noexcept {

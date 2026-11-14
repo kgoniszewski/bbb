@@ -25,7 +25,14 @@ uint32_t pm_api_version(void) {
     return (PM_API_VERSION_MAJOR << 16) | (PM_API_VERSION_MINOR << 8) | PM_API_VERSION_PATCH;
 }
 
-const char* pm_version_string(void) { return "0.10.0 (M4, app host, diagnostics, phase timing, speed probe, benchmark, pacing, audio-thread scenes)"; }
+#define PM_STR_(x) #x
+#define PM_STR(x) PM_STR_(x)
+// The number comes from the version macros, so the two cannot drift apart.
+const char* pm_version_string(void) {
+    return PM_STR(PM_API_VERSION_MAJOR) "." PM_STR(PM_API_VERSION_MINOR) "." PM_STR(PM_API_VERSION_PATCH)
+        " (M4, app host, diagnostics, phase timing, speed probe, benchmark, pacing, audio-thread scenes, "
+        "per-CPU statistics, headroom test, damper-response budget)";
+}
 
 pm_engine* pm_engine_create(void) {
     pm_engine* e = new (std::nothrow) pm_engine();

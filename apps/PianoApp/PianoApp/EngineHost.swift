@@ -170,6 +170,9 @@ final class EngineHost {
         return w
     }
 
+    /// The CPU the calling thread runs on now (-1: unknown).
+    static var currentCpu: Int { Int(pm_current_cpu()) }
+
     /// The engine's effective configuration, one "key value" per line.
     func describeEngine() -> String {
         var buf = [CChar](repeating: 0, count: 4096)
@@ -183,12 +186,14 @@ final class EngineHost {
     /// on the prepare queue (it closes the prepare gate briefly, and with
     /// PM_BENCH_SCENE_FRESH_ENGINE prepares a private engine first); calls
     /// completion on the main thread.
-    func startScene(config: pm_bench_config, item: Int, completion: @escaping (Bool) -> Void) {
+    /// load: engines rendered per buffer (pm_host_scene_start_load; > 1
+    /// prepares that many benchmark engines first, about a second each).
+    func startScene(config: pm_bench_config, item: Int, load: Int, completion: @escaping (Bool) -> Void) {
         let hostBits = Int(bitPattern: raw)
         prepareQueue.async { [self] in
             var c = config
             let ok = withExtendedLifetime(self) {
-                pm_host_scene_start(OpaquePointer(bitPattern: hostBits), &c, Int32(item)) == 1
+                pm_host_scene_start_load(OpaquePointer(bitPattern: hostBits), &c, Int32(item), Int32(load)) == 1
             }
             DispatchQueue.main.async {
                 completion(ok)
@@ -203,6 +208,14 @@ final class EngineHost {
     }
 
     func cancelScene() { pm_host_scene_cancel(raw) }
+
+    /// The finished scene's load multiplier, memory per engine and where in
+    /// the buffer the render calls changed CPU.
+    func sceneLoad() -> pm_scene_load {
+        var l = pm_scene_load()
+        pm_host_scene_get_load(raw, &l)
+        return l
+    }
 
     /// The configuration of the engine the scene runs on (captured at its start).
     func sceneConfig() -> String {
@@ -224,6 +237,53 @@ final class EngineHost {
     static func runSpeedProbe(runs: Int) -> pm_speed_probe_stats {
         var s = pm_speed_probe_stats()
         _ = pm_speed_probe_run_us(Int32(runs), &s)
+        return s
+    }
+
+    /// The audio-thread probe's latency-bound and throughput-bound parts.
+    func speedProbeSplit() -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        pm_host_get_speed_probe_split(raw, &s)
+        return s
+    }
+
+    /// Both parts on the calling thread (non-real-time).
+    static func runSpeedProbeSplit(runs: Int) -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        _ = pm_speed_probe_run_split(Int32(runs), &s)
+        return s
+    }
+
+    /// Which CPUs the render calls ran on (live meter, since the last reset).
+    func cpuUsage() -> pm_cpu_usage {
+        var u = pm_cpu_usage()
+        pm_host_get_cpu_usage(raw, &u)
+        return u
+    }
+
+    /// The finished scene run's CPUs and probe parts.
+    func sceneCpuUsage() -> pm_cpu_usage {
+        var u = pm_cpu_usage()
+        pm_host_scene_get_cpu_usage(raw, &u)
+        return u
+    }
+
+    func sceneProbeSplit() -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        pm_host_scene_get_probe_split(raw, &s)
+        return s
+    }
+
+    /// The last benchmark scenario run on the calling thread.
+    static func benchLastCpuUsage() -> pm_cpu_usage {
+        var u = pm_cpu_usage()
+        pm_bench_last_cpu_usage(&u)
+        return u
+    }
+
+    static func benchLastProbeSplit() -> pm_speed_probe_split {
+        var s = pm_speed_probe_split()
+        pm_bench_last_probe_split(&s)
         return s
     }
 

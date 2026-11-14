@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <memory>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -218,6 +220,42 @@ void sceneEvents(Scene s, double fs, std::uint64_t end, std::vector<Event>& out)
             }
             break;
         }
+        case Scene::PedalLift: {
+            // Pedal down; four keys held throughout (re-struck every 2.4 s);
+            // a 12-note chord over both hands every 1.2 s, released 0.2 s
+            // later into the pedal. Every 0.6 s, from 0.9 s, the pedal comes
+            // up for 150 ms and goes down again; three notes are struck 20 ms
+            // after it starts down. Odd changes send CC64 as plain 0 / 127,
+            // even ones as ramps (up over 40 ms in 12 steps, down over 60 ms
+            // in 16 steps).
+            const int held[4] = {33, 45, 52, 57};
+            const int chord[12] = {28, 35, 40, 47, 55, 59, 64, 67, 71, 76, 79, 88};
+            const int lead[6][3] = {{60, 72, 84}, {62, 74, 86}, {58, 70, 82}, {65, 77, 89}, {63, 75, 87}, {61, 73, 85}};
+            add(0, EventType::Sustain, 0, 127);
+            for (std::uint64_t b = 0; b < end; b += at(2.4))
+                for (int n : held) add(b, EventType::NoteOn, n, 80);
+            for (int c = 0; at(1.2 * c) < end; ++c)
+                for (int j = 0; j < 12; ++j) {
+                    const double t = 1.2 * c + 0.004 * j;
+                    add(at(t), EventType::NoteOn, chord[j], 75 + (5 * j + 11 * c) % 40);
+                    add(at(t + 0.2), EventType::NoteOff, chord[j], 64);
+                }
+            for (int c = 0; at(0.9 + 0.6 * c) < end; ++c) {
+                const double up = 0.9 + 0.6 * c, down = up + 0.15;
+                if (c % 2) {
+                    add(at(up), EventType::Sustain, 0, 0);
+                    add(at(down), EventType::Sustain, 0, 127);
+                } else {
+                    for (int j = 1; j <= 12; ++j) add(at(up + 0.040 * (j - 1) / 11.0), EventType::Sustain, 0, 127 - 127 * j / 12);
+                    for (int j = 1; j <= 16; ++j) add(at(down + 0.060 * (j - 1) / 15.0), EventType::Sustain, 0, 127 * j / 16);
+                }
+                for (int n : lead[c % 6]) {
+                    add(at(down + 0.020), EventType::NoteOn, n, 85 + 7 * (c % 4));
+                    add(at(down + 0.35), EventType::NoteOff, n, 64);
+                }
+            }
+            break;
+        }
         case Scene::Idle:
             break;
     }
@@ -250,6 +288,8 @@ BufferDetail detailOf(const RenderInfo& i) {
     d.kernelKeyUpdates = i.kernelKeyUpdates;
     d.responseGroups = i.responseGroups;
     d.damperUpdates = i.damperUpdates;
+    d.approxResponses = i.approxResponses;
+    d.groupsWoken = i.groupsWoken;
     d.hammerSamples = i.hammerSamples;
     d.hammerDampedSamples = i.hammerDampedSamples;
     d.awakeModes = i.awakeModes;
@@ -274,7 +314,7 @@ void accumulate(Phases& acc, const Phases& p, double w) {
 
 // The realistic scenes are appended after the tier cases, so that the
 // earlier cases keep their indices and output order.
-constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 8;
+constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 10;
 
 int caseCount(const Config& c) noexcept { return kBaseCases + (c.allTiers ? kTierCases : 0) + kLiveCases; }
 
@@ -291,6 +331,8 @@ Case caseAt(const Config& c, int i) noexcept {
             case 5: return {"pedalled chords (8 roots, CC64 on/off)", true, Scene::PedalChords, true, t};
             case 6: return {"fresh-key burst (6 new keys, pedal)", true, Scene::FreshBurst, true, t};
             case 7: return {"same-key burst (6 same keys, pedal)", true, Scene::SameBurst, true, t};
+            case 8: return {"pedal lift (pedal up/down, strings sounding)", true, Scene::PedalLift, true, t};
+            case 9: return {"pedal lift, cold (evicted before pedal motion)", true, Scene::PedalLift, true, t, true};
             default: return {"?", true, Scene::Worst, true, t};
         }
     }
@@ -319,13 +361,19 @@ const char* hammerName(int index) noexcept {
     return index >= 0 && index < kHammerKeyCount ? kNames[index] : "?";
 }
 
-bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames) {
+bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames, std::size_t* bytes) {
     eng.setCulling(k.cull, -100.0f);
     SoundboardConfig bc;
     bc.enabled = k.board;
     bc.tier = k.tier;
     eng.setSoundboardConfig(bc);
-    return eng.prepare(sampleRate, maxFrames);
+    const std::size_t before = alignedLiveBytes();
+    const bool ok = eng.prepare(sampleRate, maxFrames);
+    if (bytes) {
+        const std::size_t after = alignedLiveBytes();
+        *bytes = sizeof(Engine) + (after > before ? after - before : 0);
+    }
+    return ok;
 }
 
 bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& res) {
@@ -335,6 +383,19 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     if (!prepareForCase(k, eng, fs, block)) return false;
     const bool timing = c.phaseTiming;
     eng.setPhaseTiming(timing);
+    // Load multiplier: the other engines, prepared alike (same work, phase
+    // timing included). The first of them gives the memory per engine (a
+    // re-prepare of 'eng' frees its arrays as it goes, so it cannot).
+    const int load = std::clamp(c.load, 1, kMaxLoad);
+    res.load = load;
+    std::vector<std::unique_ptr<Engine>> extra;
+    for (int i = 1; i < load; ++i) {
+        extra.emplace_back(new (std::nothrow) Engine);
+        if (!extra.back() || !prepareForCase(k, *extra.back(), fs, block, i == 1 ? &res.engineBytes : nullptr))
+            return false;
+        extra.back()->setPhaseTiming(timing);
+    }
+    std::vector<float> xl(static_cast<std::size_t>(block)), xr(static_cast<std::size_t>(block));
     // The worst cases are measured from the first strike, so the max
     // includes the burst of 88 hammers (1 ms apart, pool of 32).
     const double warm = k.scene == Scene::Worst ? 0.0 : 0.5;
@@ -344,7 +405,7 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     res.paced = c.paced;
     res.spin = c.paced && c.spin;
     res.evictBytes = c.paced ? c.evictBytes : 0;
-    std::vector<unsigned char> scratch(res.evictBytes);
+    std::vector<unsigned char> scratch(k.coldMotion ? std::max(res.evictBytes, kDefaultEvictBytes) : res.evictBytes);
     for (std::size_t i = 0; i < scratch.size(); i += 4096) scratch[i] = 1;  // fault the pages in now
     const int warmBlocks = static_cast<int>(warm * fs / block);
     const int blocks = std::max(1, static_cast<int>(c.seconds * fs / block));
@@ -356,24 +417,53 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     const auto periodDur = std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(block / fs));
     Clock::time_point deadline = Clock::now();
     unsigned evictSink = 0;
-    std::vector<double> probes;
+    std::vector<double> probes, probeLat, probeThr;
     int stepCount = 0;
+    const bool hook = c.paced && c.paceHook;
+    int cpu0 = -1, cpu1 = -1;
+    // Other work on this core between buffers: one read-modify-write per
+    // cache line of a buffer larger than the caches in question.
+    auto evict = [&]() {
+        for (std::size_t i = 0; i < scratch.size(); i += 64) evictSink += ++scratch[i];
+    };
     auto step = [&](double* dt) {
         const std::uint64_t t1 = t + static_cast<std::uint64_t>(block);
-        for (; next < events.size() && events[next].time < t1; ++next) eng.pushEvent(events[next]);
+        bool pedal = false;
+        for (; next < events.size() && events[next].time < t1; ++next) {
+            pedal = pedal || events[next].type == EventType::Sustain;
+            eng.pushEvent(events[next]);
+            for (auto& e : extra) e->pushEvent(events[next]);
+        }
+        // Cold variant: pedal motion (an event now, or dampers still moving).
+        if (dt && k.coldMotion && (pedal || eng.lastRender().damperUpdates > 0)) {
+            evict();
+            ++res.coldBuffers;
+        }
         if (dt && c.probeEvery > 0 && ++stepCount % c.probeEvery == 0) {
             float sink = 0.0f;
-            probes.push_back(host::timeSpeedProbe(&sink));
+            const int cpu = host::currentCpu();
+            const host::ProbeTimes pt = host::timeSpeedProbeSplit(&sink);
+            probes.push_back(pt.totalUs());
+            probeLat.push_back(pt.latencyUs);
+            probeThr.push_back(pt.throughputUs);
+            res.cpu.addProbe(cpu, pt.latencyUs, pt.throughputUs);
             gEvictSink = gEvictSink + static_cast<unsigned>(sink > 0.0f);
         }
+        if (hook)
+            c.paceHook(c.paceCtx, 1,
+                       std::chrono::duration_cast<std::chrono::nanoseconds>(deadline + periodDur - Clock::now()).count());
+        if (dt) cpu0 = host::currentCpu();
         const auto a = Clock::now();
         eng.render(l.data(), r.data(), block, nullptr);
-        if (dt) *dt = std::chrono::duration<double>(Clock::now() - a).count();
+        for (auto& e : extra) e->render(xl.data(), xr.data(), block, nullptr);
+        if (dt) {
+            *dt = std::chrono::duration<double>(Clock::now() - a).count();
+            cpu1 = host::currentCpu();
+        }
+        if (hook) c.paceHook(c.paceCtx, 2, 0);
         t += static_cast<std::uint64_t>(block);
         if (c.paced) {
-            // Other work on this core between buffers: one read-modify-write
-            // per cache line of a buffer larger than the caches in question.
-            for (std::size_t i = 0; i < scratch.size(); i += 64) evictSink += ++scratch[i];
+            if (res.evictBytes > 0) evict();
             deadline += periodDur;
             if (c.spin)
                 while (Clock::now() < deadline) {}
@@ -381,6 +471,10 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
                 std::this_thread::sleep_until(deadline);
         }
     };
+    if (hook) {
+        c.paceHook(c.paceCtx, 0, std::chrono::duration_cast<std::chrono::nanoseconds>(periodDur).count());
+        deadline = Clock::now();  // the hook may take a while (thread policy, workgroup join)
+    }
     for (int b = 0; b < warmBlocks; ++b) step(nullptr);
     const double period = block / fs;
     res.periodUs = 1e6 * period;
@@ -393,12 +487,16 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     double freeBlocks = 0.0, forcedBlocks = 0.0, members = 0.0, listeners = 0.0;
     for (int b = 0; b < blocks; ++b) {
         step(&dts[b]);
+        res.cpu.addBuffer(cpu0, cpu1, 1e6 * dts[b]);
         if (dts[b] > period) ++res.overruns;
         if (timing) ph[b] = phasesOf(eng.profile());
         else ph[b].total = 1e6 * dts[b];
         const RenderInfo& info = eng.lastRender();
         rebuilds += info.kernelRebuilds;
         keyUpdates += info.kernelKeyUpdates;
+        res.maxDamperUpdates = std::max(res.maxDamperUpdates, info.damperUpdates);
+        res.maxResponseGroups = std::max(res.maxResponseGroups, info.responseGroups);
+        res.maxApproxResponses = std::max(res.maxApproxResponses, info.approxResponses);
         freeBlocks += info.freeGroupBlocks;
         forcedBlocks += info.forcedGroupBlocks;
         members += info.loopMembers;
@@ -410,6 +508,8 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         if (dts[b] > worstDt) {
             worstDt = dts[b];
             res.maxDetail = detailOf(info);
+            res.cpu.worstStart = cpu0;
+            res.cpu.worstEnd = cpu1;
         }
         total += dts[b];
         if (b < firstBlocks) first += dts[b];
@@ -424,6 +524,7 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
     if (res.hammerContactSamples > 0)
         res.hammerUsPerContactSample = res.hammerPhaseUs / static_cast<double>(res.hammerContactSamples);
     gEvictSink = evictSink;  // keeps the eviction walk observable
+    if (hook) c.paceHook(c.paceCtx, 3, 0);
     if (!probes.empty()) {
         res.probeRuns = static_cast<int>(probes.size());
         double sum = 0.0;
@@ -431,6 +532,18 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         res.probeMeanUs = sum / probes.size();
         std::sort(probes.begin(), probes.end());
         res.probeMedianUs = probes[probes.size() / 2];
+        auto stats = [](std::vector<double>& v, ScenarioResult::ProbeStats& o) {
+            std::sort(v.begin(), v.end());
+            double s = 0.0;
+            for (double x : v) s += x;
+            o.runs = static_cast<int>(v.size());
+            o.minUs = v.front();
+            o.maxUs = v.back();
+            o.medianUs = v.size() % 2 ? v[v.size() / 2] : 0.5 * (v[v.size() / 2 - 1] + v[v.size() / 2]);
+            o.meanUs = s / static_cast<double>(v.size());
+        };
+        stats(probeLat, res.probeLatency);
+        stats(probeThr, res.probeThroughput);
     }
     res.kernelRebuildsPerBuffer = static_cast<double>(rebuilds) / blocks;
     res.kernelKeyUpdatesPerBuffer = static_cast<double>(keyUpdates) / blocks;
@@ -447,6 +560,13 @@ bool runScenario(const Config& c, const Case& k, Engine& eng, ScenarioResult& re
         res.topCount = std::max(1, blocks - static_cast<int>(0.99 * (blocks - 1)));
         for (int i = 0; i < res.topCount; ++i) accumulate(res.top1, ph[order[i]], 1.0 / res.topCount);
         for (int b = 0; b < blocks; ++b) accumulate(res.all, ph[b], 1.0 / blocks);
+        for (int b = 0; b < blocks; ++b)
+            if (ph[b].us[EngineProfile::ForcedPass] > res.forcedMaxUs) {
+                res.forcedMaxUs = ph[b].us[EngineProfile::ForcedPass];
+                res.forcedMaxIndex = b;
+            }
+        const double fm = res.all.us[EngineProfile::ForcedPass];
+        res.forcedMaxOverMean = fm > 0.0 ? res.forcedMaxUs / fm : 0.0;
     }
     std::sort(dts.begin(), dts.end());
     res.avgPercent = 100.0 * total / (blocks * period);

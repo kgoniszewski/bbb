@@ -1,5 +1,6 @@
 // Scalar reference kernel versus SIMD kernel (plan §4.2, §5.4).
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <random>
@@ -204,6 +205,56 @@ TEST(block_coupled_matches_per_sample_input) {
         CHECK_LE(worstState, 1e-5);
         CHECK_LE(worstOut, 1e-4 * peak);
     }
+}
+
+// A sleeping coupled group that loop input wakes inside a sub-block starts
+// at its quasi-static deflection under the crossing sample's input and is
+// advanced over the rest of the sub-block in double precision. The bank
+// advances a group's modes together (vectorisable lanes, ModeBank::
+// wakeCoupled); this is the per-mode std::complex reference it must equal
+// bit for bit (the start-up state, cast to float).
+TEST(coupled_wake_matches_per_mode_reference) {
+    const int groups = 4, modes = 16 * groups;
+    std::mt19937 rng(17);
+    std::uniform_real_distribution<double> uf(30.0, 9000.0), us(0.2, 20.0), uw(-1.0, 1.0);
+    ModeBank b;
+    b.allocateSegments(&modes, 1);
+    for (int i = 0; i < modes; ++i) {
+        b.setMode(i, uf(rng), us(rng), kFs);
+        b.setDamperRate(i, 40.0 + 150.0 * (0.5 + 0.5 * uw(rng)), kFs);
+        // Every fifth mode without input (stays at zero).
+        const float wr = i % 5 == 0 ? 0.0f : static_cast<float>(0.01 * uw(rng));
+        const float wi = i % 5 == 0 ? 0.0f : static_cast<float>(0.01 * uw(rng));
+        b.setWeights(i, wr, wi, static_cast<float>(uw(rng) / modes));
+    }
+    b.setSegmentCoupledGroups(0, groups);
+    b.setCulling(true, -100.0f);   // zero state: every group asleep
+    b.setSegmentDamper(0, 0.37f);  // sleeping groups go stale: refreshed on wake
+    CHECK(b.activeGroups() == 0);
+    // No input until sample 5, then a large one: every group crosses its
+    // bound at sample 5 (and is advanced over samples 6..31).
+    const int n = 32, cross = 5;
+    std::vector<float> u = noise(n, 23, 1.0f);
+    for (int k = 0; k < cross; ++k) u[k] = 0.0f;
+    u[cross] = 1.0f;
+    b.applyCoupledInput(0, u.data(), n);
+    CHECK(b.activeGroups() == groups);
+    CHECK(b.groupsWoken() == static_cast<std::uint64_t>(groups));
+    int mismatches = 0;
+    for (int m = 0; m < modes; ++m) {
+        const std::complex<double> w(b.weightIn(m), b.weightInIm(m));
+        std::complex<double> z = 0.0;
+        if (w != 0.0) {
+            const std::complex<double> c = b.coefficient(m);
+            z = w * double(u[cross]) / (1.0 - c);
+            for (int k = cross + 1; k < n; ++k) z = c * z + w * double(u[k]);
+        }
+        const bool same = b.stateRe(m) == static_cast<float>(z.real()) && b.stateIm(m) == static_cast<float>(z.imag());
+        mismatches += same ? 0 : 1;
+        if (w == 0.0) CHECK(b.stateRe(m) == 0.0f && b.stateIm(m) == 0.0f && !std::signbit(b.stateRe(m)));
+    }
+    std::printf("  wake-up start state vs per-mode reference: %d of %d modes differ\n", mismatches, modes);
+    CHECK(mismatches == 0);
 }
 
 // Large arrays allocated together start at distinct cache-line offsets

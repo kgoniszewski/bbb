@@ -215,7 +215,7 @@ struct CPUMeterView: View {
                 }
                 .buttonStyle(.bordered)
             }
-            Text("Copy diagnostics has the render-time percentiles, the worst buffer's events and hammer work and, with Phase timing on, where the time went. Speed probe times a fixed workload on the audio thread every \(AppModel.speedProbeInterval) buffers; against the benchmark thread (run the benchmark once) it shows how fast the audio thread really runs.")
+            Text("Copy diagnostics has the render-time percentiles, the worst buffer's events and hammer work and, with Phase timing on, where the time went. Speed probe times a fixed workload on the audio thread every \(AppModel.speedProbeInterval) buffers; against the benchmark thread (run the benchmark once) it shows how fast the audio thread really runs, separately for latency-bound and throughput-bound work. While phase timing, thread CPU time or the speed probe is on, the CPU each render call ran on is recorded (Copy diagnostics: share and mean render time per CPU and per core type).")
                 .font(.caption)
                 .foregroundColor(.secondary)
         }

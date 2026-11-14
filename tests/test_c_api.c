@@ -1,6 +1,7 @@
 /* The C API compiles as C and drives the engine end to end. */
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 #include "pm_api/pm_api.h"
 
@@ -24,6 +25,12 @@ int main(void) {
 
     EXPECT(pm_api_version() == ((PM_API_VERSION_MAJOR << 16) | (PM_API_VERSION_MINOR << 8) |
                                 PM_API_VERSION_PATCH));
+    {
+        /* The version string starts with the macros' number (0.10.0 was once left behind). */
+        char want[32];
+        snprintf(want, sizeof want, "%d.%d.%d ", PM_API_VERSION_MAJOR, PM_API_VERSION_MINOR, PM_API_VERSION_PATCH);
+        EXPECT(strncmp(pm_version_string(), want, strlen(want)) == 0);
+    }
     EXPECT(eng != NULL);
     EXPECT(pm_engine_prepare(eng, 48000.0, 256) == 1);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_MASTER_GAIN_DB, -6.0) == 1);
@@ -147,26 +154,30 @@ int main(void) {
         const char* info = pm_build_info();
         EXPECT(info != NULL && info[0] != 0);
         printf("  build: %s\n", info);
-        /* 15 scenarios (7, then 8 of live playing: 4 in API 0.8, hammer
+        /* 17 scenarios (7, then 10 of live playing: 4 in API 0.8, hammer
          * burst and pedalled chords in 0.9, fresh- and same-key bursts in
-         * 0.10) + 8 hammer keys; the 6 tier cases go before the live ones. */
-        EXPECT(pm_bench_item_count(&bc) == 23);
+         * 0.10, pedal lift in 0.13, pedal lift cold in 0.14) + 8 hammer
+         * keys; the 6 tier cases go before the live ones. */
+        EXPECT(pm_bench_item_count(&bc) == 25);
         bc.flags = PM_BENCH_ALL_TIERS;
-        EXPECT(pm_bench_item_count(&bc) == 29);
+        EXPECT(pm_bench_item_count(&bc) == 31);
         EXPECT(pm_bench_item_name(&bc, 13)[0] == 'l'); /* legato */
         bc.flags = PM_BENCH_NO_HAMMER;
-        EXPECT(pm_bench_item_count(&bc) == 15);
-        EXPECT(pm_bench_item_name(&bc, 15)[0] == 0);
+        EXPECT(pm_bench_item_count(&bc) == 17);
+        EXPECT(pm_bench_item_name(&bc, 17)[0] == 0);
         EXPECT(pm_bench_item_name(&bc, 8)[0] == 'p');  /* pedalling */
         EXPECT(pm_bench_item_name(&bc, 11)[0] == 'h'); /* hammer burst */
         EXPECT(pm_bench_item_name(&bc, 13)[0] == 'f'); /* fresh-key burst */
         EXPECT(pm_bench_item_name(&bc, 14)[0] == 's'); /* same-key burst */
-        EXPECT(pm_bench_item_scene(&bc, 13) == 10 && pm_bench_item_scene(&bc, 15) == -1);
+        EXPECT(pm_bench_item_name(&bc, 15)[0] == 'p'); /* pedal lift */
+        EXPECT(strstr(pm_bench_item_name(&bc, 16), "cold") != NULL); /* pedal lift, cold */
+        EXPECT(pm_bench_item_scene(&bc, 13) == 10 && pm_bench_item_scene(&bc, 15) == 12 &&
+               pm_bench_item_scene(&bc, 16) == 12 && pm_bench_item_scene(&bc, 17) == -1);
         bc.flags = 0;
         EXPECT(pm_bench_item_name(&bc, 3)[0] == 'c');  /* cluster */
-        EXPECT(pm_bench_item_name(&bc, 18)[0] == 'h'); /* hammer, key 40 */
+        EXPECT(pm_bench_item_name(&bc, 20)[0] == 'h'); /* hammer, key 40 */
         bc.hammer_strikes = 3;
-        EXPECT(pm_bench_run_item(&bc, 18, &br) == 1);
+        EXPECT(pm_bench_run_item(&bc, 20, &br) == 1);
         EXPECT(br.ok == 1 && br.kind == PM_BENCH_HAMMER && br.key == 40 && br.strings == 3 &&
                br.oversampling == 2 && br.contact_us > 0.0 && br.life_us > 0.0);
         bc.seconds = 0.05;
@@ -193,6 +204,25 @@ int main(void) {
         pm_host_set_speed_probe(NULL, 1);
         pm_host_get_speed_probe(NULL, &ps);
         pm_host_get_worst_detail(NULL, NULL);
+    }
+    /* Probe parts and CPU numbers (API 0.11). */
+    {
+        pm_speed_probe_split sp;
+        pm_cpu_usage cu;
+        const double thr = pm_speed_probe_run_split(21, &sp);
+        printf("  probe parts on this thread: latency %.2f / throughput %.2f us (median); CPU %d\n",
+               sp.latency.median_us, sp.throughput.median_us, (int)pm_current_cpu());
+        EXPECT(sp.latency.runs == 21 && sp.throughput.runs == 21 && thr == sp.throughput.median_us);
+        EXPECT(sp.latency.min_us > 0.0 && sp.throughput.min_us > 0.0);
+        EXPECT(pm_current_cpu() >= -1);
+        pm_bench_last_cpu_usage(&cu);
+        pm_bench_last_probe_split(&sp);
+        pm_bench_set_pace_hook(NULL, NULL);
+        pm_host_get_cpu_usage(NULL, &cu);
+        pm_host_get_speed_probe_split(NULL, &sp);
+        pm_host_scene_get_cpu_usage(NULL, &cu);
+        pm_host_scene_get_probe_split(NULL, &sp);
+        EXPECT(cu.worst_cpu_start == -1 && PM_MAX_CPUS == 64);
     }
     printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;

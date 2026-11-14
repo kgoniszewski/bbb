@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 10
+#define PM_API_VERSION_MINOR 14
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -105,6 +105,8 @@ typedef struct pm_stats {
 } pm_stats;
 
 uint32_t pm_api_version(void); /* (major << 16) | (minor << 8) | patch */
+/* "major.minor.patch (...)", built from the macros above (API 0.12: the
+ * number always matches them). */
 const char* pm_version_string(void);
 
 pm_engine* pm_engine_create(void);  /* NULL on allocation failure */
@@ -380,6 +382,11 @@ typedef struct pm_work_detail {
     int32_t loop_listeners;          /* keys taking loop input (largest over the sub-blocks) */
     int32_t loop_entries;            /* zone-kernel entries (largest over the sub-blocks) */
     int32_t out_zones;               /* board zones read back per sample (largest over the sub-blocks) */
+    /* API 0.14: */
+    int32_t groups_woken;            /* sleeping coupled groups woken by loop input (each a double-precision
+                                        start-up of its 16 modes over the rest of its sub-block) */
+    int32_t approx_responses;        /* coupled-group responses taken from the damper expansion (pedal motion
+                                        over the tick's response budget: rows of the expansion read) */
     int32_t reserved;
 } pm_work_detail;
 
@@ -420,6 +427,65 @@ void pm_host_get_speed_probe(const pm_host* host, pm_speed_probe_stats* stats);
 double pm_speed_probe_run_us(int32_t runs, pm_speed_probe_stats* stats);
 
 /* ------------------------------------------------------------------------
+ * Speed probe parts and CPU numbers (API 0.11).
+ *
+ * The probe has two parts, timed separately: latency-bound (a dependent
+ * scalar sqrt/divide chain and a dependent vector multiply-add chain) and
+ * throughput-bound (the mode-bank kernel's shape: 1024 complex one-pole
+ * modes, 16 KiB, many independent vector operations in flight). A core or
+ * clock change slows them by different factors: an efficiency core loses
+ * little more than its clock on the first and much more on the second, as
+ * the engine's wide inner loops do. pm_speed_probe_stats keeps reporting the
+ * whole probe (both parts; not comparable with the API 0.9-0.10 workload).
+ * Times in microseconds; host medians are histogram bin centres (1.5 %). */
+typedef struct pm_probe_series {
+    uint64_t runs;
+    double min_us, median_us, mean_us, max_us;
+} pm_probe_series;
+
+typedef struct pm_speed_probe_split {
+    pm_probe_series latency;
+    pm_probe_series throughput;
+} pm_speed_probe_split;
+
+/* The audio thread's probe parts since the last pm_host_reset_load. */
+void pm_host_get_speed_probe_split(const pm_host* host, pm_speed_probe_split* split);
+/* Runs the probe 'runs' times (1..4096) on the calling thread; fills split
+ * (may be NULL) and returns the throughput part's median. Non-real-time. */
+double pm_speed_probe_run_split(int32_t runs, pm_speed_probe_split* split);
+
+/* Which CPU the calling thread runs on now (Apple: pthread_cpu_number_np;
+ * Linux: sched_getcpu), or -1 where it cannot be read. */
+int32_t pm_current_cpu(void);
+
+/* Per-CPU usage of the render calls. pm_host_render reads the CPU number at
+ * the start and at the end of each render call (outside the timed interval)
+ * while any of the run-time diagnostics is on: thread CPU time
+ * (pm_host_set_cpu_timing), phase timing or the speed probe. Two reads of a
+ * per-CPU register value (no system call, no lock; see core/pm_host/cpu_id.h
+ * for the platforms and what was verified). A call is counted on the CPU it
+ * started on. CPU numbers are the kernel's logical CPU numbers; which of them
+ * are efficiency or performance cores is not part of this API (on current
+ * Apple silicon the efficiency cores have the lowest numbers, but nothing
+ * documents that). */
+#define PM_MAX_CPUS 64
+typedef struct pm_cpu_usage {
+    uint64_t buffers_tracked;  /* render calls whose CPU number was read (and < PM_MAX_CPUS) */
+    uint64_t buffers_unknown;  /* render calls without a CPU number (diagnostics off, or none) */
+    uint64_t migrations;       /* render calls that ended on another CPU than they started on */
+    int32_t worst_cpu_start;   /* the worst buffer's CPUs (pm_host_diagnostics' worst; -1: unknown) */
+    int32_t worst_cpu_end;
+    uint32_t buffers[PM_MAX_CPUS];           /* render calls per CPU */
+    double mean_render_us[PM_MAX_CPUS];      /* their mean render time */
+    uint32_t probe_runs[PM_MAX_CPUS];        /* speed-probe runs per CPU */
+    double probe_latency_us[PM_MAX_CPUS];    /* their mean latency-bound part */
+    double probe_throughput_us[PM_MAX_CPUS]; /* their mean throughput-bound part */
+} pm_cpu_usage;
+
+/* Live meter, since the last pm_host_reset_load. */
+void pm_host_get_cpu_usage(const pm_host* host, pm_cpu_usage* usage);
+
+/* ------------------------------------------------------------------------
  * Build information (API 0.7): a static string describing how the engine
  * was compiled (SIMD kernel, optimisation, NDEBUG, FMA contraction,
  * compiler), for diagnostics. */
@@ -446,7 +512,12 @@ enum pm_bench_flags {
      * thread with a private engine prepared exactly as the benchmark
      * prepares the item's (instead of the app's engine instance), to tell
      * the instance from the thread. */
-    PM_BENCH_SCENE_FRESH_ENGINE = 32
+    PM_BENCH_SCENE_FRESH_ENGINE = 32,
+    /* API 0.11, scenarios: the speed probe (both parts) right before every
+     * 8th render call, untimed, as the host runs it on the audio thread;
+     * see pm_bench_last_probe_split and pm_bench_last_cpu_usage. API 0.12,
+     * pm_host_scene_start(_load): the host's speed probe on for the run. */
+    PM_BENCH_SPEED_PROBE = 64
 };
 
 enum pm_bench_kind {
@@ -491,8 +562,17 @@ typedef struct pm_bench_result {
     int32_t overruns;        /* buffers whose render took longer than the period */
     int32_t paced;           /* 1: paced to real time (2: with the eviction walk) */
     pm_work_detail worst;    /* the most expensive buffer by wall time */
+    /* API 0.14, with has_phases: the forced phase's largest value in any
+     * buffer (not necessarily the most expensive one) and its buffer index. */
+    double forced_max_us;
+    int32_t forced_max_index;
+    int32_t cold_buffers;    /* "pedal lift, cold": buffers preceded by the eviction walk */
 } pm_bench_result;
 
+/* Items: the scenarios (bench.h order; API 0.13 appended "pedal lift",
+ * scene 12, after the same-key burst; API 0.14 "pedal lift, cold", the
+ * same scene with a 32 MiB eviction walk, untimed, before every buffer with
+ * pedal motion), then the hammer keys. */
 int32_t pm_bench_item_count(const pm_bench_config* config);
 /* Static string; "" for an index out of range. */
 const char* pm_bench_item_name(const pm_bench_config* config, int32_t index);
@@ -503,6 +583,32 @@ int pm_bench_run_item(const pm_bench_config* config, int32_t index, pm_bench_res
 int32_t pm_bench_last_config(char* buffer, int32_t size);
 /* API 0.10: the scene (pm_bench_scene) of scenario item 'index', or -1. */
 int32_t pm_bench_item_scene(const pm_bench_config* config, int32_t index);
+/* API 0.11: of the last scenario run on the calling thread, the CPUs its
+ * measured render calls ran on (always recorded) and, with
+ * PM_BENCH_SPEED_PROBE, the probe's parts (runs 0 otherwise). Zeros before
+ * any. */
+void pm_bench_last_cpu_usage(pm_cpu_usage* usage);
+void pm_bench_last_probe_split(pm_speed_probe_split* split);
+
+/* API 0.11: pacing hook. A paced scenario (PM_BENCH_PACED) run on the
+ * calling thread calls hook(ctx, event, ns) on that thread: PM_PACE_BEGIN
+ * once after the engine is prepared and before the first buffer (ns = the
+ * buffer period), PM_PACE_BUFFER before each render call (ns = time left
+ * until that buffer's real-time deadline, may be negative after an
+ * overrun), PM_PACE_BUFFER_DONE after it (before the sleep; ns = 0) and
+ * PM_PACE_END after the last buffer. Lets the app run the paced loop in the
+ * scheduling class of an audio thread (e.g. time-constraint policy; a
+ * host in C could also start a work interval with each buffer's deadline)
+ * without platform code in the engine. The hook's own time is outside the timed render call. NULL
+ * removes it. Per thread. */
+enum pm_pace_event {
+    PM_PACE_BEGIN = 0,
+    PM_PACE_BUFFER = 1,
+    PM_PACE_BUFFER_DONE = 2,
+    PM_PACE_END = 3
+};
+typedef void (*pm_pace_hook)(void* ctx, int32_t event, int64_t ns);
+void pm_bench_set_pace_hook(pm_pace_hook hook, void* ctx);
 
 /* ------------------------------------------------------------------------
  * Scene on the audio thread (API 0.10): the events of a benchmark scenario
@@ -560,7 +666,7 @@ typedef struct pm_host_scene_result {
     int32_t reserved;
 } pm_host_scene_result;
 
-int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t item_index);
+int pm_host_scene_start(pm_host* host, const pm_bench_config* config, int32_t item_index);  /* = _load with load 1 */
 /* Any thread: stops a running scene (no result). */
 void pm_host_scene_cancel(pm_host* host);
 /* Main thread: the state, and once PM_SCENE_DONE the result. */
@@ -573,6 +679,68 @@ void pm_host_scene_get_result(const pm_host* host, pm_host_scene_result* result)
  * engine is freed at the next pm_host_scene_start or pm_host_destroy. */
 /* The engine configuration captured when the scene started (pm_engine_describe). */
 int32_t pm_host_scene_config(const pm_host* host, char* buffer, int32_t size);
+/* API 0.11, once PM_SCENE_DONE: the CPUs of the measured buffers (read when
+ * phase timing, thread CPU time or the speed probe is on, as the live meter)
+ * and the audio-thread probe's parts over the run. Zeros otherwise. */
+void pm_host_scene_get_cpu_usage(const pm_host* host, pm_cpu_usage* usage);
+void pm_host_scene_get_probe_split(const pm_host* host, pm_speed_probe_split* split);
+
+/* ------------------------------------------------------------------------
+ * Headroom test (API 0.12): a scene on the audio thread with a load
+ * multiplier, and where in the buffer the render call changed CPU.
+ *
+ * pm_host_scene_start_load is pm_host_scene_start with 'load' = K (1 ..
+ * PM_SCENE_MAX_LOAD) engines: K > 1 renders every buffer of the scene on K
+ * independent engines, each prepared exactly as the benchmark prepares the
+ * item's (K > 1 implies PM_BENCH_SCENE_FRESH_ENGINE), all fed the scene's
+ * events, one after the other inside the timed render call; the first one is
+ * heard and takes the MIDI and UI events, the others render into scratch
+ * (allocated here, not on the audio thread). The work per buffer is exactly K
+ * times the scene's, with K times its working set: if the render time grows
+ * K-fold from the efficiency-core figure the system has no headroom left on
+ * that thread; if it stays near K times the back-to-back (performance-core)
+ * figure it does. Preparing takes about a second per engine (calling
+ * thread); each engine holds about 6 MB (pm_scene_load.engine_bytes). The
+ * engines are freed at the next pm_host_scene_start(_load) or
+ * pm_host_destroy. With PM_BENCH_SPEED_PROBE in config->flags the speed probe
+ * runs every 8th buffer for the run if it was off (and is switched off again
+ * at its end), as PM_BENCH_PHASE_TIMING does for phase timing.
+ *
+ * While the CPU numbers are read (the speed probe, phase timing or thread
+ * CPU time on), every engine of the scene also reads the CPU number at the
+ * start of each of its sub-blocks (Engine sub-block hook: one per-CPU
+ * register read, as pm_current_cpu, until the first change in the buffer),
+ * so a migration is located within the buffer: sub-block n counts across the
+ * K engines (engine 2's first sub-block follows engine 1's last). */
+#define PM_SCENE_MAX_LOAD 8
+#define PM_SCENE_LEFT_BINS 129
+
+typedef struct pm_scene_load {
+    int32_t load;                /* engines rendered per buffer (K) */
+    int32_t cpu_tracked;         /* 1: CPU numbers were read (the fields below are valid) */
+    uint64_t engine_bytes;       /* memory of one benchmark-prepared engine: the object plus its aligned
+                                    arrays (0: the app's engine only, not measured) */
+    uint64_t buffers;            /* measured buffers with a CPU number */
+    uint64_t migrated;           /* of those, buffers that ran on another CPU before they ended */
+    double mean_sub_blocks;      /* sub-blocks per buffer, all K engines */
+    /* Over the migrated buffers: render start to the first sub-block start
+     * found on another CPU (a change seen only at the end of the call counts
+     * as the whole render time). */
+    double mean_us_before_migration;
+    double mean_sub_blocks_before_migration;
+    uint32_t end_cpu[PM_MAX_CPUS];   /* buffers by the CPU the render call ended on */
+    uint32_t moved_to[PM_MAX_CPUS];  /* migrated buffers by the first other CPU seen */
+    /* Migrated buffers by the sub-block at whose start another CPU was first
+     * seen (bin n: sub-block n, 0-based; a change seen only at the end of the
+     * call counts at the buffer's sub-block total); the last bin holds n >=
+     * PM_SCENE_LEFT_BINS - 1. */
+    uint32_t left_after[PM_SCENE_LEFT_BINS];
+    int32_t reserved;
+} pm_scene_load;
+
+int pm_host_scene_start_load(pm_host* host, const pm_bench_config* config, int32_t item_index, int32_t load);
+/* Once PM_SCENE_DONE (zeros otherwise; load is 1 for pm_host_scene_start). */
+void pm_host_scene_get_load(const pm_host* host, pm_scene_load* result);
 
 #ifdef __cplusplus
 }
