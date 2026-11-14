@@ -1,6 +1,6 @@
-# Physically modelled piano engine
+# Phys mod upian engine
 
-A portable C++20 engine for a physically modelled concert grand, built
+A portable C++20 engine for a phys mod concert grand, built
 milestone by milestone from the engineering plan in
 [docs/steinway-d-physical-model-plan.md](docs/steinway-d-physical-model-plan.md).
 
