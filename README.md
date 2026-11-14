@@ -17,7 +17,7 @@ by a one-sample run-time loop (sympathetic resonance, pedal bloom),
 continuous half-pedalling, hammer-knock and damper-lift noise hooks, and a
 placeholder two-pickup output, and the app half of M2: a portable host
 layer (MIDI 1.0 / UMP parsing, event queues from the MIDI and UI threads,
-a prepare gate, a render-load meter with diagnostics and a speed probe, benchmark scenes on the audio thread, per-CPU render statistics, a headroom test with a load multiplier; `core/pm_host`, C API 0.12), an
+a prepare gate, a render-load meter with diagnostics and a speed probe, benchmark scenes on the audio thread, per-CPU render statistics, a headroom test with a load multiplier; `core/pm_host`, C API 0.14), an
 offline benchmark library shared by `bench_engine` and the app (`core/pm_bench`), a Swift
 package exposing the C API, and a SwiftUI app for iPad and Mac (see
 [iPad app](#ipad-app); built and run on an iPad Pro M2 and on a Mac, see
@@ -37,7 +37,7 @@ duplex yet.
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
 | `core/pm_bench/` | Non-real-time: the engine benchmark scenarios (worst, typical, cluster, bloom, board-off A/Bs, then the live-playing scenes legato, pedalling, chord release, idle, hammer burst, pedalled chords, the fresh- and same-key bursts and the pedal lift, and the hammer per key; back to back or paced to real time), shared by `bench_engine` and the app's Benchmark screen |
-| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, (0.6) the app host `pm_host_*`, (0.7) load diagnostics, build information and the offline benchmark `pm_bench_*`, (0.8) phase timing and the worst buffer's events, (0.9) the worst buffer's hammer and zone-kernel detail, the speed probe and `PM_BENCH_PHASE_TIMING`, (0.10) paced benchmark runs, per-buffer work counts (`pm_work_detail`), the effective engine configuration (`pm_engine_describe`) and benchmark scenes played on the audio thread (`pm_host_scene_*`), (0.11) the speed probe's latency- and throughput-bound parts, per-CPU render statistics (`pm_cpu_usage`) and the paced benchmark's pacing hook, (0.12) audio-thread scenes with a load multiplier and a per-sub-block CPU trace (`pm_host_scene_start_load`, `pm_scene_load`); `include/` holds the Swift module map |
+| `core/pm_api/` | Stable C API (`pm_api.h`) for Swift and Python: engine, (0.6) the app host `pm_host_*`, (0.7) load diagnostics, build information and the offline benchmark `pm_bench_*`, (0.8) phase timing and the worst buffer's events, (0.9) the worst buffer's hammer and zone-kernel detail, the speed probe and `PM_BENCH_PHASE_TIMING`, (0.10) paced benchmark runs, per-buffer work counts (`pm_work_detail`), the effective engine configuration (`pm_engine_describe`) and benchmark scenes played on the audio thread (`pm_host_scene_*`), (0.11) the speed probe's latency- and throughput-bound parts, per-CPU render statistics (`pm_cpu_usage`) and the paced benchmark's pacing hook, (0.12) audio-thread scenes with a load multiplier and a per-sub-block CPU trace (`pm_host_scene_start_load`, `pm_scene_load`), (0.13) the pedal-lift scene, (0.14) the "pedal lift, cold" scene, the forced phase's maximum in a benchmark row (`forced_max_us`) and, in every `pm_work_detail`, the coupled groups woken by loop input and the responses taken from the damper expansion (`groups_woken`, `approx_responses`); `include/` holds the Swift module map |
 | `Package.swift` | Swift package `PianoEngine`, library `PianoCore` (the C++ core, imported in Swift through the C API) |
 | `apps/PianoApp/` | SwiftUI app (iPadOS 17+, macOS 14+): XcodeGen spec `project.yml`, sources, and the package's Swift smoke test |
 | `tools/render_cli/` | Offline renderer: one plucked string to a mono WAV, or a text score through the engine to a stereo WAV |
@@ -141,7 +141,14 @@ duplex yet.
   sweep). A key joining or leaving the loop (a hammer takes it over or
   hands it back, the pedal lifts or lands its damper) updates the zone
   kernel in place as well when the packed entries stay the same, which
-  replaces most full rebuilds.
+  replaces most full rebuilds. A sleeping coupled group that loop input
+  wakes inside a sub-block starts from its quasi-static deflection and is
+  advanced over the rest of the sub-block in double precision; a pedal
+  lift over ringing strings wakes a hundred groups or more in one
+  sub-block, so the group's 16 modes are advanced together as vectorisable
+  lanes (API 0.14; bit-identical to the former one-mode-at-a-time loop,
+  whose serial dependency chains made the forced phase of such a buffer
+  about 4× its usual cost, plan §4.1).
   Static correction: driven by a bridge displacement, each string mode
   responds quasi-statically with 2T/L (1 + B n^2) u, the same for every
   partial, so the truncated modal sum is a large negative stiffness on the
@@ -382,7 +389,11 @@ chord over both hands every 1.2 s released into the pedal and four keys
 held, about 9000 modes sounding; every 0.6 s the pedal comes up for 150 ms
 and goes down again, as CC64 on/off and as ramps, with three notes struck
 as it goes down: the dampers land on and lift off sounding strings, the
-iPad's worst live buffer); last, the
+iPad's worst live buffer), and the same pedal lift "cold": a 32 MiB
+eviction walk, untimed, before every buffer with pedal motion (a sustain
+event in it, or damper updates in the buffer before), so that those
+buffers start with the caches other work leaves, as live (API 0.14; in the
+app's Benchmark tab it is one more row); last, the
 cost of one hammer per buffer for eight keys (at mf, 2.2 m/s; the scenes
 use MIDI velocities 70-127, the clusters 120, the burst 127, i.e. 5.5
 m/s). `--tier balanced|eco` and `--tiers` run the board cases at the
@@ -409,7 +420,12 @@ reads the clock about five times per 32-frame sub-block, plus twice per
 sample while a hammer is active, included in every number; `--timing
 both` measures what that costs (on the x86 container: within the run-to-run
 noise for every playing scene, about +1.3 µs per idle 512-frame buffer),
-`--timing off` skips it.
+`--timing off` skips it. Under each case's breakdown, the forced phase's
+largest value in any buffer and its ratio to the forced mean (a spike in
+one phase need not be in the most expensive buffer; API 0.14); the
+summary per case also gives the most expensive buffer's coupled groups
+woken by loop input and responses taken from the damper expansion, which
+the live meter's worst buffer records as well (Copy diagnostics).
 
 Pacing. By default every buffer is rendered back to back, as fast as the
 thread can, with everything the engine touches hot in the caches and the
@@ -966,7 +982,32 @@ judge the device. Not yet measured on the device: the Balanced and Eco
 tiers, 128- and 256-frame buffers, repeated runs, other devices, and
 sustained load or a raised thermal state.
 
-What to send back from a device next: the Benchmark table and a Headroom
+Live playing with much pedalling (API 0.13.0, 93992 buffers): mean 238
+µs (17.8 %), p99 309 µs (23.0 %), max 775 µs (58.1 %), none over 70 %.
+The worst buffer was a pedal-motion buffer with no hammer and no event
+(9112 modes awake, 66 damper updates, 63 exact responses, i.e. the
+response budget held; zone kernel 0 rebuilds + 109 in-place updates;
+group-blocks free 851 / forced 831): removing 450 response recomputes
+(783 µs before) had not made that buffer cheaper. In the in-app
+benchmark (pedal lift, back to back, phase timing) its forced phase was
+201.7 µs against a mean of 52.4 µs (43-72 µs in other scenes' worst
+buffers), and a live capture with phase timing and thread CPU time
+(57829 buffers; worst 735 µs = CPU 736 µs on one performance core)
+split it events 131.3 / hammers 0 / free 61.8 / forced 460.6 / board
+75.6 / other 5.2 µs. Cause: the wake-up of sleeping coupled groups at
+the end of the sub-block (counted in the forced phase) when the lifting
+dampers' raised input threshold drops (115 groups in one sub-block in the
+benchmark's version of that buffer), done one mode at a time as serial
+double-precision dependency chains; few instructions, but
+latency-bound. API 0.14 advances each group's modes together
+(bit-identical output); on the x86 container that buffer's forced phase
+went from 284 to 158 µs, the still buffers' maximum being 154 µs (plan
+§4.1). Not yet measured on the device after the change.
+
+What to send back from a device next (API 0.14): the Benchmark rows
+"pedal lift" and "pedal lift, cold" with Phase timing on (forced max and
+its ratio to the mean), and Copy diagnostics after a few minutes of
+pedalled playing (worst buffer: groups woken, responses expanded); also the Benchmark table and a Headroom
 sweep of the worst scene at 128 and 256 frames and at the Balanced and Eco
 tiers; the same at 64 frames after several minutes of heavy playing
 (thermal state in the diagnostics); a listening report (crackles while

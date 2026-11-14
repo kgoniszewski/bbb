@@ -685,8 +685,8 @@ void ModeBank::applyCoupledInput(int s, const float* u, int n, Kernel kernel) no
 // input summed since the cull pass crosses their bounds as soon as the
 // damper's raised input threshold drops), and done one mode after the
 // other each mode's recursion is a serial chain of dependent double
-// operations: about 100 us per such sub-block on an M2 performance core
-// (plan §4.1). The group's modes are therefore advanced together, as
+// operations, latency-bound: about 150 us extra in such a buffer on an M2
+// performance core, back to back (plan §4.1). The group's modes are therefore advanced together, as
 // independent lanes the compiler vectorises, with exactly the operations
 // of the complex expression z = c z + w u (product terms rounded the same
 // way, the same sum order), so the state is bit for bit what the per-mode
