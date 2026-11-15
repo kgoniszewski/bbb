@@ -269,11 +269,15 @@ TEST(coupled_wake_ignores_host_cuts) {
         std::uniform_real_distribution<double> uf(30.0, 9000.0), us(0.2, 20.0), uw(-1.0, 1.0);
         b.allocateSegments(&modes, 1);
         for (int i = 0; i < modes; ++i) {
-            b.setMode(i, uf(rng), us(rng), kFs);
+            // Draws in named locals: the order of evaluation of function
+            // arguments differs between compilers, and with it the scenario.
+            const double t60 = us(rng), f = uf(rng);
+            b.setMode(i, f, t60, kFs);
             // Input weights spread over 60 dB: the groups cross at different samples.
             const float g = static_cast<float>(1e-3 * std::pow(10.0, -3.0 * (i / 16) / groups));
-            b.setWeights(i, g * static_cast<float>(uw(rng)), g * static_cast<float>(uw(rng)),
-                         static_cast<float>(uw(rng) / modes));
+            const float wo = static_cast<float>(uw(rng) / modes);
+            const float wi = g * static_cast<float>(uw(rng)), wr = g * static_cast<float>(uw(rng));
+            b.setWeights(i, wr, wi, wo);
         }
         b.setSegmentCoupledGroups(0, groups);
         b.setCulling(true, -100.0f);
