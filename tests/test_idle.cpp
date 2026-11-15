@@ -102,43 +102,31 @@ TEST(idle_sleep_is_exact_and_costs_nothing) {
 
 // Sleep decisions are taken per sub-block, so they add no dependence on the
 // buffer size: at every buffer size the output with sleep equals the output
-// without it, and buffer sizes agree to rounding.
+// without it, and buffer sizes agree to rounding, with culling on and off.
+// (Restored and tightened, block 1 included: with culling on, block 37 and
+// block 1 had measured -84 / -85 dB re peak at the first hammer onset,
+// where the board, driven by the knock, woke sleeping coupled groups of
+// the undamped keys 69-88 at the end of whatever sub-block the host's
+// buffer cut; the check had been loosened to -80 dB for block 37 and
+// skipped for block 1, -90 dB before. Wake-up decisions are now taken
+// only where the music ends a sub-block, ModeBank::applyCoupledInput.
+// Measured: -108.7 dB re peak, worst block.)
 TEST(idle_sleep_is_buffer_size_invariant) {
-    const Run ref = render(true, 64, false);
-    const double peak = std::max(peakAbs(ref.out.l), peakAbs(ref.out.r));
-    for (int block : {1, 37, 512}) {
-        const Run r = render(true, block, false), rOff = render(false, block, false);
-        double at = 0.0;
-        const double d = maxDiff(ref.out, r.out, &at);
-        const double dOff = maxDiff(r.out, rOff.out);
-        std::printf("  block %3d: vs block 64 %.1f dB re peak (at %.3f s); sleep on vs off %.3g; %d idle buffers\n",
-                    block, 20 * std::log10(d / peak + 1e-30), at, dOff, r.idleBuffers);
-        CHECK(dOff == 0.0);
-        // Loosened (low-regime board, plan §1.6 note (6)): with culling on,
-        // block 37 now differs from block 64 by -84 dB at the first hammer
-        // onset (0.202 s), as block 1 does (-85 dB). Cause, measured: a
-        // sleeping coupled group (here the undamped keys 69-88, driven
-        // through the board by the hammer knock) wakes in the sub-block in
-        // which its input bound is crossed, from its quasi-static deflection,
-        // so the wake-up depends on where sub-blocks start. It predates the
-        // board change: with the v0 board blocks 16, 33 and 100 already
-        // measured -90.6, -90.8 and -92.4 dB (block 37 -109.5 dB by chance);
-        // with culling off block 37 is at -109 dB with either board. Held
-        // here to -80 dB; buffer-size invariance proper is asserted with
-        // culling off below.
-        if (block != 1) CHECK_LE(20 * std::log10(d / peak + 1e-30), block == 37 ? -80.0 : -90.0);
-    }
-    // Culling off: every block size except 1 (a hammer-solver property, as
-    // above) agrees to rounding.
-    const Run refAll = render(true, 64, false, false);
-    const double peakAll = std::max(peakAbs(refAll.out.l), peakAbs(refAll.out.r));
-    for (int block : {37, 512}) {
-        const Run r = render(true, block, false, false);
-        double at = 0.0;
-        const double d = maxDiff(refAll.out, r.out, &at);
-        std::printf("  culling off, block %3d: vs block 64 %.1f dB re peak (at %.3f s)\n", block,
-                    20 * std::log10(d / peakAll + 1e-30), at);
-        CHECK_LE(20 * std::log10(d / peakAll + 1e-30), -100.0);
+    for (bool cull : {true, false}) {
+        const Run ref = render(true, 64, false, cull);
+        const double peak = std::max(peakAbs(ref.out.l), peakAbs(ref.out.r));
+        for (int block : {1, 37, 512}) {
+            const Run r = render(true, block, false, cull), rOff = render(false, block, false, cull);
+            double at = 0.0;
+            const double d = maxDiff(ref.out, r.out, &at);
+            const double dOff = maxDiff(r.out, rOff.out);
+            std::printf("  culling %s, block %3d: vs block 64 %.1f dB re peak (at %.3f s); sleep on vs off %.3g; "
+                        "%d idle buffers\n",
+                        cull ? "on " : "off", block, 20 * std::log10(d / peak + 1e-30), at, dOff, r.idleBuffers);
+            CHECK(dOff == 0.0);
+            if (block % 32 == 0) CHECK(d == 0.0);
+            else CHECK_LE(20 * std::log10(d / peak + 1e-30), -100.0);
+        }
     }
 }
 

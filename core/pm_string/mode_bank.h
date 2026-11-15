@@ -276,7 +276,21 @@ public:
     // bound was crossed (quasi-static deflection under that sample's input,
     // then the remaining input), so wake-ups happen at the same point of the
     // music however the stream is cut into sub-blocks.
-    void applyCoupledInput(int s, const float* u, int n, Kernel kernel = Kernel::Simd) noexcept;
+    //
+    // Wake-up spans. Where the caller cuts a sub-block only because a host
+    // buffer ends there (final = false), the input still reaches the state
+    // at once, but the wake-up test is deferred: u is kept and tested
+    // together with the rest of the span when a piece ends with final =
+    // true, or at flushCoupled(). The wake-ups (and the input bound the
+    // cull pass reads) are then bit for bit those of the uncut span, so
+    // they do not depend on where the host's buffers end. A span
+    // is at most kResponseTaps samples (it never crosses the caller's
+    // kSubBlock grid); a longer one is tested early (bounded work).
+    void applyCoupledInput(int s, const float* u, int n, Kernel kernel = Kernel::Simd, bool final = true) noexcept;
+    // RT. Tests every deferred span now (before anything that changes what
+    // the test reads: an event, a culling change).
+    void flushCoupled() noexcept;
+    bool coupledPending() const noexcept { return spanCount_ > 0; }
     void endCoupled(const SegmentIO* io, int nFrames) noexcept;
     // RT. Wakes every sleeping coupled group of segment s at its
     // quasi-static deflection under input u (a key that starts to take
@@ -314,6 +328,9 @@ private:
     void cullPass(const SegmentIO* io) noexcept;
     void run(SegmentIO* io, int nFrames, Kernel kernel, bool overwrite) noexcept;
     void wakeCoupled(int s, float inputBefore, const float* u, int n) noexcept;
+    void wakeTest(int s, const float* u, int n, int nActive) noexcept;
+    void finishSpan(int s) noexcept;
+    void clearSpans() noexcept;
     void setActive(int g, std::uint8_t on) noexcept {
         if (active_[g] == on) return;
         if (on && groupStale_[g]) refreshGroup(g);
@@ -388,6 +405,11 @@ private:
     int refineCursor_ = 0;
     AlignedArray<int> hList_;
     AlignedArray<float> segCullScale_, segInputScale_;  // per-segment threshold factors
+    // Deferred wake-up spans (applyCoupledInput): input per segment
+    // (segments x kResponseTaps), its length, and the segments that have one.
+    AlignedArray<float> spanU_;
+    AlignedArray<int> spanLen_, spanList_;
+    int spanCount_ = 0, spanListLen_ = 0;
 
     int capacity_ = 0;
     int size_ = 0;

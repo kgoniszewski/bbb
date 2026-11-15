@@ -257,6 +257,67 @@ TEST(coupled_wake_matches_per_mode_reference) {
     CHECK(mismatches == 0);
 }
 
+// A sub-block cut by the end of a host buffer (applyCoupledInput with
+// final = false) takes its wake-up decisions with the rest of the
+// sub-block, or at flushCoupled(): the result is bit for bit that of the
+// uncut sub-block, wherever the cuts fall (here every group sleeps, so the
+// forced pass, which a cut changes by rounding, does not act).
+TEST(coupled_wake_ignores_host_cuts) {
+    const int groups = 6, modes = 16 * groups, n = 32;
+    auto make = [&](ModeBank& b) {
+        std::mt19937 rng(29);
+        std::uniform_real_distribution<double> uf(30.0, 9000.0), us(0.2, 20.0), uw(-1.0, 1.0);
+        b.allocateSegments(&modes, 1);
+        for (int i = 0; i < modes; ++i) {
+            b.setMode(i, uf(rng), us(rng), kFs);
+            // Input weights spread over 60 dB: the groups cross at different samples.
+            const float g = static_cast<float>(1e-3 * std::pow(10.0, -3.0 * (i / 16) / groups));
+            b.setWeights(i, g * static_cast<float>(uw(rng)), g * static_cast<float>(uw(rng)),
+                         static_cast<float>(uw(rng) / modes));
+        }
+        b.setSegmentCoupledGroups(0, groups);
+        b.setCulling(true, -100.0f);
+    };
+    std::vector<float> u = noise(n, 31, 1.0f);
+    for (int k = 0; k < n; ++k) u[k] *= 1e-4f * float(k * k);
+    ModeBank ref;
+    make(ref);
+    ref.applyCoupledInput(0, u.data(), n);
+    CHECK(ref.groupsWoken() > 1 && ref.groupsWoken() < static_cast<std::uint64_t>(groups));
+    auto same = [&](const ModeBank& b) {
+        bool eq = b.activeGroups() == ref.activeGroups() && b.groupsWoken() == ref.groupsWoken();
+        for (int m = 0; m < modes; ++m) eq = eq && b.stateRe(m) == ref.stateRe(m) && b.stateIm(m) == ref.stateIm(m);
+        return eq;
+    };
+    const int cuts[][4] = {{1, 31, 0, 0}, {5, 27, 0, 0}, {3, 2, 9, 18}, {31, 1, 0, 0}};
+    for (const auto& c : cuts) {
+        ModeBank b;
+        make(b);
+        int pos = 0;
+        for (int p = 0; p < 4 && c[p] > 0; ++p) {
+            const bool last = pos + c[p] == n;
+            b.applyCoupledInput(0, u.data() + pos, c[p], Kernel::Simd, last);
+            CHECK(b.coupledPending() == !last);
+            if (!last) CHECK(b.groupsWoken() == 0);
+            pos += c[p];
+        }
+        CHECK(same(b));
+    }
+    // A span ended by flushCoupled (an event at the buffer boundary) equals
+    // a sub-block ending there.
+    ModeBank a, b;
+    make(a);
+    make(b);
+    a.applyCoupledInput(0, u.data(), 20);
+    b.applyCoupledInput(0, u.data(), 7, Kernel::Simd, false);
+    b.applyCoupledInput(0, u.data() + 7, 13, Kernel::Simd, false);
+    b.flushCoupled();
+    CHECK(!b.coupledPending());
+    bool eq = a.activeGroups() == b.activeGroups() && a.groupsWoken() == b.groupsWoken();
+    for (int m = 0; m < modes; ++m) eq = eq && a.stateRe(m) == b.stateRe(m) && a.stateIm(m) == b.stateIm(m);
+    CHECK(eq);
+}
+
 // Large arrays allocated together start at distinct cache-line offsets
 // modulo 4 KiB and 16 KiB (aligned.h), so kernels that stream them in
 // lockstep at equal indices never map them all to one cache set.

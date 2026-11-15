@@ -639,13 +639,13 @@ void CouplingLoop::push(int i, const float* zoneDisp) noexcept {
     for (int o = 0; o < nOut_; ++o) d[outZones_[o]] = zoneDisp[outZones_[o]];
 }
 
-void CouplingLoop::end(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel) noexcept {
+void CouplingLoop::end(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel, bool final) noexcept {
     float* u = u_.data();
     for (int l = 0; l < nListen_; ++l) {
         const int k = listenList_[l];
         for (int i = 0; i < n; ++i) u[i] = keyInput(k, i);
         if (io[k].skip) bank.setCoupledInputHistory(k, u[n - 1]);
-        else bank.applyCoupledInput(k, u, n, kernel);
+        else bank.applyCoupledInput(k, u, n, kernel, final);
     }
     for (int z = 0; z < kZ; ++z) {
         d_[z] = d_[n * kZ + z];

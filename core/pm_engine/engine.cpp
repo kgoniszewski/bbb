@@ -781,6 +781,7 @@ void Engine::readParams() noexcept {
     const bool on = cullOn_.load(std::memory_order_relaxed);
     const float db = cullDb_.load(std::memory_order_relaxed);
     if (on != appliedCullOn_ || db != appliedCullDb_) {
+        bank_.flushCoupled();  // wake-ups pending from the last buffer, at the old threshold
         appliedCullOn_ = on;
         appliedCullDb_ = db;
         bank_.setCulling(on, db - cullOffsetDb_);
@@ -793,7 +794,7 @@ void Engine::readParams() noexcept {
 // loop and the board run sample by sample, then the loop's input is added
 // to the strings' state (CouplingLoop, pm_board/soundboard.h). Output into
 // mixL_/mixR_ (board) and hfL_/hfR_ (direct).
-void Engine::processBoard(int n) noexcept {
+void Engine::processBoard(int n, bool final) noexcept {
     for (int a = 0; a < activeCount_; ++a) {
         const int k = hammers_[active_[a]].key;
         hView_[a] = contact_.view(bank_, k);
@@ -877,12 +878,12 @@ void Engine::processBoard(int n) noexcept {
         mixR_[i] = kBoardOutputGain * pick_[1];
     }
     PM_PROF_LAP(Board);
-    loop_.end(bank_, io_.data(), n);
+    loop_.end(bank_, io_.data(), n, Kernel::Simd, final);
     PM_PROF_LAP(ForcedPass);
     bank_.endCoupled(io_.data(), n);
 }
 
-void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept {
+void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now, bool final) noexcept {
     ++info_.subBlocks;
     float* mL = mixL_.data();
     float* mR = mixR_.data();
@@ -897,7 +898,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
         // damper noise drives the board), at the same sample whatever the
         // buffering, since it is decided per sub-block.
         const bool quiet = activeCount_ == 0 && bank_.activeGroups() == 0 && board_.asleep() && nKnocks_ == 0 &&
-                           noiseAmp_ == 0.0f;
+                           noiseAmp_ == 0.0f && !bank_.coupledPending();
         idle = quiet && quietRun_ >= 2 && idleSleep_;
         if (idle) {
             ++info_.idleSubBlocks;
@@ -908,7 +909,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now)
             std::fill(hfL_.data(), hfL_.data() + n, 0.0f);
             std::fill(hfR_.data(), hfR_.data() + n, 0.0f);
         } else {
-            processBoard(n);
+            processBoard(n, final);
         }
         quietRun_ = quiet ? std::min(quietRun_ + 1, 2) : 0;
         // Direct path, high-passed (skipped once its state has decayed to
@@ -1047,6 +1048,11 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
     int pos = 0;
     while (pos < nFrames) {
         const std::int64_t now = static_cast<std::int64_t>(sampleTime_) + pos;
+        // An event at a host buffer boundary ends the sub-block there, as an
+        // event inside a buffer does: wake-up tests deferred by the
+        // boundary are taken before it (they would have been, had the
+        // event been known when the last buffer ended).
+        if (pendingCount_ > 0 && pending_[0].when <= now && bank_.coupledPending()) bank_.flushCoupled();
         while (pendingCount_ > 0 && pending_[0].when <= now) {
             const Event e = pending_[0].e;
             --pendingCount_;
@@ -1059,14 +1065,19 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             bank_.beginResponseTick(exactRespApplied_ ? -1 : kResponseBudget);
             if (!tickIsNoOp()) controlTick(now);
         }
-        std::int64_t len = std::min<std::int64_t>(nFrames - pos, kSubBlock - now % kSubBlock);
-        if (pendingCount_ > 0) len = std::min<std::int64_t>(len, pending_[0].when - now);
+        // Sub-block end: the next point of the absolute grid, event or
+        // hammer grid (fixed relative to the music), or the end of the
+        // buffer. Wake-up decisions are taken only at the former (final),
+        // so they do not depend on how the host slices time.
+        std::int64_t lim = kSubBlock - now % kSubBlock;
+        if (pendingCount_ > 0) lim = std::min<std::int64_t>(lim, pending_[0].when - now);
         for (int a = 0; a < activeCount_; ++a) {
             const std::int64_t age = now - static_cast<std::int64_t>(hammers_[active_[a]].launchTime);
-            len = std::min<std::int64_t>(len, kSubBlock - age % kSubBlock);
+            lim = std::min<std::int64_t>(lim, kSubBlock - age % kSubBlock);
         }
+        const std::int64_t len = std::min<std::int64_t>(nFrames - pos, lim);
         if (subBlockHook_) subBlockHook_(subBlockCtx_);
-        processSubBlock(left + pos, right + pos, static_cast<int>(len), now);
+        processSubBlock(left + pos, right + pos, static_cast<int>(len), now, len == lim);
         pos += len;
     }
     sampleTime_ += static_cast<std::uint64_t>(nFrames);

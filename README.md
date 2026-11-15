@@ -248,9 +248,12 @@ duplex yet.
   or absolute engine sample indices. Lowest-latency mode puts due events at
   the start of the buffer; constant-latency mode adds a fixed delay
   (default: one buffer) to host-time events. Buffers are cut at event times
-  and on fixed grids, so output is the same for any buffer size and a
-  note-on lands on its exact sample (to rounding, -100 to -110 dB: the
-  soundboard loop sums per sub-block).
+  and on fixed grids, and no decision is taken where a host buffer alone
+  ends a sub-block (soundboard wake-ups wait for the rest of it), so output
+  is the same for any buffer size, culling on or off (to rounding, -107 to
+  -116 dB re peak for 1 to 512 frames, bit-identical for multiples of 32:
+  the soundboard loop sums per sub-block), and a note-on lands on its
+  exact sample.
 - **Real-time.** `render()` does not allocate, lock, throw or do I/O
   (checked by a test that counts every `operator new`).
 
