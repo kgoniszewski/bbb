@@ -32,6 +32,7 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
                     segTValid_.allocate(ns) &&
                     segCullScale_.allocate(ns) && segInputScale_.allocate(ns) &&
                     segDamp_.allocate(ns) && segInput_.allocate(ns) &&
+                    spanU_.allocate(ns * kResponseTaps) && spanLen_.allocate(ns) && spanList_.allocate(ns) &&
                     scratch_.allocate(static_cast<std::size_t>(kCullInterval) * simd::kWidth);
     capacity_ = ok ? static_cast<int>(padded) : 0;
     if (ok) {
@@ -43,11 +44,13 @@ bool ModeBank::allocateArrays(int groups, int segments) noexcept {
             groupHValid_[g] = groupH0Valid_[g] = groupTaylorValid_[g] = groupApprox_[g] = 0;
         }
         for (std::size_t i = 0; i < ns; ++i) {
+            spanLen_[i] = 0;
             segApprox_[i] = segTValid_[i] = 0;
             segDampTick_[i] = segAwakeVer_[i] = segTVer_[i] = 0;
         }
     }
     activeCount_ = 0;
+    spanCount_ = spanListLen_ = 0;
     size_ = 0;
     nSeg_ = ok ? segments : 0;
     sinceCull_ = 0;
@@ -238,9 +241,16 @@ void ModeBank::clearState() noexcept {
     for (int g = 0; g < groupCount(); ++g) active_[g] = cullEnabled_ ? 0 : 1;
     syncActive();
     touchAll();
+    clearSpans();
+}
+
+void ModeBank::clearSpans() noexcept {
+    for (int l = 0; l < spanListLen_; ++l) spanLen_[spanList_[l]] = 0;
+    spanCount_ = spanListLen_ = 0;
 }
 
 void ModeBank::setCulling(bool enabled, float thresholdDb) noexcept {
+    clearSpans();  // a caller that wants their wake-ups calls flushCoupled() first
     cullEnabled_ = enabled;
     cullThreshold_ = std::pow(10.0f, thresholdDb / 20.0f);
     for (int g = 0; g < groupCount(); ++g) {
@@ -650,7 +660,7 @@ void ModeBank::precomputeCoupledResponses() noexcept {
         }
 }
 
-void ModeBank::applyCoupledInput(int s, const float* u, int n, Kernel kernel) noexcept {
+void ModeBank::applyCoupledInput(int s, const float* u, int n, Kernel kernel, bool final) noexcept {
     if (n <= 0) return;
     segInPrev_[s] = u[n - 1];
     int nActive = 0;
@@ -666,12 +676,54 @@ void ModeBank::applyCoupledInput(int s, const float* u, int n, Kernel kernel) no
         forcedBlocks_ += static_cast<std::uint64_t>(nActive);
     }
     if (!cullEnabled_) return;
+    if (final && spanLen_[s] == 0) {
+        wakeTest(s, u, n, nActive);
+        return;
+    }
+    constexpr int T = kResponseTaps;
+    if (spanLen_[s] + n > T) finishSpan(s);  // not with the engine's sub-blocks
+    if (spanLen_[s] == 0) {
+        ++spanCount_;
+        if (spanListLen_ == nSeg_) {  // drop finished entries (bounded: nSeg_)
+            int j = 0;
+            for (int l = 0; l < spanListLen_; ++l)
+                if (spanLen_[spanList_[l]] > 0) spanList_[j++] = spanList_[l];
+            spanListLen_ = j;
+        }
+        spanList_[spanListLen_++] = s;
+    }
+    float* span = spanU_.data() + std::size_t(s) * T;
+    for (int k = 0; k < n; ++k) span[spanLen_[s] + k] = u[k];
+    spanLen_[s] += n;
+    if (final) finishSpan(s);
+}
+
+// The wake-up test of one span of input (see applyCoupledInput): the bound
+// accumulated since the last cull pass, summed exactly as over an uncut
+// sub-block.
+void ModeBank::wakeTest(int s, const float* u, int n, int nActive) noexcept {
     float l1 = 0.0f;
     for (int k = 0; k < n; ++k) l1 += std::fabs(u[k]);
     const float before = segInput_[s];
     segInput_[s] += l1;
     if (nActive < segCoupled_[s] && segInput_[s] * segWakeGain_[s] > cullThreshold_ * segInputScale_[s])
         wakeCoupled(s, before, u, n);
+}
+
+void ModeBank::finishSpan(int s) noexcept {
+    const int n = spanLen_[s];
+    if (n == 0) return;
+    spanLen_[s] = 0;
+    if (--spanCount_ == 0) spanListLen_ = 0;
+    int nActive = 0;
+    for (int g = segFirstGroup(s); g < segFirstGroup(s) + segCoupled_[s]; ++g) nActive += active_[g] ? 1 : 0;
+    wakeTest(s, spanU_.data() + std::size_t(s) * kResponseTaps, n, nActive);
+}
+
+void ModeBank::flushCoupled() noexcept {
+    // finishSpan resets the list when the last span is done; read it first.
+    const int len = spanListLen_;
+    for (int l = 0; l < len && spanCount_ > 0; ++l) finishSpan(spanList_[l]);
 }
 
 // A group wakes at the first sample i where the input accumulated since the

@@ -210,5 +210,74 @@ TEST(bass_driving_point_not_peaky) {
                 worstPeak);
     CHECK(median >= 700.0 && median <= 2000.0);
     CHECK(mins.front() >= 120.0);
-    CHECK(worstPeak <= 9.0);
+    // Loosened from 9.0 (low-regime board, plan §1.6 note (6)): the worst
+    // peak is the unchanged first mode (57.6 Hz) and fell (6.45e-3 to
+    // 6.18e-3 s/kg), but the mean over 40-500 Hz it is divided by fell more
+    // (8.2e-4 to 6.9e-4: the denser low regime has no tall isolated peaks),
+    // so the ratio rose from 7.9 to 9.0.
+    CHECK(worstPeak <= 9.5);
+}
+
+// Low-frequency regime (plan §1.6 note (6), Boutillon & Ege 2013): below
+// 1.1 kHz the modes extend over the whole board, whose equivalent isotropic
+// plate has a dynamical rigidity D / rho_h of 68-73 m^4/s^2 on the grands
+// measured (96-105 on uprights). With clamped edges the mode count between
+// f0 and f1 is N(f1) - N(f0), N(f) = A f / (2 r^2) - P sqrt(f) / (r sqrt(2 pi)),
+// r = Diso^(1/4): about 125 between 90 and 1100 Hz for this board's area and
+// perimeter at Diso = 70. The v0 plate (one stiffness for the whole range,
+// set by the density above 1 kHz) had 37, with gaps of up to 79 Hz (none
+// between 105 and 155 Hz but one at 154.7). Checks: the count per band
+// within 15 % of the formula, no gap above 30 Hz between 90 and 1100 Hz (v0:
+// 79 Hz; the formula's mean spacing there is 4-17 Hz), and the statistics
+// at the bridge: the spread of Re Y over all keys' bridge points and
+// frequencies (standard deviation of log10 Re Y; v0 0.445 / 0.410 / 0.325 in
+// the three bands, now 0.27 / 0.19 / 0.15) below 0.33 / 0.25 / 0.20, with
+// its geometric mean over 90-1100 Hz within 1 dB of the v0 board's (the
+// change is to the statistics; the level is M6's calibration).
+TEST(low_regime_modal_density_and_bridge_statistics) {
+    const pm::BoardModel& b = pm::defaultBoard();
+    pm::PlateParams v0p;
+    v0p.lowRegimeDiso = 0.0;
+    const pm::BoardModel v0 = pm::buildPlateBoard(v0p);
+    const pm::PlateParams& p = b.params;
+    const double r = std::pow(p.lowRegimeDiso, 0.25), A = p.lengthX * p.widthY, P = 2.0 * (p.lengthX + p.widthY);
+    auto N = [&](double f) { return A * f / (2.0 * r * r) - P * std::sqrt(f) / (r * std::sqrt(2.0 * kPi)); };
+    const double bands[3][2] = {{90.0, 250.0}, {250.0, 600.0}, {600.0, 1100.0}};
+    const double spreadMax[3] = {0.33, 0.25, 0.20};
+    auto stats = [](const pm::BoardModel& m, double f0, double f1, double& mean, double& sd) {
+        std::vector<double> l;
+        for (int key = 1; key <= 88; ++key)
+            for (int j = 0; j < 60; ++j)
+                l.push_back(std::log10(pm::boardDrivingPoint(m, key, f0 * std::pow(f1 / f0, j / 59.0)).real()));
+        mean = 0.0;
+        for (double v : l) mean += v;
+        mean /= l.size();
+        sd = 0.0;
+        for (double v : l) sd += (v - mean) * (v - mean);
+        sd = std::sqrt(sd / l.size());
+    };
+    for (int q = 0; q < 3; ++q) {
+        int count = 0, countV0 = 0;
+        for (double f : b.freq) count += f >= bands[q][0] && f < bands[q][1];
+        for (double f : v0.freq) countV0 += f >= bands[q][0] && f < bands[q][1];
+        const double expect = N(bands[q][1]) - N(bands[q][0]);
+        double m, sd, m0, sd0;
+        stats(b, bands[q][0], bands[q][1], m, sd);
+        stats(v0, bands[q][0], bands[q][1], m0, sd0);
+        std::printf("  %4.0f-%4.0f Hz: %3d modes (formula %.1f, v0 %d); spread of log10 Re Y %.3f (v0 %.3f), "
+                    "geometric mean %+.2f dB re v0\n",
+                    bands[q][0], bands[q][1], count, expect, countV0, sd, sd0, 10.0 * (m - m0));
+        CHECK(std::fabs(count - expect) <= 0.15 * expect);
+        CHECK(sd <= spreadMax[q]);
+    }
+    double gap = 0.0;
+    for (int i = 1; i < b.modes; ++i)
+        if (b.freq[i - 1] >= 90.0 && b.freq[i] < 1100.0) gap = std::max(gap, b.freq[i] - b.freq[i - 1]);
+    double m, sd, m0, sd0;
+    stats(b, 90.0, 1100.0, m, sd);
+    stats(v0, 90.0, 1100.0, m0, sd0);
+    std::printf("  largest gap 90-1100 Hz %.1f Hz; geometric mean of Re Y 90-1100 Hz %+.2f dB re v0\n", gap,
+                10.0 * (m - m0));
+    CHECK(gap <= 30.0);
+    CHECK(std::fabs(10.0 * (m - m0)) <= 1.0);
 }

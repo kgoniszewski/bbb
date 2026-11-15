@@ -58,7 +58,20 @@ TEST(event_offset_shifts_output) {
             // by k changes the damping curve by under two control periods:
             // a tiny, inaudible difference (about -62 dB re peak here, -73
             // dB before the two-tick grid for the pedal).
-            CHECK_LE(20 * std::log10(d / peak + 1e-30), -60.0);
+            // Loosened from -60 dB with the low-regime board (plan §1.6
+            // note (6)): culling on, offset 45 measures -59.8 dB (v0 board
+            // -62.3 dB). That worst case is not the damping curve (culling
+            // off: -64.3 dB, from the pedal release) but culling at the
+            // pedal press: it lifts the dampers of strings the board moves,
+            // and their groups wake at sub-block ends and are culled on the
+            // 64-sample pass, both on the absolute grid, so relative to the
+            // shifted pedal they move by up to a sub-block; the difference
+            // scales with the threshold (pedal press alone, offset 45: -80.6
+            // dB culling off; culling at -80 / -100 / -120 dB: -46 / -60 /
+            // -80 dB). The denser board drives more such wake-ups. Not
+            // changed by taking wake-ups on the music's grid only: these
+            // renders use 64-frame buffers.
+            CHECK_LE(20 * std::log10(d / peak + 1e-30), -58.0);
         }
     }
 }
@@ -86,21 +99,37 @@ TEST(note_on_offset_is_exact) {
 
 // Rendering with different buffer sizes gives the same output to rounding
 // (bit-identical before the block-wise soundboard loop, see above; a host
-// buffer boundary cuts a sub-block like an event does).
+// buffer boundary cuts a sub-block like an event does, which changes the
+// rounding of the loop's sums). With culling on, a sleeping coupled group
+// woken in a sub-block joins at its end (here: the pedal at sample 2100
+// lifts the dampers of strings the board is moving), so the wake-up
+// decisions are taken only where the music ends a sub-block (grid, events,
+// hammer grids), never at a host buffer's end alone (ModeBank::
+// applyCoupledInput, final): culling on is held to the same limit as
+// culling off. (Restored, then tightened: it had been loosened to -95 dBFS
+// = -76 dB re peak when the wake-ups still followed host cuts and measured
+// -78.4 dB re peak; previously -90 dB re peak.) Measured: -107.6 (off) and
+// -112.0 dB (on) re peak, worst block. Buffers that are multiples of the
+// 32-sample grid cut nothing extra: bit-identical.
 TEST(block_size_invariance) {
     const int n = 30000;
-    pm::Engine eng;
-    eng.prepare(kFs, 512);
-    const Stereo ref = renderEngine(eng, scene(100), n, 64);
-    for (int block : {1, 7, 37, 128, 500}) {
+    for (bool cull : {false, true}) {
+        pm::Engine eng;
+        eng.setCulling(cull, -100.0f);
         eng.prepare(kFs, 512);
-        const Stereo s = renderEngine(eng, scene(100), n, block);
-        double d = 0.0;
-        for (int i = 0; i < n; ++i)
-            d = std::max(d, std::max(double(std::fabs(s.l[i] - ref.l[i])), double(std::fabs(s.r[i] - ref.r[i]))));
-        const double db = 20.0 * std::log10(d / peakAbs(ref.l) + 1e-30);
-        std::printf("  block %3d: max difference %.1f dB re peak\n", block, db);
-        CHECK_LE(db, -90.0);
+        const Stereo ref = renderEngine(eng, scene(100), n, 64);
+        for (int block : {1, 7, 32, 37, 96, 128, 500, 512}) {
+            eng.prepare(kFs, 512);
+            const Stereo s = renderEngine(eng, scene(100), n, block);
+            double d = 0.0;
+            for (int i = 0; i < n; ++i)
+                d = std::max(d, std::max(double(std::fabs(s.l[i] - ref.l[i])), double(std::fabs(s.r[i] - ref.r[i]))));
+            const double db = 20.0 * std::log10(d / peakAbs(ref.l) + 1e-30);
+            std::printf("  culling %s, block %3d: max difference %.1f dB re peak (%.1f dBFS)\n", cull ? "on " : "off",
+                        block, db, 20.0 * std::log10(d + 1e-30));
+            if (block % 32 == 0) CHECK(d == 0.0);
+            else CHECK_LE(db, -100.0);
+        }
     }
 }
 

@@ -36,7 +36,13 @@ constexpr double kTension[kAnchors] = {1300, 750, 670, 720, 750, 700};
 constexpr double kB[kAnchors] = {2.5e-4, 7.4e-5, 3.8e-4, 2.5e-3, 8.6e-3, 1.5e-2};
 constexpr double kMassG[kAnchors] = {11.0, 10.0, 9.0, 6.0, 5.0, 4.5};
 constexpr double kP[kAnchors] = {2.2, 2.3, 2.5, 2.8, 3.0, 3.5};
-constexpr double kK[kAnchors] = {2e8, 4e8, 4.5e9, 1e11, 1e12, 3e12};
+// Felt K. The plan's first C8 value (3e12 at p = 3.5) made the top hammer
+// far softer than C7's at every working compression (force at 0.3 mm: A0
+// 3.5, C2 3.2, C4 7.0, C6 13.7, C7 27, C8 1.4 N), so the top-octave contact
+// lasted longer than C7's and put 1e-6 to 1e-8 of the hammer's energy into
+// the strings. C8 now continues the C6-C7 progression (x2 per octave):
+// 50 N at 0.3 mm, K = 50 / (3e-4)^3.5 = 1.1e14 (plan §2.1).
+constexpr double kK[kAnchors] = {2e8, 4e8, 4.5e9, 1e11, 1e12, 1.1e14};
 constexpr double kStrike[kAnchors] = {0.12, 0.12, 0.12, 0.09, 0.0625, 0.06};
 constexpr double kB1[kAnchors] = {0.115, 0.15, 0.335, 0.92, 1.8, 4.0};
 constexpr double kB3[kAnchors] = {1e-8, 8e-9, 3.5e-9, 1.5e-9, 1e-9, 8e-10};

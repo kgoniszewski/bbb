@@ -22,7 +22,8 @@ set(PM_TESTS
   test_passivity
   test_sympathetic
   test_half_pedal
-  test_idle)
+  test_idle
+  test_decay_trend)
 
 find_package(Threads REQUIRED)
 foreach(t IN LISTS PM_TESTS)

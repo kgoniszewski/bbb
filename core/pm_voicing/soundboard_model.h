@@ -39,9 +39,22 @@
 // estimate until measured data exist) and a 2 % frequency scatter. Result
 // over keys 1-52, 40-500 Hz: median |Z| 1,130 kg/s, every key's minimum
 // above 150 kg/s, Re Y peaks within 8 times the mean
-// (test_soundboard_model). The sparse region of the plate's low spectrum
-// (no mode between 105 and 155 Hz) remains: filling it needs a non-uniform
-// plate (rib layout, thickness taper), beyond v0.
+// (test_soundboard_model).
+//
+// Low regime. One stiffness for the whole range (set by the density above
+// 1 kHz) leaves the plate far too sparse below about 1.1 kHz (37 modes
+// between 90 and 1100 Hz, none between 105 and 155 Hz but one). Real boards
+// have two regimes (Ege et al. 2013; Boutillon & Ege 2013): below about
+// 1.1 kHz the modes extend over the whole board, a homogeneous plate of
+// equivalent isotropic rigidity D / rho_h = 68-73 m^4/s^2 on grands, with
+// clamped edges, n(f) = A / (2 r^2) - P / (2 r sqrt(2 pi f)), r = Diso^(1/4);
+// above, the ribs confine the waves. Between lowRegimeFromHz and
+// lowRegimeToHz the modes are therefore those of a clamped isotropic plate
+// (Warburton's frequency approximation, products of clamped beam
+// functions), and the bridge's own stiffness and mass are represented by
+// scaling those modes' shapes at the bridges (keys and zones, not pickups)
+// by sqrt(lowRegimeBridgeLevel n_plate / n_low(f)), which keeps the mean
+// bridge conductance at the stiff plate's level (plan §1.6 note (6)).
 //
 // Bridges. Treble bridge (keys 21-88) and bass bridge (keys 1-20) are
 // quadratic Bezier curves in plate coordinates; keys sit at equal arc-length
@@ -144,6 +157,21 @@ struct PlateParams {
     double horizontalRatio = 12.0;
     double cross = 0.25;
     int continuationPoints = 360;  // log-frequency grid of the continuation table
+    // Low-frequency regime (Boutillon & Ege 2013, see "Low regime" above):
+    // between lowRegimeFromHz and lowRegimeToHz the modes are those of a
+    // clamped isotropic plate of the same size and mass with dynamical
+    // rigidity lowRegimeDiso = D / rho_h (m^4/s^2); their shapes at the
+    // bridges are scaled by sqrt(n_plate / n_low(f)) so that the mean bridge
+    // conductance is that of the stiff plate, times lowRegimeBridgeLevel.
+    // lowRegimeDiso <= 0: off (the v0 board).
+    double lowRegimeDiso = 70.0;
+    double lowRegimeFromHz = 90.0, lowRegimeToHz = 1100.0;
+    // Level of the bridge conductance in the low regime relative to n / (4 M)
+    // of the stiff plate. 0.63 keeps the geometric mean of Re Y at the bridge
+    // points over 90-1100 Hz at the v0 board's value (which, sparse and
+    // peaky, sat below its own n / (4 M)); the absolute level is a voicing
+    // quantity for M6, so this change alters the statistics only.
+    double lowRegimeBridgeLevel = 0.63;
 };
 
 struct BoardModel {
@@ -151,6 +179,8 @@ struct BoardModel {
     int modes = 0;
     std::vector<double> freq, sigma;  // Hz, 1/s
     std::vector<int> mIndex, nIndex;  // plate mode numbers (0 for a measured set)
+    std::vector<char> lowRegime;      // 1: mode of the low-regime (clamped) plate
+    std::vector<double> bridgeScale;  // per mode: factor on its key and zone shapes
     int zones = 0;
     std::vector<double> zoneShape;    // zones x modes, 1/sqrt(kg)
     std::vector<double> keyShape;     // kNumKeys x modes, at each key's bridge point

@@ -59,14 +59,23 @@
 // kSubBlock frames (control-rate state: damper envelopes) and on a grid
 // relative to each active hammer's launch (hammer release), and every
 // decision with a lasting effect (wake-ups, hammer release, damper motion)
-// is taken at a sample fixed relative to those. Output therefore does not
-// depend on how the host cuts the stream into buffers, and an event lands
-// on its exact sample: a note-on moved by k samples gives the same output
-// moved by k samples. Both hold to rounding (-100 to -110 dB re peak), not
-// bit-exactly: the soundboard loop sums its forced response per sub-block,
-// so where a buffer boundary or an event cuts a sub-block changes the
-// rounding. (With culling, whose 64-sample grid is absolute, a moved note
-// also differs to within the culling threshold.)
+// is taken at a sample fixed relative to those. A host buffer's end also
+// cuts a sub-block, but no decision is taken there: the wake-up test of the
+// soundboard loop (a sleeping coupled group joins at the end of the
+// sub-block in which its input bound is crossed, its output missing until
+// then) waits for the rest of the sub-block (CouplingLoop::end, final), or
+// is taken before an event that falls on the boundary. Output therefore
+// does not depend on how the host cuts the stream into buffers, culling on
+// or off, and an event lands on its exact sample: a note-on moved by k
+// samples gives the same output moved by k samples. The first holds to
+// rounding (-107 to -116 dB re peak over five scenes and buffers of 1 to
+// 512 frames), bit-exactly for buffers that are multiples of kSubBlock; the
+// soundboard loop sums its forced response per sub-block, so where a buffer
+// boundary or an event cuts a sub-block changes the rounding. A moved note
+// differs more: the control grid (damper motion) and, with culling, the
+// sub-block ends at which wake-ups and the 64-sample cull passes fall are
+// absolute, so they move relative to the note (-60 dB re peak in
+// test_scheduling's pedalled scene; -80 dB with culling at -120 dB).
 //
 // Soundboard off (SoundboardConfig::enabled = false, for A/B, or prepare()
 // with an explicit bridge): the M3 output, the sum of the keys' bridge
@@ -484,8 +493,8 @@ private:
     void retargetDamper(int k, std::int64_t now, float releaseVelocity) noexcept;
     void controlTick(std::int64_t now) noexcept;
     bool tickIsNoOp() const noexcept;
-    void processSubBlock(float* left, float* right, int n, std::int64_t now) noexcept;
-    void processBoard(int n) noexcept;
+    void processSubBlock(float* left, float* right, int n, std::int64_t now, bool final) noexcept;
+    void processBoard(int n, bool final) noexcept;
     bool prepareImpl(double sampleRate, int maxFrames, const PianoTable& table, const BridgeAdmittance& bridge,
                      bool board) noexcept;
     float pedalFactor(int k) noexcept;

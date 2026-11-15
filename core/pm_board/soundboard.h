@@ -179,9 +179,13 @@ inline void zonesToKeys(const KeyZone* kz, const float* zoneDisp, int keys, floa
 // bound was only just crossed. A key that starts taking input (its damper
 // lifted by the pedal) has its sleeping coupled groups woken at once, before
 // the sub-block, since its input is then typically far above the bound.
-// Every such decision falls on a sample fixed relative to the music, so the
-// output does not depend on how the stream is cut into sub-blocks (to
-// rounding).
+// Since a woken group's output is missing up to the end of its sub-block,
+// where sub-blocks end matters (at the culling threshold, not at rounding
+// level). The engine therefore ends a sub-block for this purpose only at
+// samples fixed relative to the music (its kSubBlock grid, event times, a
+// hammer's launch grid); where it also cuts at the end of a host buffer it
+// passes final = false and the wake-up test covers the whole sub-block, so
+// the output does not depend on the host's buffer size (to rounding).
 //
 // configure() is non-real-time; everything else is RT.
 class CouplingLoop {
@@ -236,8 +240,11 @@ public:
     }
     // The board's zone displacements after sample i (input of sample i + 1).
     void push(int i, const float* zoneDisp) noexcept;
-    // Applies the inputs of the sub-block to the bank (and wakes groups).
-    void end(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel = Kernel::Simd) noexcept;
+    // Applies the inputs of the sub-block to the bank (and wakes groups;
+    // final = false: the sub-block was cut only by the end of a host
+    // buffer, the wake-up test waits for the rest of it, see
+    // ModeBank::applyCoupledInput).
+    void end(ModeBank& bank, const SegmentIO* io, int n, Kernel kernel = Kernel::Simd, bool final = true) noexcept;
 
     // Inspection: keys in the loop (awake coupled groups) during the last sub-block.
     int memberCount() const noexcept { return nMembers_; }

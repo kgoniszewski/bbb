@@ -57,13 +57,23 @@ double plateShape(const PlateParams& p, int m, int n, double x, double y) {
     return std::sin(m * kPi * x / p.lengthX) * std::sin(n * kPi * y / p.widthY);
 }
 
-// Mean of the plate shape over the bridge contact around (x, y).
-double bridgeShape(const PlateParams& p, int m, int n, Point at, Point tangent) {
+double clampedBeam(int m, double xi);
+
+// Shape of mode (m, n) of the stiff plate (simply supported, low = false)
+// or of the low-regime plate (clamped beam functions), unnormalised: mean
+// square 1/4 and 1 over the plate respectively.
+double modeShape(const PlateParams& p, bool low, int m, int n, double x, double y) {
+    if (!low) return plateShape(p, m, n, x, y);
+    return clampedBeam(m, x / p.lengthX) * clampedBeam(n, y / p.widthY);
+}
+
+// Mean of the mode shape over the bridge contact around (x, y).
+double bridgeShape(const PlateParams& p, bool low, int m, int n, Point at, Point tangent) {
     const int np = std::max(1, p.bridgePoints);
     double s = 0.0;
     for (int i = 0; i < np; ++i) {
         const double d = np == 1 ? 0.0 : p.bridgeHalfLength * (2.0 * i / (np - 1) - 1.0);
-        s += plateShape(p, m, n, at.x + d * tangent.x, at.y + d * tangent.y);
+        s += modeShape(p, low, m, n, at.x + d * tangent.x, at.y + d * tangent.y);
     }
     return s / np;
 }
@@ -75,6 +85,41 @@ double jitter(int m, int n, unsigned seed) {
     x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
     x ^= x >> 31;
     return double(x >> 11) * (2.0 / 9007199254740992.0) - 1.0;
+}
+
+// Clamped-clamped beam (Euler-Bernoulli): roots beta L of cos cosh = 1 and
+// the eigenfunction cosh bx - cos bx - s (sinh bx - sin bx) with mean square
+// 1 over the span, written with decaying exponentials only (stable for any
+// beta L).
+double clampedRoot(int m) {
+    static constexpr double r[5] = {4.730040745, 7.853204624, 10.99560784, 14.13716549, 17.27875966};
+    return m <= 5 ? r[m - 1] : (m + 0.5) * kPi;
+}
+double clampedBeam(int m, double xi /* x / L in [0, 1] */) {
+    const double bl = clampedRoot(m);
+    const double e1 = std::exp(-bl), e2 = e1 * e1;
+    const double den = 1.0 - e2 - 2.0 * std::sin(bl) * e1;  // 2 (sinh bL - sin bL) e^-bL
+    const double s = (1.0 + e2 - 2.0 * std::cos(bl) * e1) / den;
+    const double bx = bl * std::clamp(xi, 0.0, 1.0);
+    // (1 - s) / 2 e^{bx}  and  (1 + s) / 2 e^{-bx}
+    const double grow = (std::cos(bl) - std::sin(bl) - e1) * std::exp(bx - bl) / den;
+    return grow + 0.5 * (1.0 + s) * std::exp(-bx) - std::cos(bx) + s * std::sin(bx);
+}
+// Warburton's approximation for a clamped plate: G = beta L / pi and the
+// mixed-term factor H / G^2 = 1 - 2 / (G pi).
+double clampedPlateFreq(const PlateParams& p, double D, int m, int n) {
+    const double gm = clampedRoot(m) / kPi, gn = clampedRoot(n) / kPi;
+    const double km = gm * kPi / p.lengthX, kn = gn * kPi / p.widthY;
+    const double hm = 1.0 - 2.0 / (gm * kPi), hn = 1.0 - 2.0 / (gn * kPi);
+    const double w2 = D * (km * km * km * km + kn * kn * kn * kn + 2.0 * km * km * kn * kn * hm * hn) / p.massPerArea;
+    return std::sqrt(w2) / (2.0 * kPi);
+}
+// Asymptotic modal density with the clamped-edge correction (Boutillon &
+// Ege 2013, eq. B.1): n(f) = A / (2 r^2) - P / (2 r sqrt(2 pi f)), r = Diso^(1/4).
+double lowRegimeDensity(const PlateParams& p, double f) {
+    const double r = std::pow(p.lowRegimeDiso, 0.25);
+    const double A = p.lengthX * p.widthY, P = 2.0 * (p.lengthX + p.widthY);
+    return std::max(A / (2.0 * r * r) - P / (2.0 * r * std::sqrt(2.0 * kPi * std::max(f, 1.0))), 1e-6);
 }
 
 double directionalD(const PlateParams& p, double th) {
@@ -139,8 +184,19 @@ BoardModel buildPlateBoard(const PlateParams& p) {
     b.params = p;
     b.mass = p.massPerArea * p.lengthX * p.widthY;
 
-    // Mode enumeration.
-    std::vector<std::tuple<double, int, int>> list;
+    // Asymptotic modal density of the stiff plate:
+    // n = (A / (4 pi)) INT_0^2pi sqrt(rho_h / D(th)) dth.
+    double integ = 0.0;
+    const int nt = 720;
+    for (int t = 0; t < nt; ++t) integ += std::sqrt(p.massPerArea / directionalD(p, 2.0 * kPi * (t + 0.5) / nt));
+    integ *= 2.0 * kPi / nt;
+    b.density = p.lengthX * p.widthY / (4.0 * kPi) * integ;
+    b.meanConductance = b.density / (4.0 * b.mass);
+
+    // Mode enumeration: (frequency, m, n, low regime).
+    const bool lowOn = p.lowRegimeDiso > 0.0 && p.lowRegimeToHz > p.lowRegimeFromHz;
+    auto inLow = [&](double f) { return lowOn && f >= p.lowRegimeFromHz && f < p.lowRegimeToHz; };
+    std::vector<std::tuple<double, int, int, int>> list;
     const double a = p.lengthX, w = p.widthY;
     for (int m = 1; m < 400; ++m) {
         bool any = false;
@@ -150,20 +206,42 @@ BoardModel buildPlateBoard(const PlateParams& p) {
                              std::sqrt((p.Dx * km * km * km * km + 2.0 * p.Dxy * km * km * kn * kn +
                                         p.Dy * kn * kn * kn * kn) / p.massPerArea);
             if (f >= p.maxFreqHz) break;
-            list.emplace_back(f * (1.0 + p.freqJitter * jitter(m, n, p.jitterSeed)), m, n);
             any = true;
+            const double fj = f * (1.0 + p.freqJitter * jitter(m, n, p.jitterSeed));
+            if (inLow(fj)) continue;
+            list.emplace_back(fj, m, n, 0);
         }
         if (!any) break;
+    }
+    if (lowOn) {
+        const double D = p.lowRegimeDiso * p.massPerArea;
+        for (int m = 1; m < 400; ++m) {
+            if (clampedPlateFreq(p, D, m, 1) >= 1.1 * p.lowRegimeToHz) break;
+            for (int n = 1; n < 400; ++n) {
+                const double f = clampedPlateFreq(p, D, m, n);
+                if (f >= 1.1 * p.lowRegimeToHz) break;
+                const double fj = f * (1.0 + p.freqJitter * jitter(m, n, p.jitterSeed + 7919u));
+                if (inLow(fj)) list.emplace_back(fj, m, n, 1);
+            }
+        }
     }
     std::sort(list.begin(), list.end());
     while (!list.empty() && std::get<0>(list.back()) >= p.maxFreqHz) list.pop_back();
     if (static_cast<int>(list.size()) > p.maxModes) list.resize(static_cast<std::size_t>(p.maxModes));
     b.modes = static_cast<int>(list.size());
-    const double norm = 1.0 / std::sqrt(0.25 * b.mass);
-    for (const auto& [f, m, n] : list) {
+    // Mass normalisation: mean square of the shape times M is 1.
+    const double normSS = 1.0 / std::sqrt(0.25 * b.mass), normLow = 1.0 / std::sqrt(b.mass);
+    std::vector<double> norm;
+    for (const auto& [f, m, n, low] : list) {
         b.freq.push_back(f);
         b.mIndex.push_back(m);
         b.nIndex.push_back(n);
+        b.lowRegime.push_back(static_cast<char>(low));
+        norm.push_back(low ? normLow : normSS);
+        // The bridge's own stiffness and mass keep its mean conductance at
+        // the stiff plate's n / (4 M): a low-regime mode's participation at
+        // the bridges is reduced in proportion to the higher density.
+        b.bridgeScale.push_back(low ? std::sqrt(p.lowRegimeBridgeLevel * b.density / lowRegimeDensity(p, f)) : 1.0);
     }
     for (int i = 0; i < b.modes; ++i) b.sigma.push_back(b.eta(b.freq[i]) * kPi * b.freq[i]);
 
@@ -181,7 +259,8 @@ BoardModel buildPlateBoard(const PlateParams& p) {
             b.zoneX.push_back(q.x);
             b.zoneY.push_back(q.y);
             for (int i = 0; i < b.modes; ++i)
-                b.zoneShape.push_back(norm * bridgeShape(p, b.mIndex[i], b.nIndex[i], q, tg));
+                b.zoneShape.push_back(norm[i] * b.bridgeScale[i] *
+                                      bridgeShape(p, b.lowRegime[i], b.mIndex[i], b.nIndex[i], q, tg));
         }
         for (int j = 0; j < nk; ++j) {
             const int key = c->firstKey + j;
@@ -191,7 +270,8 @@ BoardModel buildPlateBoard(const PlateParams& p) {
             b.keyX[key - 1] = q.x;
             b.keyY[key - 1] = q.y;
             double* row = b.keyShape.data() + std::size_t(key - 1) * b.modes;
-            for (int i = 0; i < b.modes; ++i) row[i] = norm * bridgeShape(p, b.mIndex[i], b.nIndex[i], q, tg);
+            for (int i = 0; i < b.modes; ++i)
+                row[i] = norm[i] * b.bridgeScale[i] * bridgeShape(p, b.lowRegime[i], b.mIndex[i], b.nIndex[i], q, tg);
             KeyZone& kz = b.keyZone[key - 1];
             if (nz == 1) {
                 kz = KeyZone{zoneBase, 1.0f, 0.0f, 1.0f};
@@ -207,15 +287,9 @@ BoardModel buildPlateBoard(const PlateParams& p) {
     b.zones = zoneBase;
     for (int k = 0; k < 2; ++k)
         for (int i = 0; i < b.modes; ++i)
-            b.pickupShape.push_back(norm * plateShape(p, b.mIndex[i], b.nIndex[i], p.pickupX[k], p.pickupY[k]));
+            b.pickupShape.push_back(norm[i] *
+                                    modeShape(p, b.lowRegime[i], b.mIndex[i], b.nIndex[i], p.pickupX[k], p.pickupY[k]));
 
-    // Asymptotic modal density: n = (A / (4 pi)) INT_0^2pi sqrt(rho_h / D(th)) dth.
-    double integ = 0.0;
-    const int nt = 720;
-    for (int t = 0; t < nt; ++t) integ += std::sqrt(p.massPerArea / directionalD(p, 2.0 * kPi * (t + 0.5) / nt));
-    integ *= 2.0 * kPi / nt;
-    b.density = p.lengthX * p.widthY / (4.0 * kPi) * integ;
-    b.meanConductance = b.density / (4.0 * b.mass);
     for (int i = 0; i < kTabN; ++i)
         b.bridgeTab.push_back(bridgeFactorRaw(p, kTabLo * std::pow(kTabHi / kTabLo, double(i) / (kTabN - 1))));
 

@@ -4,9 +4,20 @@ Physically modelled concert grand piano (target: Steinway Model D) for iPad Pro 
 
 ## Which model does what
 
-- **Design, DSP and coding:** Opus 5.5 at medium effort.
-- **Simple mechanical tasks:** Sonnet 5.5 or Haiku 5.5 subagents. This covers building, running `ctest` across the configuration matrix, sanitizer runs, benchmarks, rendering example scores, running analysis scripts, and cleanup. Use Haiku by default and Sonnet when failures need interpreting.
-- Give such a subagent the exact commands and ask for a compact result: pass/fail per configuration, the output of failing tests, and benchmark tables.
+- **Planning, briefs, review, plan and README updates:** the main session.
+- **Design, DSP and coding:** Opus 5.5 subagents at medium effort.
+- **Mechanical work that needs judgement** (interpreting failures, pull requests): Sonnet 5.5 or Haiku 5.5 subagents.
+
+## Keeping token use down
+
+Every subagent turn re-sends its whole context, so cost grows with turns times context size. Measured on M1–M4: workers given a whole job ran 100–200 turns at about 320 k tokens of context and were 87 % of all usage.
+
+- **One focused change per Opus worker.** The brief names the files and line ranges to read and gives the relevant plan excerpt. Target: under 40 turns and under 100 k tokens of context. Split anything larger.
+- **Workers do not read or edit `docs/steinway-d-physical-model-plan.md` or `README.md`** (together about 58 k tokens). They report what changed and the measured numbers; the main session updates the documents.
+- **Workers do not run the matrix or the benchmarks.** They do one g++ Release build and the affected test suites, with output filtered to warnings, errors and failures.
+- **Verification and benchmarks run as a background script** started by the main session, which writes a short summary file (pass/fail per configuration, output of failing tests only). No subagent waits on or polls a script.
+- **Never print whole long files or unfiltered build, test or benchmark logs** into any context. The plan has paragraphs of several thousand tokens: search it with `grep -o` or `cut -c1-200`, and read by line range.
+- **One session per milestone.** The plan and this file carry the state between sessions.
 
 ## Working rules
 
@@ -27,7 +38,8 @@ Physically modelled concert grand piano (target: Steinway Model D) for iPad Pro 
 
 ## Verification
 
-- Before a change is committed: build with g++ and clang++, with and without `-DPM_NATIVE_ARCH=ON`, with forced-scalar SIMD, and once under ASan+UBSan; all CTest suites must pass.
+- Before each commit: g++ and clang++ Release builds and one g++ ASan+UBSan build; all CTest suites must pass.
+- Before a pull request, and after any change to a SIMD kernel: the full matrix. That is g++ and clang++, each with and without `-DPM_NATIVE_ARCH=ON`, forced-scalar SIMD, and ASan+UBSan (g++; the container has no clang ASan runtime).
 - The development container is Linux x86_64. NEON code cannot run there, so any new or changed kernel is unverified until it has run on Apple Silicon. List such kernels in the report.
 - For performance, the SSE2 build is the proxy for NEON (both are 4-wide); AVX2 numbers overstate what Apple Silicon will do.
 - CPU limits on the iPad Pro M2 at 48 kHz and 64-frame buffers: mean at most 50 % of one core, worst single buffer at most 70 %.

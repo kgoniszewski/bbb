@@ -22,6 +22,9 @@ namespace {
 
 constexpr double kFs = 48000.0;
 constexpr double kPi = std::numbers::pi;
+// Pedal-down residual of a held mf C4 re its direct (partial) energy over
+// 1.1-5.1 s, 100-5300 Hz, as measured with the low-regime board, 2026-11-15 (pedal_residual_per_bark_band).
+constexpr double kC4ResidualReDirectDb = -22.5;
 
 pm::Event keyDownSilent(std::uint64_t t, int note) {
     pm::Event e = noteOn(t, note, 1);
@@ -212,4 +215,135 @@ TEST(pedal_bloom_per_third_octave) {
     CHECK(low[1] > low[0] && low[2] > low[1] && low[3] > low[2]);
     CHECK(share < -3.0 && share > -60.0);
     CHECK(broad[3] < direct);
+}
+
+namespace {
+
+// Power spectrum of x[t0, t0 + len) (Hann window, zero-padded to 2^18
+// points), bin spacing kFs / 2^18.
+std::vector<double> powerSpectrum(const std::vector<float>& x, double t0, double len) {
+    const std::size_t n = 1 << 18, m = static_cast<std::size_t>(len * kFs);
+    std::vector<std::complex<double>> a(n);
+    const std::size_t s0 = static_cast<std::size_t>(t0 * kFs);
+    for (std::size_t i = 0; i < m && i < n; ++i)
+        a[i] = (0.5 - 0.5 * std::cos(2.0 * kPi * (i + 0.5) / m)) * double(s0 + i < x.size() ? x[s0 + i] : 0.0f);
+    fft(a);
+    std::vector<double> p(n / 2);
+    for (std::size_t k = 0; k < n / 2; ++k) p[k] = std::norm(a[k]);
+    return p;
+}
+
+// The tone's partials in a spectrum (tools/analysis/analyze_pedal_residual.py):
+// partial n at the largest bin near the prediction of a least-squares fit
+// of f_n^2 = n^2 f0^2 (1 + B n^2) to the partials found so far.
+std::vector<double> findPartials(const std::vector<double>& p, double f1, double fmax) {
+    const double df = kFs / double(2 * p.size());
+    std::vector<double> found;
+    for (int n = 1;; ++n) {
+        double pred, tol;
+        if (found.size() >= 3) {
+            double s22 = 0, s24 = 0, s44 = 0, r2 = 0, r4 = 0;
+            for (std::size_t i = 0; i < found.size(); ++i) {
+                const double k = double(i + 1), k2 = k * k, k4 = k2 * k2, y = found[i] * found[i];
+                s22 += k2 * k2;
+                s24 += k2 * k4;
+                s44 += k4 * k4;
+                r2 += k2 * y;
+                r4 += k4 * y;
+            }
+            const double det = s22 * s44 - s24 * s24;
+            const double c0 = (r2 * s44 - s24 * r4) / det, c1 = (s22 * r4 - s24 * r2) / det;
+            pred = std::sqrt(std::max(c0 * n * n + c1 * double(n) * n * n * n, 1.0));
+            tol = 0.01;
+        } else {
+            pred = found.empty() ? f1 : n * found.back() / double(found.size());
+            tol = 0.03;
+        }
+        if (pred > fmax) break;
+        std::size_t best = 0;
+        for (std::size_t k = static_cast<std::size_t>(pred * (1 - tol) / df);
+             k <= static_cast<std::size_t>(pred * (1 + tol) / df) && k < p.size(); ++k)
+            if (best == 0 || p[k] > p[best]) best = k;
+        if (best == 0) break;
+        found.push_back(best * df);
+    }
+    return found;
+}
+
+}  // namespace
+
+// Sustain-pedal residual (plan §1.6 note (7)), the method of Lehtonen et al.
+// (JASA 122, 2007): a tone held with the pedal down and the same tone with
+// it up; the tone's own partials (and +-(3 Hz + 0.2 %) around each) removed
+// from both spectra over 1-5 s after the strike; the remaining energy per
+// Bark band compared. Published for recorded grand-piano tones: the
+// residual rises 5-30 dB per Bark band with the pedal, about 10 dB over
+// 1-5 s [quoted from the paper's abstract and text; VERIFY the bands and
+// notes against the full paper]. The model's pedal-up residual has no
+// floor (no room, no microphone or room noise, no longitudinal or phantom
+// components yet; noises off here), so its rise is far larger (30-100 dB
+// per band) and is not comparable as a level: only the published lower
+// bound, 5 dB in every band from 100 Hz to 5.3 kHz whose pedal-down
+// residual is within 100 dB of the tone, is asserted. The
+// residual relative to the tone's direct (partial) energy, the metric of
+// plan §2.4, is reported per band and guarded (broadband, C4) within 4 dB
+// of the value this model gave with the low-regime board (2026-11-15): a regression guard, not a
+// comparison with a reference (none exists before M6).
+TEST(pedal_residual_per_bark_band) {
+    static const double edges[] = {100, 200, 300, 400, 510, 630, 770, 920, 1080, 1270, 1480,
+                                   1720, 2000, 2320, 2700, 3150, 3700, 4400, 5300};
+    constexpr int nb = sizeof(edges) / sizeof(edges[0]) - 1;
+    const double df = kFs / double(1 << 18);
+    double c4ResidualReDirect = 0.0;
+    for (int note : {48, 60, 72}) {
+        std::vector<double> spec[2];
+        for (int ped = 0; ped < 2; ++ped) {
+            std::vector<pm::Event> ev;
+            if (ped) ev.push_back(sustain(0, true));
+            ev.push_back(noteOn(4800, note, 80));
+            spec[ped] = powerSpectrum(mono(render(1.0, ev, 5.2)), 1.1, 4.0);
+        }
+        const double f1 = 440.0 * std::pow(2.0, (note - 69) / 12.0);
+        const std::vector<double> partials = findPartials(spec[0], f1, 16000.0);
+        std::vector<char> mask(spec[0].size(), 1);
+        for (double f : partials) {
+            const double w = 3.0 + 0.002 * f;
+            for (std::size_t k = static_cast<std::size_t>(std::max(0.0, f - w) / df);
+                 k <= static_cast<std::size_t>((f + w) / df) && k < mask.size(); ++k)
+                mask[k] = 0;
+        }
+        double direct = 0.0, resUp = 0.0, resDown = 0.0;
+        for (std::size_t k = 0; k < mask.size(); ++k) {
+            if (!mask[k]) direct += spec[0][k];
+            else if (k * df >= edges[0] && k * df < edges[nb]) {
+                resUp += spec[0][k];
+                resDown += spec[1][k];
+            }
+        }
+        std::printf("  note %d: %zu partials removed; residual 1.1-5.1 s, dB re the tone's partials (pedal up):\n"
+                    "    band (Hz)   pedal up  pedal down  rise\n",
+                    note, partials.size());
+        double minRise = 1e9;
+        for (int b = 0; b < nb; ++b) {
+            double u = 0.0, d = 0.0;
+            for (std::size_t k = static_cast<std::size_t>(edges[b] / df); k < static_cast<std::size_t>(edges[b + 1] / df);
+                 ++k)
+                if (mask[k]) {
+                    u += spec[0][k];
+                    d += spec[1][k];
+                }
+            const double ud = 10.0 * std::log10(u / direct + 1e-300), dd = 10.0 * std::log10(d / direct + 1e-300);
+            std::printf("    %4.0f-%4.0f %8.1f %9.1f %+7.1f\n", edges[b], edges[b + 1], ud, dd, dd - ud);
+            // A band whose residual is more than 100 dB below the tone even
+            // with the pedal down is below any recording's noise floor, so the
+            // published bound cannot refer to it (C3 above 4.4 kHz: -129 dB).
+            if (dd >= -100.0) minRise = std::min(minRise, dd - ud);
+        }
+        const double reDirect = 10.0 * std::log10(resDown / direct);
+        std::printf("    100-5300 Hz: pedal down %.1f dB re direct, rise %+.1f dB; smallest rise (bands above -100 dB) %+.1f dB\n",
+                    reDirect, 10.0 * std::log10(resDown / resUp), minRise);
+        CHECK(minRise >= 5.0);
+        if (note == 60) c4ResidualReDirect = reDirect;
+    }
+    CHECK_NEAR(c4ResidualReDirect, kC4ResidualReDirectDb, 4.0);
 }
