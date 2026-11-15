@@ -43,7 +43,7 @@ duplex yet.
 | `tools/render_cli/` | Offline renderer: one plucked string to a mono WAV, or a text score through the engine to a stereo WAV |
 | `tools/reference_fdtd/` | Offline finite-difference stiff string + hammer (library and CLI), the reference for the real-time model |
 | `tools/bench/` | Modal kernel benchmark and engine benchmark |
-| `tools/analysis/` | Python (numpy): partial frequencies and T60 of a string; attack centroid and partial levels; two-stage decay and beating of piano notes; third-octave band levels and band decay (bloom, sympathetic, half-pedal) |
+| `tools/analysis/` | Python (numpy): partial frequencies and T60 of a string; attack centroid and partial levels; two-stage decay and beating of piano notes; third-octave band levels and band decay (bloom, sympathetic, half-pedal); the sustain-pedal residual per Bark band |
 | `tests/` | Self-contained C++ unit tests (and one C test of the API), run by CTest |
 
 ## Engine
@@ -72,12 +72,20 @@ duplex yet.
   Dxy 2,090 N m) and 6.6 kg/m^2 (15.9 kg); loss factor 3 % above about
   1 kHz, rising to 10 % at the lowest modes (+ 0.08 / (1 + (f / 150 Hz)^2):
   rim and case participation, an estimate), mode frequencies scattered by
-  +-2 % (seeded) to break the uniform plate's regularity. 190 modes below
-  5 kHz (configurable cap and mode count), first mode 57.6 Hz, one mode per
-  24-26 Hz above 1 kHz; mean driving-point impedance at the bridge 1,400-
-  1,900 kg/s (0.2-8 kHz). Bass bridge, 40-500 Hz (keys 1-52): median |Z|
-  1,130 kg/s, every key's minimum above 150 kg/s, Re Y peaks within 8x its
-  mean (the plain 3 % plate dipped to 50-70 kg/s, peaks 18-25x). Treble bridge (keys 21-88) and bass bridge (1-20)
+  +-2 % (seeded) to break the uniform plate's regularity. Low-frequency
+  regime (plan §1.6 note (6); Boutillon & Ege 2013): between 90 and 1100 Hz
+  the modes are those of a clamped isotropic plate of the same size and mass
+  with the dynamical rigidity measured on grand soundboards (D / rho_h = 70
+  m^4/s^2), 126 modes where the stiff plate had 37 (6 between 105 and 155 Hz,
+  where it had 1; largest gap 25.7 Hz, was 79 Hz), their bridge shapes scaled
+  so that the geometric-mean bridge conductance stays at the v0 value
+  (`PlateParams::lowRegimeDiso`, 0 = the v0 board, `render_cli --board-v0`).
+  279 modes below 5 kHz (configurable cap and mode count), first mode 57.6
+  Hz, one mode per 24-26 Hz above 1 kHz; mean driving-point impedance at the
+  bridge 1,750-2,200 kg/s (0.2-8 kHz). Bass bridge, 40-500 Hz (keys 1-52):
+  median |Z| 1,590 kg/s, every key's minimum above 150 kg/s, Re Y peaks
+  within 9x its mean (the plain 3 % plate dipped to 50-70 kg/s, peaks
+  18-25x). Treble bridge (keys 21-88) and bass bridge (1-20)
   are Bezier curves on the plate; every key has its own bridge point (shape
   values averaged over a 5 cm contact) and reaches the run-time board
   through 18 zones (4 bass, 14 treble) by hat-function weights. Above 5 kHz
@@ -166,12 +174,14 @@ duplex yet.
   -1.4 dBFS: the limiter (above -1 dBFS) is not reached.
   `SoundboardConfig::enabled = false` gives the M3 output (A/B).
 - **Decay times.** The bake follows the board, so decay varies note to
-  note and partial to partial. Fundamentals at mf, prompt / aftersound T60
-  measured on the engine output: C2 7.6 / 52 s, C3 16 / 6.8 s, C4 2.6 /
-  24 s, C5 0.44 / 12 s, C6 1.9 / 7.5 s. Neighbouring keys' prompt decay of
-  the fundamental differs by a median factor 1.6 (90 % below 3.3, worst
-  8.8, around C5): fewer extremes than the plain 3 % plate (90 % below 5.9,
-  worst 14, one growing mode), but still a v0 board.
+  note and partial to partial. Fundamentals at MIDI velocity 80, prompt /
+  aftersound T60 (two-stage fit, held 20 s) on the engine output: C2 9.0 /
+  48 s, C3 13.9 / 38 s, C4 1.9 / 20 s, C5 1.9 / 0.5 s, C6 1.0 / 5.9 s (v0
+  board: C2 7.7 / 45, C3 15.2 / 33, C4 2.6 / 24, C5 0.58 / 0.27, C6 1.4 /
+  7.9 s). C4-B5 (keys 40-63): the early T60 (1-15 dB down) scatters by x1.40
+  about a smooth trend, neighbouring keys differ by at most 2.6x (v0 board:
+  x1.82 and 8.4x, keys 50/51 one board mode apart; `test_decay_trend`);
+  above C6, outside the board's low-frequency regime, x1.4-1.5 as before.
 - **Unison detuning.** Per-string cents offsets from a deterministic seed
   (a spread pattern, randomly permuted, +-30 % jitter, zero mean; about
   +-0.5 cent), times a global unison width; horizontal modes 0.2 cent sharp.
@@ -288,9 +298,11 @@ C7 at five velocities), `chord_pedal.txt` (a chord with and without pedal),
 down), `pedal_bloom.txt` (a staccato chord with the pedal down and up),
 `half_pedal.txt` (C3 releases over fixed pedal positions, then a pedal
 sweep over a ringing note), `sympathetic.txt` (C3 held silently while C4
-is struck staccato, then Db3 held, then nothing held). Tuning options:
+is struck staccato, then Db3 held, then nothing held), `pedal_residual.txt`
+(C3, C4 and C5 held 6 s with the pedal down, then up). Tuning options:
 `--a4 HZ`, `--stretch X` (0-1.5), `--equal-temperament`, `--unison-width X`;
-soundboard: `--no-board` (A/B), `--sympathetic G`, `--knock N`,
+soundboard: `--no-board` (A/B), `--board-v0` (the board without its
+low-frequency regime, A/B), `--sympathetic G`, `--knock N`,
 `--damper-noise N`. `--help` lists all options.
 
 ## Analyse
@@ -328,6 +340,17 @@ Third-octave band levels some time after each given instant (a release)
 and the band decay time from the following window, each segment also
 relative to the first.
 
+```sh
+python3 tools/analysis/analyze_pedal_residual.py pedal_residual.wav --pairs 1,9 17,25 33,41 --notes 48 60 72
+```
+
+The sustain-pedal residual (method of Lehtonen et al. 2007, plan §1.6 note
+(7)): for each pair of strike times (pedal down, pedal up) of the same
+note, the tone's partials are found and removed from both spectra over 1-5
+s after the strike, and the remaining energy is compared per Bark band.
+The model has no room or noise floor yet, so its pedal-up residual is
+80-130 dB below the tone and the ratio is far above the published 5-30 dB.
+
 ## Offline FDTD reference
 
 ```sh
@@ -344,8 +367,9 @@ strike, and writes the bridge force (WAV) and hammer force, strike-point
 displacement and bridge force (CSV). `test_fdtd` compares the real-time
 model against it: partial energies of the first 30 partials agree within
 1 dB from A0 to C7 at pp, mf and ff (largest +0.89 dB, C2 ff); see the test
-output for the top octave, where both models put only 1e-4 to 1e-8 of the
-hammer's energy into the strings.
+output for the top octave (C8: 7e-5 / 1e-2 / 6e-2 of the hammer's energy in
+the strings at pp / mf / ff; 3e-8 / 3e-6 / 5e-4 before the C8 felt anchor
+was corrected, plan §2.1).
 
 ## Benchmark
 
@@ -515,9 +539,37 @@ paced loop in another scheduling class): the app's Benchmark tab runs exactly th
 the device. `pm_host_scene_start` plays a case's events through the real
 host and audio render path instead (see the Benchmark screen below).
 
+Cost of the board's low-frequency regime (279 board modes instead of 190;
+plan §1.6 note (6)) and the C8 felt correction, x86 container, g++ SSE2
+build (the 4-wide proxy for NEON), 64 frames at 48 kHz, 3 s per scene: per
+buffer the minimum over 5 runs (removes preemption), then the mean and the
+maximum over the buffers (µs; 1333 µs = one buffer period):
+
+| Scene | Mean before → after | Max before → after |
+|---|---|---|
+| worst (88 keys held, pedal) | 355.6 → 374.1 (+5.2 %) | 690.5 → 722.4 (+4.6 %; +2.2 % in a second series) |
+| typical | 84.1 → 93.5 (+11.2 %) | 244.5 → 278.7 (+14.0 %) |
+| cluster | 168.2 → 185.2 (+10.1 %) | 551.8 → 619.3 (+12.2 %) |
+| bloom | 344.7 → 360.7 (+4.6 %) | 549.9 → 553.3 (+0.6 %) |
+| legato | 103.8 → 116.0 (+11.8 %) | 209.2 → 217.6 (+4.0 %) |
+| pedalling | 336.6 → 356.2 (+5.8 %) | 586.2 → 611.4 (+4.3 %) |
+| release of a 10-note chord | 112.1 → 127.7 (+13.9 %) | 517.7 → 549.4 (+6.1 %) |
+| hammer burst | 126.7 → 141.9 (+12.0 %) | 458.6 → 493.1 (+7.5 %) |
+| pedalled chords | 325.6 → 356.5 (+9.5 %) | 560.2 → 591.1 (+5.5 %) |
+| fresh-key burst | 341.7 → 367.6 (+7.6 %) | 562.8 → 608.9 (+8.2 %) |
+| same-key burst | 346.8 → 365.5 (+5.4 %) | 569.5 → 589.1 (+3.4 %) |
+| pedal lift | 347.3 → 366.7 (+5.6 %) | 508.0 → 530.3 (+4.4 %) |
+| pedal lift, cold | 345.7 → 366.8 (+6.1 %) | 512.8 → 543.1 (+5.9 %) |
+
+The board step costs about 0.2 µs per mode per buffer here, so the added 89
+modes cost about 18 µs per buffer in every non-idle scene, which is up to
+14 % of the light scenes. On the iPad the board is a larger share of a
+buffer (68 of 205 µs in the pedal-lift scene, §4.1) and the change is not
+yet measured there.
+
 ## Tests
 
-`ctest` runs 29 suites. The app host ones: `test_midi_parser` (running
+`ctest` runs 30 suites. The app host ones: `test_midi_parser` (running
 status, real-time bytes inside messages, SysEx, malformed input, UMP in
 MIDI 1.0 and 2.0 protocol, the `MIDIEventList` layout, controller mapping,
 fuzzing), `test_load_meter` and `test_host` (MIDI host timestamps land on
@@ -537,8 +589,12 @@ run-time bank, bake + loop = driving point), `test_soundboard_coupling`
 (no double counting), `test_passivity` (10^4 random reduced systems with
 the production components, and 3000 with every damper amount moving on
 every sub-block under a damper-response budget of 0-2 groups, so the loop
-runs on expanded responses; a sign-flipped loop is flagged), `test_sympathetic` (silently held key, pedal
-bloom per third octave, monotonic in the sympathetic gain),
+runs on expanded responses; a sign-flipped loop is flagged), `test_soundboard_model` also checks the board's low-frequency mode count
+against the literature formula and the spread of the bridge conductance;
+`test_decay_trend` (C4-B5 prompt decay against a smooth trend);
+`test_sympathetic` (silently held key, pedal
+bloom per third octave, monotonic in the sympathetic gain, the pedal
+residual per Bark band against the published lower bound),
 `test_half_pedal` (graded T60 against pedal position, no click on pedal
 moves, re-pedalling keeps energy; 30 notes under a pedal swept
 continuously for 4 s: bounded, within -80 dB of exact responses (measured
@@ -547,7 +603,8 @@ the zone kernel exact once the pedal rests, buffer-size invariant, decays
 with the pedal up, silenced by a panic mid-stroke; with the dampers at rest
 the output is bit-identical to exact responses) and `test_idle` (also: the
 zone kernel updated in place, including keys joining and leaving, equals a
-full rebuild bit for bit). `test_hammer` also checks the hammer's
+full rebuild bit for bit). `test_hammer` also checks that the felt gets harder towards the treble and the
+top octave's contact time and energy transfer change monotonically, and the hammer's
 sample path (one pass over a key's modes per base sample) against its
 substep path (one pass per substep) and against a double-precision
 recursion. Unit tests of the unison solver and the

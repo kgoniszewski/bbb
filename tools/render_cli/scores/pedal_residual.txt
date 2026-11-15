@@ -1,0 +1,33 @@
+# Sustain-pedal residual (Lehtonen et al. 2007, plan §1.6 note (7)): single
+# tones held 6 s, first with the sustain pedal down (every damper lifted),
+# then the same tone with the pedal up (only the key's own damper lifted),
+# at C3, C4 and C5, mf. analyze_pedal_residual.py removes each tone's
+# partials and compares the residual (what the other strings, the board and
+# the noises add) over 1-5 s after the strike, per Bark band.
+# Segment starts (strike times): 1, 9, 17, 25, 33, 41 s.
+0.00  cc64 127
+1.00  note_on C3 80
+7.00  note_off C3
+7.00  cc64 0
+7.10  panic
+9.00  note_on C3 80
+15.00 note_off C3
+15.10 panic
+
+16.00 cc64 127
+17.00 note_on C4 80
+23.00 note_off C4
+23.00 cc64 0
+23.10 panic
+25.00 note_on C4 80
+31.00 note_off C4
+31.10 panic
+
+32.00 cc64 127
+33.00 note_on C5 80
+39.00 note_off C5
+39.00 cc64 0
+39.10 panic
+41.00 note_on C5 80
+47.00 note_off C5
+47.10 panic

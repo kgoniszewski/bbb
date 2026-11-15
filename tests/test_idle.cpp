@@ -33,10 +33,11 @@ struct Run {
     std::uint64_t groupBlocksIdle = 0, boardStepsIdle = 0;  // work done in fully idle buffers
 };
 
-Run render(bool sleep, int block, bool liftNoise = true) {
+Run render(bool sleep, int block, bool liftNoise = true, bool cull = true) {
     Run r;
     pm::Engine eng;
     eng.setIdleSleep(sleep);
+    if (!cull) eng.setCulling(false, eng.cullThresholdDb());
     if (!liftNoise) eng.setNoiseLevels(eng.knockLevel(), 0.0f);
     eng.prepare(kFs, block);
     const std::vector<pm::Event> ev = scene();
@@ -113,11 +114,31 @@ TEST(idle_sleep_is_buffer_size_invariant) {
         std::printf("  block %3d: vs block 64 %.1f dB re peak (at %.3f s); sleep on vs off %.3g; %d idle buffers\n",
                     block, 20 * std::log10(d / peak + 1e-30), at, dOff, r.idleBuffers);
         CHECK(dOff == 0.0);
-        // Block 1 differs from block 64 by -85 dB at the first hammer
-        // contact (0.203 s), with or without sleep and in the engine before
-        // idle sleep existed (a hammer-solver property, measured), so it is
-        // only held to the sleep on/off identity above.
-        if (block != 1) CHECK_LE(20 * std::log10(d / peak + 1e-30), -90.0);
+        // Loosened (low-regime board, plan §1.6 note (6)): with culling on,
+        // block 37 now differs from block 64 by -84 dB at the first hammer
+        // onset (0.202 s), as block 1 does (-85 dB). Cause, measured: a
+        // sleeping coupled group (here the undamped keys 69-88, driven
+        // through the board by the hammer knock) wakes in the sub-block in
+        // which its input bound is crossed, from its quasi-static deflection,
+        // so the wake-up depends on where sub-blocks start. It predates the
+        // board change: with the v0 board blocks 16, 33 and 100 already
+        // measured -90.6, -90.8 and -92.4 dB (block 37 -109.5 dB by chance);
+        // with culling off block 37 is at -109 dB with either board. Held
+        // here to -80 dB; buffer-size invariance proper is asserted with
+        // culling off below.
+        if (block != 1) CHECK_LE(20 * std::log10(d / peak + 1e-30), block == 37 ? -80.0 : -90.0);
+    }
+    // Culling off: every block size except 1 (a hammer-solver property, as
+    // above) agrees to rounding.
+    const Run refAll = render(true, 64, false, false);
+    const double peakAll = std::max(peakAbs(refAll.out.l), peakAbs(refAll.out.r));
+    for (int block : {37, 512}) {
+        const Run r = render(true, block, false, false);
+        double at = 0.0;
+        const double d = maxDiff(refAll.out, r.out, &at);
+        std::printf("  culling off, block %3d: vs block 64 %.1f dB re peak (at %.3f s)\n", block,
+                    20 * std::log10(d / peakAll + 1e-30), at);
+        CHECK_LE(20 * std::log10(d / peakAll + 1e-30), -100.0);
     }
 }
 
