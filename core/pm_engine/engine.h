@@ -32,13 +32,17 @@
 // Above the modal range a high-frequency direct path: the panned bridge
 // forces, high-passed at 0.9 times the modal range and scaled by the mean
 // |modal transfer| from the bridge points to the microphones near the top of
-// that range. Stereo width scales the side signal. Level (v0 pickups; with
-// the MIDI dynamics mf = 80, ff = 112): mf single notes C3-C5 peak at -33 to
-// -22 dBFS, velocity 127 at -17 dBFS at most; 12-note clusters every 100 ms
-// at -7 (ff) to -5 dBFS (127, pedal down); all 88 keys at velocity 127 at
-// once -1.4 dBFS, just below the limiter. The microphones tilt the spectrum
-// (pressure rises with frequency relative to board velocity): mf C2-C7 peak
-// at -31 to -24 dBFS, the treble up to 12 dB above the v0 pickups.
+// that range. Stereo width scales the side signal. Level, measured with
+// render_cli (MIDI dynamics mf = 80, ff = 112; microphones, then the v0
+// pickups in brackets): mf single notes C2-C7 peak at -35 to -27 dBFS
+// (-36 to -24), C3-C5 at -33 to -31 (-32 to -24); velocity 127, A0 and
+// every C, at -20 dBFS at most (-19); 12-note clusters (keys 48-59) every
+// 100 ms for 2 s at -12.9 (ff) and -11.3 dBFS (127, pedal down) (-4.9 and
+// -3.2); all 88 keys at velocity 127 at once -3.5 dBFS (-3.6), no sample
+// limited. The microphones tilt the spectrum (pressure rises with frequency
+// relative to board velocity, about 6 dB/octave): the treble sits up to
+// 9 dB above the v0 pickups, the mid-range clusters 8 dB below; the level
+// trim (kMicLevelTrim) is a convention, the balance is M6 voicing.
 //
 // Pedals. Sustain (CC64) is continuous (plan §1.9). The pedal position is
 // smoothed (pedal and lever inertia, 10 ms) and mapped per register to a
@@ -183,7 +187,7 @@ struct RenderInfo {
     int newtonEvals = 0;       // contact-solver Newton evaluations (each S felt forces)
     int fallbackSolves = 0;    // contact substeps that needed the bracketed fallback
     int awakeModes = 0;        // at the end of the buffer
-    int idleSubBlocks = 0;     // sub-blocks skipped as silent (board, loop and bank asleep)
+    int idleSubBlocks = 0;     // sub-blocks skipped as silent (board, loop and bank asleep, room silent)
     // Events applied, by kind (note-on with velocity 0 counts as a note-off;
     // pedal: sustain, sostenuto, una corda).
     int noteOns = 0, noteOffs = 0, pedalEvents = 0;

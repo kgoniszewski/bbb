@@ -33,10 +33,11 @@ struct Run {
     std::uint64_t groupBlocksIdle = 0, boardStepsIdle = 0;  // work done in fully idle buffers
 };
 
-Run render(bool sleep, int block, bool liftNoise = true, bool cull = true) {
+Run render(bool sleep, int block, bool liftNoise = true, bool cull = true, bool room = false) {
     Run r;
     pm::Engine eng;
     eng.setIdleSleep(sleep);
+    eng.setRoomEnabled(room);
     if (!cull) eng.setCulling(false, eng.cullThresholdDb());
     if (!liftNoise) eng.setNoiseLevels(eng.knockLevel(), 0.0f);
     eng.prepare(kFs, block);
@@ -130,6 +131,36 @@ TEST(idle_sleep_is_buffer_size_invariant) {
     }
 }
 
+// With the room on, the engine is idle only once the room is silent too
+// (its tail decayed below -140 dBFS for a whole line length), so later
+// than without it; the output is still bit-identical with sleep on and
+// off, exactly zero while idle, and buffer sizes that are multiples of the
+// grid are bit-identical.
+TEST(idle_sleep_with_room) {
+    const Run dry = render(true, 64);
+    const Run on = render(true, 64, true, true, true), off = render(false, 64, true, true, true);
+    const Run on37 = render(true, 37, true, true, true), on512 = render(true, 512, true, true, true);
+    const double peak = std::max(peakAbs(off.out.l), peakAbs(off.out.r));
+    const double d = maxDiff(on.out, off.out), d512 = maxDiff(on.out, on512.out), d37 = maxDiff(on.out, on37.out);
+    std::printf("  room on: first fully idle buffer at %.2f s (dry %.2f s); %d buffers idle (dry %d); sleep on vs "
+                "off %.3g; block 512 %.3g, block 37 %.1f dB re peak\n",
+                on.firstIdle * 64 / kFs, dry.firstIdle * 64 / kFs, on.idleBuffers, dry.idleBuffers, d,
+                d512, 20 * std::log10(d37 / peak + 1e-30));
+    CHECK(peak > 1e-3);
+    CHECK(d == 0.0);
+    CHECK(d512 == 0.0);
+    CHECK_LE(20 * std::log10(d37 / peak + 1e-30), -100.0);
+    CHECK(on.firstIdle > dry.firstIdle);
+    CHECK(on.idleBuffers > 0);
+    CHECK(on.groupBlocksIdle == 0 && on.boardStepsIdle == 0);
+    // Exactly silent while idle, in the same window as without the room
+    // (the room's tail has gone to sleep by then; the DC blocker settles
+    // to zero shortly after the first idle buffer).
+    bool silent = true;
+    for (int i = static_cast<int>(5.5 * kFs); i < static_cast<int>(6.0 * kFs); ++i)
+        silent = silent && on.out.l[i] == 0.0f && on.out.r[i] == 0.0f;
+    CHECK(silent);
+}
 
 // The soundboard loop's zone kernel is updated in place, column by column,
 // when only some keys' impulse responses change (wake-ups and cull

@@ -903,7 +903,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
     ++info_.subBlocks;
     float* mL = mixL_.data();
     float* mR = mixR_.data();
-    bool idle = false;
+    bool idle = false, settled = false;
     if (boardOn_) {
         // Idle: no string mode awake, no hammer, the board asleep and
         // nothing driving it. After two such sub-blocks every loop input
@@ -915,9 +915,9 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
         // buffering, since it is decided per sub-block.
         const bool quiet = activeCount_ == 0 && bank_.activeGroups() == 0 && board_.asleep() && nKnocks_ == 0 &&
                            noiseAmp_ == 0.0f && !bank_.coupledPending();
-        idle = quiet && quietRun_ >= 2 && idleSleep_;
+        settled = quiet && quietRun_ >= 2;
+        idle = settled && idleSleep_;
         if (idle) {
-            ++info_.idleSubBlocks;
             PM_PROF_LAP(Events);
             bank_.endCoupled(io_.data(), n);
             std::fill(mL, mL + n, 0.0f);
@@ -993,7 +993,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
     // starts and ends silent wrote zeros and is not added (keeps the sign
     // of zeros, so off is bit-identical).
     bool roomSounding = false;
-    if (PM_ROOM_BYPASS_TEST && (roomOn_.load(std::memory_order_relaxed) || !room_.silent())) {
+    if (roomOn_.load(std::memory_order_relaxed) || !room_.silent()) {
         const bool wasSilent = room_.silent();
         float* rL = roomL_.data();
         float* rR = roomR_.data();
@@ -1005,6 +1005,17 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
                 mR[i] += rR[i];
             }
     }
+    // Idle only with the room silent as well (its tail runs on a sleeping
+    // board: the board's work is skipped all the same).
+    if (idle && !roomSounding) ++info_.idleSubBlocks;
+    // The room cuts its tail at -140 dBFS; the 5 Hz DC blocker would then
+    // take seconds to decay from there to exact zero, so with the room on
+    // its state is flushed below -300 dBFS once nothing sounds (decided
+    // whether idle sleep is on or off, so both stay bit-identical; room
+    // off leaves the dry output untouched).
+    if (settled && !roomSounding && roomOn_.load(std::memory_order_relaxed))
+        for (int c = 0; c < 2; ++c)
+            if (dcX_[c] == 0.0f && std::fabs(dcY_[c]) < 1e-15f) dcY_[c] = 0.0f;
 
     // Hammers are released only on a grid relative to their own launch, so
     // the hand-over back to the bank (which sums modes in another order)

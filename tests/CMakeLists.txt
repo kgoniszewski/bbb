@@ -24,6 +24,7 @@ set(PM_TESTS
   test_half_pedal
   test_idle
   test_decay_trend
+  test_room_engine
   test_radiation)
 
 find_package(Threads REQUIRED)
