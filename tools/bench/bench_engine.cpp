@@ -42,6 +42,7 @@
 //
 //   bench_engine [--seconds 3] [--block 64] [--fs 48000] [--tier full|balanced|eco] [--tiers]
 //                [--timing on|off|both] [--paced] [--paced-evict MiB] [--compare] [--only text] [--load K]
+//                [--dry]   (room off; default: room on, the product configuration)
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -83,6 +84,11 @@ int main(int argc, char** argv) {
         }
         if (!std::strcmp(argv[i], "--paced")) {
             cfg.paced = true;
+            --i;
+            continue;
+        }
+        if (!std::strcmp(argv[i], "--dry")) {
+            cfg.room = false;
             --i;
             continue;
         }
@@ -143,13 +149,14 @@ int main(int argc, char** argv) {
     const long long rss0 = residentBytes();
     const std::size_t aligned0 = pm::alignedLiveBytes();
     auto eng = std::make_unique<pm::Engine>();
+    eng->setRoomEnabled(cfg.room);
     if (!eng->prepare(fs, block)) return 1;
     const std::size_t engineBytes = sizeof(pm::Engine) + (pm::alignedLiveBytes() - aligned0);
     const long long rss1 = residentBytes();
     std::printf("engine benchmark: fs %.0f Hz, block %d, kernel %s, %.1f s measured; %d normal modes "
-                "in %d groups of %d\n",
+                "in %d groups of %d; room %s\n",
                 fs, block, pm::simdKernelName(), cfg.seconds, eng->stats().totalModes, eng->stats().groups,
-                pm::ModeBank::kGroupSize);
+                pm::ModeBank::kGroupSize, cfg.room ? "on" : "off (--dry)");
     std::printf("  memory of one prepared engine: %.2f MB (object %.2f MB + aligned arrays)", engineBytes / 1048576.0,
                 sizeof(pm::Engine) / 1048576.0);
     if (rss1 > 0) std::printf("; process resident set grew by %.2f MB while preparing it", (rss1 - rss0) / 1048576.0);

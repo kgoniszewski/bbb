@@ -318,7 +318,8 @@ constexpr int kBaseCases = 7, kTierCases = 6, kLiveCases = 10;
 
 int caseCount(const Config& c) noexcept { return kBaseCases + (c.allTiers ? kTierCases : 0) + kLiveCases; }
 
-Case caseAt(const Config& c, int i) noexcept {
+namespace {
+Case caseAtDry(const Config& c, int i) noexcept {
     const QualityTier t = c.tier;
     const int live = kBaseCases + (c.allTiers ? kTierCases : 0);
     if (i >= live) {
@@ -354,6 +355,14 @@ Case caseAt(const Config& c, int i) noexcept {
     }
 }
 
+}  // namespace
+
+Case caseAt(const Config& c, int i) noexcept {
+    Case k = caseAtDry(c, i);
+    k.room = c.room;
+    return k;
+}
+
 const char* hammerName(int index) noexcept {
     static const char* const kNames[kHammerKeyCount] = {
         "hammer, key 1",  "hammer, key 16", "hammer, key 28", "hammer, key 40",
@@ -363,6 +372,7 @@ const char* hammerName(int index) noexcept {
 
 bool prepareForCase(const Case& k, Engine& eng, double sampleRate, int maxFrames, std::size_t* bytes) {
     eng.setCulling(k.cull, -100.0f);
+    eng.setRoomEnabled(k.room);
     SoundboardConfig bc;
     bc.enabled = k.board;
     bc.tier = k.tier;

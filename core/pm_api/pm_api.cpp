@@ -81,6 +81,12 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
     switch (id) {
         case PM_PARAM_MASTER_GAIN_DB: e.setMasterGainDb(static_cast<float>(value)); return 1;
         case PM_PARAM_STEREO_WIDTH: e.setStereoWidth(static_cast<float>(value)); return 1;
+        case PM_PARAM_ROOM_ENABLED: e.setRoomEnabled(value >= 0.5); return 1;
+        case PM_PARAM_ROOM_LEVEL_DB: e.setRoomLevelDb(static_cast<float>(value)); return 1;
+        case PM_PARAM_ROOM_DECAY: e.setRoomDecay(static_cast<float>(value)); return 1;
+        case PM_PARAM_ROOM_HF_RATIO: e.setRoomHfRatio(static_cast<float>(value)); return 1;
+        case PM_PARAM_ROOM_SIZE: e.setRoomSize(static_cast<float>(value)); return 1;
+        case PM_PARAM_ROOM_EARLY_LATE: e.setRoomEarlyLate(static_cast<float>(value)); return 1;
         case PM_PARAM_SCHEDULING_MODE:
             e.setSchedulingMode(value >= 0.5 ? pm::SchedulingMode::ConstantLatency
                                              : pm::SchedulingMode::LowestLatency);
@@ -143,6 +149,12 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
     switch (id) {
         case PM_PARAM_MASTER_GAIN_DB: *value = e.masterGainDb(); return 1;
         case PM_PARAM_STEREO_WIDTH: *value = e.stereoWidth(); return 1;
+        case PM_PARAM_ROOM_ENABLED: *value = e.roomEnabled() ? 1.0 : 0.0; return 1;
+        case PM_PARAM_ROOM_LEVEL_DB: *value = e.roomLevelDb(); return 1;
+        case PM_PARAM_ROOM_DECAY: *value = e.roomDecay(); return 1;
+        case PM_PARAM_ROOM_HF_RATIO: *value = e.roomHfRatio(); return 1;
+        case PM_PARAM_ROOM_SIZE: *value = e.roomSize(); return 1;
+        case PM_PARAM_ROOM_EARLY_LATE: *value = e.roomEarlyLate(); return 1;
         case PM_PARAM_SCHEDULING_MODE: *value = static_cast<double>(e.schedulingMode()); return 1;
         case PM_PARAM_CONSTANT_LATENCY_FRAMES: *value = e.constantLatencyFrames(); return 1;
         case PM_PARAM_CULL_THRESHOLD_DB: *value = e.cullThresholdDb(); return 1;

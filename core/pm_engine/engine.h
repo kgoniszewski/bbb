@@ -137,6 +137,7 @@
 #include "pm_board/soundboard.h"
 #include "pm_engine/events.h"
 #include "pm_hammer/hammer.h"
+#include "pm_room/room.h"
 #include "pm_string/mode_bank.h"
 #include "pm_voicing/bridge_admittance.h"
 #include "pm_voicing/radiation_model.h"
@@ -326,6 +327,19 @@ public:
     // Atomic parameters, any thread.
     void setMasterGainDb(float db) noexcept { masterGainDb_.store(db, std::memory_order_relaxed); }
     void setStereoWidth(float w) noexcept { width_.store(w, std::memory_order_relaxed); }
+    // Room (pm_room): its wet signal is added to the dry microphone pair
+    // before master gain. Off by default on the bare engine (the physics
+    // tests measure the dry output); the host turns it on. Changes are
+    // latched by the room at its own 32-sample control grid and smoothed.
+    void setRoomEnabled(bool on) noexcept {
+        roomOn_.store(on, std::memory_order_relaxed);
+        room_.setEnabled(on);
+    }
+    void setRoomLevelDb(float db) noexcept { roomLevelDb_.store(db, std::memory_order_relaxed); room_.setLevelDb(db); }
+    void setRoomDecay(float s) noexcept { roomDecay_.store(s, std::memory_order_relaxed); room_.setDecay(s); }
+    void setRoomHfRatio(float r) noexcept { roomHf_.store(r, std::memory_order_relaxed); room_.setHfRatio(r); }
+    void setRoomSize(float x) noexcept { roomSize_.store(x, std::memory_order_relaxed); room_.setSize(x); }
+    void setRoomEarlyLate(float b) noexcept { roomBal_.store(b, std::memory_order_relaxed); room_.setEarlyLateBalance(b); }
     void setSchedulingMode(SchedulingMode m) noexcept {
         schedMode_.store(static_cast<int>(m), std::memory_order_relaxed);
     }
@@ -388,6 +402,13 @@ public:
     bool loopKernelExact() noexcept { return !boardOn_ || loop_.kernelMatchesRebuild(); }
     float masterGainDb() const noexcept { return masterGainDb_.load(std::memory_order_relaxed); }
     float stereoWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
+    bool roomEnabled() const noexcept { return roomOn_.load(std::memory_order_relaxed); }
+    float roomLevelDb() const noexcept { return roomLevelDb_.load(std::memory_order_relaxed); }
+    float roomDecay() const noexcept { return roomDecay_.load(std::memory_order_relaxed); }
+    float roomHfRatio() const noexcept { return roomHf_.load(std::memory_order_relaxed); }
+    float roomSize() const noexcept { return roomSize_.load(std::memory_order_relaxed); }
+    float roomEarlyLate() const noexcept { return roomBal_.load(std::memory_order_relaxed); }
+    bool roomSilent() const noexcept { return room_.silent(); }
     SchedulingMode schedulingMode() const noexcept {
         return static_cast<SchedulingMode>(schedMode_.load(std::memory_order_relaxed));
     }
@@ -531,6 +552,8 @@ private:
     AlignedArray<float> keyBuf_;   // kNumKeys x kSubBlock
     AlignedArray<float> mixL_, mixR_;
     AlignedArray<float> hfL_, hfR_;       // high-frequency direct bus, kSubBlock
+    AlignedArray<float> roomL_, roomR_;   // room wet output, kSubBlock
+    Room room_;
     AlignedArray<float> dampShape_;       // per bank mode: displacement at the damper per |z|
 
     // Soundboard.
@@ -627,6 +650,9 @@ private:
     // Parameters.
     std::atomic<float> masterGainDb_{0.0f};
     std::atomic<float> width_{0.35f};
+    std::atomic<bool> roomOn_{false};
+    std::atomic<float> roomLevelDb_{float(Room::kDefaultLevelDb)}, roomDecay_{1.8f}, roomHf_{0.5f}, roomSize_{1.0f},
+        roomBal_{0.5f};
     std::atomic<int> schedMode_{0};
     std::atomic<int> latency_{0};
     std::atomic<bool> cullOn_{true};

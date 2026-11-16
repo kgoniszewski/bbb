@@ -133,7 +133,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     if (!contact_.allocate(bank_.capacity(), kNumKeys)) return false;
     if (!io_.allocate(kNumKeys) || !keyBuf_.allocate(std::size_t{kNumKeys} * kSubBlock) ||
         !mixL_.allocate(kSubBlock) || !mixR_.allocate(kSubBlock) || !hfL_.allocate(kSubBlock) ||
-        !hfR_.allocate(kSubBlock) || !dampShape_.allocate(static_cast<std::size_t>(bank_.capacity())) ||
+        !hfR_.allocate(kSubBlock) || !roomL_.allocate(kSubBlock) || !roomR_.allocate(kSubBlock) || !dampShape_.allocate(static_cast<std::size_t>(bank_.capacity())) ||
         !groupModes_.allocate(static_cast<std::size_t>(bank_.groupCount())))
         return false;
     for (int k = 0; k < kNumKeys; ++k) {
@@ -228,6 +228,9 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
         latency_.store(maxFrames, std::memory_order_relaxed);
     if (!velocitySet_) setVelocityFunction(velocityCurveFn, &defaultCurve_);
 
+    room_.setEnabled(roomOn_.load(std::memory_order_relaxed));
+    if (!room_.prepare(fs_, kSubBlock)) return false;
+
     Event drop;
     while (queue_.pop(drop)) {}
     resetState();
@@ -281,6 +284,7 @@ void Engine::resetState() noexcept {
     peakPre_ = 0.0f;
     peakHammers_ = 0;
     quietRun_ = stableTicks_ = 0;
+    room_.reset();
 }
 
 void Engine::setVelocityFunction(VelocityFn fn, const void* user) noexcept {
@@ -980,6 +984,28 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
         }
     }
 
+    // Room: fed the dry pair (after width, before master gain and the DC
+    // blocker) once per sub-block; it is split-invariant, so the engine's
+    // buffer-size invariance holds. Skipped while off and silent (the dry
+    // output is then exactly the room-less one); otherwise it runs on every
+    // sub-block, idle ones included, so its control grid stays on absolute
+    // engine time and idle sleep on/off stay bit-identical. A span that
+    // starts and ends silent wrote zeros and is not added (keeps the sign
+    // of zeros, so off is bit-identical).
+    bool roomSounding = false;
+    if (PM_ROOM_BYPASS_TEST && (roomOn_.load(std::memory_order_relaxed) || !room_.silent())) {
+        const bool wasSilent = room_.silent();
+        float* rL = roomL_.data();
+        float* rR = roomR_.data();
+        room_.process(mL, mR, rL, rR, n);
+        roomSounding = !(wasSilent && room_.silent());
+        if (roomSounding)
+            for (int i = 0; i < n; ++i) {
+                mL[i] += rL[i];
+                mR[i] += rR[i];
+            }
+    }
+
     // Hammers are released only on a grid relative to their own launch, so
     // the hand-over back to the bank (which sums modes in another order)
     // happens at the same point of the note whatever the buffering.
@@ -994,7 +1020,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
     }
 
     const float gStep = 1.0f - std::exp(-1.0f / (0.01f * static_cast<float>(fs_)));
-    if (idle && dcX_[0] == 0.0f && dcX_[1] == 0.0f && dcY_[0] == 0.0f && dcY_[1] == 0.0f) {
+    if (idle && !roomSounding && dcX_[0] == 0.0f && dcX_[1] == 0.0f && dcY_[0] == 0.0f && dcY_[1] == 0.0f) {
         // Silent input and settled filters: the output is exactly zero.
         for (int i = 0; i < n; ++i) masterGain_ += (masterTarget_ - masterGain_) * gStep;
         std::fill(left, left + n, 0.0f);
@@ -1168,6 +1194,10 @@ int Engine::describe(char* buf, int size) const noexcept {
     put("half_pedal %.3f %.3f %.3f\n", static_cast<double>(hpP0T_.load(std::memory_order_relaxed)),
         static_cast<double>(hpP0B_.load(std::memory_order_relaxed)), static_cast<double>(hpW_.load(std::memory_order_relaxed)));
     put("stereo_width %.3f\n", static_cast<double>(width_.load(std::memory_order_relaxed)));
+    put("room_enabled %d\n", roomOn_.load(std::memory_order_relaxed) ? 1 : 0);
+    put("room_level_db %.2f\n", static_cast<double>(roomLevelDb_.load(std::memory_order_relaxed)));
+    put("room_decay_s %.2f\n", static_cast<double>(roomDecay_.load(std::memory_order_relaxed)));
+    put("room_size %.2f\n", static_cast<double>(roomSize_.load(std::memory_order_relaxed)));
     put("master_gain_db %.2f\n", static_cast<double>(masterGainDb_.load(std::memory_order_relaxed)));
     put("scheduling %d latency %d\n", schedMode_.load(std::memory_order_relaxed), latency_.load(std::memory_order_relaxed));
     put("phase_timing %d\n", phaseTiming() ? 1 : 0);

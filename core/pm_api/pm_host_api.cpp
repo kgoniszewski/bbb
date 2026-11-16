@@ -333,6 +333,9 @@ pm_host* pm_host_create(void) {
         delete h;
         return nullptr;
     }
+    // The product configuration: the room on at its default level (the bare
+    // engine keeps it off for the physics tests).
+    pm_engine_set_param(h->engine, PM_PARAM_ROOM_ENABLED, 1.0);
     return h;
 }
 

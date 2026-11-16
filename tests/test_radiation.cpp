@@ -195,3 +195,58 @@ TEST(engine_stereo) {
         CHECK(mono > -3.0);  // correlation > -0.5: no broadband cancellation
     }
 }
+
+namespace {
+
+// GCC-PHAT lag (s) of the right channel against the left, transfer from the
+// bridge point of a key, 100 Hz-5 kHz.
+double gccLag(const pm::BoardModel& b, const pm::MicGains& g, int key) {
+    const double* sh = b.shapeOfKey(key);
+    std::vector<std::complex<double>> x;
+    std::vector<double> w;
+    for (double f = 100.0; f < 5000.0; f += 2.0) {
+        const std::complex<double> c = pm::micModalTransfer(b, sh, g.row(1), f) *
+                                       std::conj(pm::micModalTransfer(b, sh, g.row(0), f));
+        x.push_back(c / std::max(std::abs(c), 1e-300));
+        w.push_back(2.0 * kPi * f);
+    }
+    double best = -1e300, lag = 0.0;
+    for (double tau = -3e-3; tau <= 3e-3; tau += 1e-5) {
+        double acc = 0.0;
+        for (std::size_t k = 0; k < x.size(); ++k) acc += (x[k] * std::polar(1.0, w[k] * tau)).real();
+        if (acc > best) best = acc, lag = tau;
+    }
+    return lag;
+}
+
+}  // namespace
+
+// One bulk delay for both microphones keeps the inter-microphone time
+// difference: the channels' GCC-PHAT lag is that of per-microphone bulk
+// delays plus the difference of the microphones' distances to the board
+// centre (0.63 ms). For a bass key the lag is the path difference from its
+// bridge point; elsewhere the whole board radiates and no single path rules.
+TEST(inter_microphone_delay) {
+    const pm::BoardModel& b = pm::defaultBoard();
+    pm::RadiationParams r, own;
+    own.commonBulkDelay = false;
+    const pm::MicGains g = pm::computeMicGains(b, r), go = pm::computeMicGains(b, own);
+    double d[2];
+    for (int q = 0; q < 2; ++q) {
+        const double cx = 0.5 * b.params.lengthX - r.micX[q], cy = 0.5 * b.params.widthY - r.micY[q];
+        d[q] = std::sqrt(cx * cx + cy * cy + r.micZ[q] * r.micZ[q]);
+    }
+    const double centre = (d[1] - d[0]) / r.c;
+    for (int key : {10, 40, 70}) {
+        const double lag = gccLag(b, g, key), lagOwn = gccLag(b, go, key);
+        double p[2];
+        for (int q = 0; q < 2; ++q) {
+            const double dx = b.keyX[key - 1] - r.micX[q], dy = b.keyY[key - 1] - r.micY[q];
+            p[q] = std::sqrt(dx * dx + dy * dy + r.micZ[q] * r.micZ[q]);
+        }
+        std::printf("  key %d: R-L lag %.3f ms (own bulk delays %.3f ms), bridge-point path difference %.3f ms\n", key,
+                    1e3 * lag, 1e3 * lagOwn, 1e3 * (p[1] - p[0]) / r.c);
+        CHECK_NEAR(lag - lagOwn, centre, 0.05e-3);
+        if (key == 10) CHECK_NEAR(lag, (p[1] - p[0]) / r.c, 0.1e-3);
+    }
+}

@@ -27,8 +27,15 @@ Geometry geometry(const BoardModel& b, const RadiationParams& r, int mic) {
     g.mx = r.micX[mic];
     g.my = r.micY[mic];
     g.mz = r.micZ[mic];
-    const double cx = 0.5 * b.params.lengthX - g.mx, cy = 0.5 * b.params.widthY - g.my;
-    g.r0 = std::sqrt(cx * cx + cy * cy + g.mz * g.mz);
+    // One bulk delay for both microphones (mean distance to the board
+    // centre): the inter-microphone time difference stays in the phases.
+    g.r0 = 0.0;
+    for (int q = 0; q < 2; ++q) {
+        const double cx = 0.5 * b.params.lengthX - r.micX[q], cy = 0.5 * b.params.widthY - r.micY[q];
+        const double d = std::sqrt(cx * cx + cy * cy + r.micZ[q] * r.micZ[q]);
+        if (!r.commonBulkDelay) g.r0 += q == mic ? d : 0.0;
+        else g.r0 += 0.5 * d;
+    }
     const double a = r.lidAngleDeg * kPi / 180.0;
     g.ey = std::cos(a);
     g.ez = std::sin(a);
@@ -131,7 +138,7 @@ MicGains computeMicGains(const BoardModel& b, const RadiationParams& r) {
     };
     const double lg = logMean([&](int mic, int i) { return std::abs(m.gain[std::size_t(mic) * b.modes + i]); });
     const double lp = logMean([&](int mic, int i) { return std::fabs(b.pickupShape[std::size_t(mic) * b.modes + i]); });
-    m.scale = std::exp(lp - lg);
+    m.scale = r.levelTrim * std::exp(lp - lg);
     for (cd& g : m.gain) g *= m.scale;
     return m;
 }

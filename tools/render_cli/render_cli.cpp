@@ -52,10 +52,16 @@ void usage() {
         "\n"
         "piano mode: render_cli --score FILE [options]\n"
         "  --score FILE       text score (time note_on KEY VEL | note_off KEY | cc64/cc66/cc67 V | ...)\n"
-        "  --tail S           seconds rendered after the last event (default 4)\n"
+        "  --tail S           seconds rendered after the last event (default 4, plus the room decay\n"
+        "                     time when the room is on)\n"
         "  --fs, --block, --format, --out, --cull-db, --no-cull as above\n"
         "  --gain-db DB       master gain (default 0)\n"
         "  --width W          stereo width 0..1 (default 0.35)\n"
+        "  --dry              room (reverb) off; default on\n"
+        "  --room-level DB    room wet level (default -9; 0 = physical reverberant-to-direct ratio)\n"
+        "  --room-decay S     room T60 at mid frequencies, 0.3..6 s (default 1.8)\n"
+        "  --room-size X      room scale 0.5..2 (default 1)\n"
+        "  --room-hf R        T60(8 kHz) / T60(mid), 0.1..1 (default 0.5)\n"
         "  --quiet            do not list the strikes\n"
         "  --a4 HZ            reference pitch (default 440)\n"
         "  --stretch X        stretch tuning amount 0..1.5 (default 1)\n"
@@ -87,11 +93,14 @@ int pianoMain(int argc, char** argv) {
     pm::TableOptions voicing;
     pm::SoundboardConfig board;
     double knock = -1.0, damperNoise = -1.0;
+    bool room = true, tailSet = false;
+    double roomLevel = pm::Room::kDefaultLevelDb, roomDecay = 1.8, roomSize = 1.0, roomHf = 0.5;
     pm_tools::WavFormat format = pm_tools::WavFormat::Float32;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--no-cull") { cull = false; continue; }
         if (a == "--quiet") { quiet = true; continue; }
+        if (a == "--dry") { room = false; continue; }
         if (a == "--equal-temperament") { voicing.equalTemperament = true; continue; }
         if (a == "--no-board") { board.enabled = false; continue; }
         if (a == "--board-v0") { board.plate.lowRegimeDiso = 0.0; continue; }
@@ -107,7 +116,11 @@ int pianoMain(int argc, char** argv) {
         if (a == "--score") scorePath = v;
         else if (a == "--out") out = v;
         else if (a == "--fs") ok = num, fs = d;
-        else if (a == "--tail") ok = num, tail = d;
+        else if (a == "--tail") ok = num, tail = d, tailSet = true;
+        else if (a == "--room-level") ok = num, roomLevel = d;
+        else if (a == "--room-decay") ok = num && d >= 0.3 && d <= 6.0, roomDecay = d;
+        else if (a == "--room-size") ok = num && d >= 0.5 && d <= 2.0, roomSize = d;
+        else if (a == "--room-hf") ok = num && d >= 0.1 && d <= 1.0, roomHf = d;
         else if (a == "--block") ok = num, block = static_cast<int>(d);
         else if (a == "--gain-db") ok = num, gainDb = d;
         else if (a == "--width") ok = num, width = d;
@@ -148,6 +161,13 @@ int pianoMain(int argc, char** argv) {
     pm::Engine engine;
     engine.setMasterGainDb(static_cast<float>(gainDb));
     engine.setStereoWidth(static_cast<float>(width));
+    engine.setRoomEnabled(room);
+    engine.setRoomLevelDb(static_cast<float>(roomLevel));
+    engine.setRoomDecay(static_cast<float>(roomDecay));
+    engine.setRoomSize(static_cast<float>(roomSize));
+    engine.setRoomHfRatio(static_cast<float>(roomHf));
+    // The default tail also covers the reverberant decay (one T60).
+    if (room && !tailSet) tail += roomDecay;
     engine.setCulling(cull, static_cast<float>(cullDb));
     engine.setSoundboardConfig(board);
     engine.setNoiseLevels(knock >= 0.0 ? static_cast<float>(knock) : engine.knockLevel(),
@@ -194,9 +214,9 @@ int pianoMain(int argc, char** argv) {
     std::printf("%s: %zu events, %.2f s stereo at %.0f Hz, %d modes, peak %.4f (%.1f dBFS)\n",
                 out.c_str(), score.size(), n / fs, fs, st.totalModes, peak,
                 20.0 * std::log10(std::max(peak, 1e-30f)));
-    std::printf("  render time %.1f ms (%.1fx real time), block %d, kernel %s, culling %s, soundboard %s\n",
+    std::printf("  render time %.1f ms (%.1fx real time), block %d, kernel %s, culling %s, soundboard %s, room %s\n",
                 elapsed * 1e3, (n / fs) / elapsed, block, pm::simdKernelName(), cull ? "on" : "off",
-                board.enabled ? "on" : "off");
+                board.enabled ? "on" : "off", room ? "on" : "off");
     std::printf("  peak before limiter %.3f, limited samples %llu, deferred strikes %llu, dropped %llu\n",
                 st.peakPreLimiter, static_cast<unsigned long long>(st.limitedSamples),
                 static_cast<unsigned long long>(st.deferredStrikes),

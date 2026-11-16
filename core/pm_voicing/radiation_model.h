@@ -6,14 +6,16 @@
 // plane, times a reflection factor, wherever the reflection point lies on
 // the lid. Narrowband per mode: every board mode is a resonator, so its
 // contribution is its velocity phasor times
-//   G_{m,i} = (j w_i rho0 / 2 pi) Sum_patches phi_i exp(-j k_i (r - r0_m)) / r dA
-// evaluated at the mode's damped frequency w_i, with the bulk delay r0_m
-// (microphone to board centre) removed. A complex gain on a mode's complex
-// state is a linear combination of its real and imaginary parts, i.e. the
-// existing pickup row of the board (Soundboard::setPickupGain): no run-time
-// cost. Limitation: a mode radiates with the gain of its own frequency, so
-// its off-resonance forced response gets that gain's phase, an error bounded
-// by removing the bulk delay.
+//   G_{m,i} = (j w_i rho0 / 2 pi) Sum_patches phi_i exp(-j k_i (r - r0)) / r dA
+// evaluated at the mode's damped frequency w_i, with one bulk delay r0
+// removed for both microphones (the mean of their distances to the board
+// centre), so the inter-microphone time difference stays in the phases.
+// A complex gain on a mode's complex state is a linear combination of its
+// real and imaginary parts, i.e. the existing pickup row of the board
+// (Soundboard::setPickupGain): no run-time cost. Limitation: a mode radiates
+// with the gain of its own frequency, so its off-resonance forced response
+// gets that gain's phase; the error grows with the residual path
+// difference r - r0 (board extent plus half the inter-microphone difference).
 #pragma once
 
 #include <complex>
@@ -27,6 +29,8 @@ class Soundboard;
 
 // Coordinates: the board's (x along the strings from the belly rail, y
 // across from the bass-side straight edge (the spine), z up from the board).
+inline constexpr double kMicLevelTrim = 0.67;
+
 struct RadiationParams {
     bool enabled = true;  // false: the v0 pickups (PlateParams::pickupX/Y), bit-identical
     // A spaced pair 0.6 m apart, 0.5 m above the board, inside the lid
@@ -48,6 +52,13 @@ struct RadiationParams {
     // Normalisation band: the geometric mean of |G| over the modes in it
     // equals that of the v0 pickup shapes (keeps the output level).
     double normLoHz = 200.0, normHiHz = 2000.0;
+    // Level convention, not physics (the final balance is M6 voicing): a
+    // trim on that match so that all 88 keys at velocity 127 at once peak
+    // at about -3.5 dBFS, as the v0 pickups do, without limiting.
+    double levelTrim = kMicLevelTrim;
+    // false: each microphone's own distance to the board centre is removed
+    // (drops the inter-microphone time difference; tests and A/B).
+    bool commonBulkDelay = true;
     bool operator==(const RadiationParams&) const = default;
 };
 

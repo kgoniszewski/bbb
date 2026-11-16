@@ -58,6 +58,22 @@ int main(void) {
     EXPECT(pm_engine_set_param(eng, PM_PARAM_LOOP_CUTOFF_HZ, 0.0) == 1);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_QUALITY_TIER, PM_QUALITY_FULL) == 1);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_KNOCK_LEVEL, 0.0) == 1);
+    /* Room (API 0.15): off by default on a bare engine. */
+    EXPECT(PM_API_VERSION_MAJOR == 0 && PM_API_VERSION_MINOR >= 15);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_ENABLED, &v) == 1 && v == 0.0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_LEVEL_DB, -12.0) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_LEVEL_DB, &v) == 1 && v == -12.0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_DECAY, 2.5) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_DECAY, &v) == 1 && v == 2.5);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_HF_RATIO, 0.25) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_HF_RATIO, &v) == 1 && v == 0.25);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_SIZE, 1.5) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_SIZE, &v) == 1 && v == 1.5);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_EARLY_LATE, 0.75) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_EARLY_LATE, &v) == 1 && v == 0.75);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_ENABLED, 1.0) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_ENABLED, &v) == 1 && v == 1.0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_ENABLED, 0.0) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_KNOCK_LEVEL, &v) == 1 && v == 0.0);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_DAMPER_NOISE_LEVEL, 0.01) == 1);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_HALF_PEDAL_WIDTH, 0.3) == 1);
@@ -108,6 +124,8 @@ int main(void) {
         const uint8_t on[3] = {0x90, 60, 100};
         const uint32_t ump = 0x20B04000u; /* CC64 = 0 */
         EXPECT(h != NULL);
+        /* The host is the product configuration: room on. */
+        EXPECT(pm_engine_get_param(pm_host_engine(h), PM_PARAM_ROOM_ENABLED, &v) == 1 && v == 1.0);
         pm_host_set_timebase(h, 125, 3);
         EXPECT(pm_engine_set_param(pm_host_engine(h), PM_PARAM_SOUNDBOARD_ENABLED, 0.0) == 1);
         EXPECT(pm_host_prepare(h, 48000.0, 256) == 1 && pm_host_is_prepared(h) == 1);
