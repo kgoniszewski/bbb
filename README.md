@@ -34,6 +34,7 @@ duplex yet.
 | `core/pm_hammer/` | Hunt-Crossley felt hammer and the contact solver for one hammer on 1-3 strings, on normal modes |
 | `core/pm_board/` | Real-time soundboard modal bank (zone ports in and out, pickup read-outs, sleep) and the key/zone mixing of the coupling loop |
 | `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface (smooth placeholder kept for unit tests), soundboard mode set v0 and its admittances (`soundboard_model.h`), unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
+| `core/pm_room/` | Room, real-time: image-source early reflections and a 16-line feedback delay network, stereo in, wet stereo out (M5a). Radiation to the two microphones is in `core/pm_voicing/radiation_model.h`. C API 0.15 adds the parameters `PM_PARAM_ROOM_ENABLED`, `_LEVEL_DB`, `_DECAY`, `_HF_RATIO`, `_SIZE`, `_EARLY_LATE`; the app host turns the room on, the bare engine has it off. `bench_engine --dry` measures without it. |
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
 | `core/pm_bench/` | Non-real-time: the engine benchmark scenarios (worst, typical, cluster, bloom, board-off A/Bs, then the live-playing scenes legato, pedalling, chord release, idle, hammer burst, pedalled chords, the fresh- and same-key bursts and the pedal lift, and the hammer per key; back to back or paced to real time), shared by `bench_engine` and the app's Benchmark screen |
@@ -306,7 +307,11 @@ is struck staccato, then Db3 held, then nothing held), `pedal_residual.txt`
 `--a4 HZ`, `--stretch X` (0-1.5), `--equal-temperament`, `--unison-width X`;
 soundboard: `--no-board` (A/B), `--board-v0` (the board without its
 low-frequency regime, A/B), `--sympathetic G`, `--knock N`,
-`--damper-noise N`. `--help` lists all options.
+`--damper-noise N`; output stage: `--pickups-v0` (the board-velocity
+pickups instead of the two microphones, A/B), `--dry` (room off; it is on
+by default and adds its decay time to the default tail), `--room-level DB`
+(default -9), `--room-decay S` (default 1.8), `--room-size X` (0.5-2),
+`--room-hf R`. `--help` lists all options.
 
 ## Analyse
 
@@ -572,7 +577,8 @@ yet measured there.
 
 ## Tests
 
-`ctest` runs 30 suites. The app host ones: `test_midi_parser` (running
+`ctest` runs 33 suites (M5a added `test_radiation`, `test_room` and
+`test_room_engine`). The app host ones: `test_midi_parser` (running
 status, real-time bytes inside messages, SysEx, malformed input, UMP in
 MIDI 1.0 and 2.0 protocol, the `MIDIEventList` layout, controller mapping,
 fuzzing), `test_load_meter` and `test_host` (MIDI host timestamps land on
