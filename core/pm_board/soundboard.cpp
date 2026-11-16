@@ -148,6 +148,23 @@ void Soundboard::setPickupShape(int p, int i, double phi) noexcept {
     maxPickShape_ = std::max(maxPickShape_, static_cast<float>(std::fabs(phi) * std::hypot(vRe_[i], vIm_[i])));
 }
 
+// The state p_i rotates as exp(lambda t), lambda = -sigma + j omega_d, and
+// the velocity readout is Re(u_i) with u_i = (omega_d + j sigma) p_i =
+// (vRe - j vIm) p_i. Re(g u_i) = Re(g c) Re p - Im(g c) Im p, c = vRe - j vIm.
+void Soundboard::setPickupGain(int p, int i, double gRe, double gIm) noexcept {
+    const std::size_t k = static_cast<std::size_t>(p) * padded_ + i;
+    const double u = vRe_[i], w = vIm_[i];
+    pickRe_[k] = static_cast<float>(gRe * u + gIm * w);
+    pickIm_[k] = static_cast<float>(gRe * w - gIm * u);
+    maxPickShape_ = std::max(maxPickShape_, static_cast<float>(std::hypot(gRe, gIm) * std::hypot(u, w)));
+}
+
+void Soundboard::updatePickupBound() noexcept {
+    maxPickShape_ = 0.0f;
+    for (std::size_t k = 0; k < static_cast<std::size_t>(pickups_) * padded_; ++k)
+        maxPickShape_ = std::max(maxPickShape_, std::hypot(pickRe_[k], pickIm_[k]));
+}
+
 void Soundboard::setSleepThresholds(double displacement, double velocity) noexcept {
     dispThreshold_ = displacement;
     velThreshold_ = velocity;

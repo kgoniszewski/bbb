@@ -63,6 +63,7 @@ void usage() {
         "  --unison-width X   scales the unison detuning (default 1; 0 = strings in unison)\n"
         "  --no-board         soundboard off (A/B: M3 output, no sympathetic loop)\n"
         "  --board-v0         the v0 board, without its low-frequency regime (A/B)\n"
+        "  --pickups-v0       board velocity at two points instead of the microphones (A/B)\n"
         "  --sympathetic G    sympathetic loop gain 0..1.5 (default 1)\n"
         "  --tier T           loop quality: full (default), balanced, eco\n"
         "  --loop-cutoff HZ   loop band, overrides the tier\n"
@@ -94,6 +95,7 @@ int pianoMain(int argc, char** argv) {
         if (a == "--equal-temperament") { voicing.equalTemperament = true; continue; }
         if (a == "--no-board") { board.enabled = false; continue; }
         if (a == "--board-v0") { board.plate.lowRegimeDiso = 0.0; continue; }
+        if (a == "--pickups-v0") { board.radiation.enabled = false; continue; }
         if (i + 1 >= argc) {
             std::fprintf(stderr, "missing value for %s\n", a.c_str());
             return 2;

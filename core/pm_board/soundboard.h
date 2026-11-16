@@ -52,6 +52,12 @@ public:
     void setZoneShape(int z, int i, double phi) noexcept;
     // After setMode(i): the row holds phi times the mode's velocity readout.
     void setPickupShape(int p, int i, double phi) noexcept;
+    // After setMode(i): the row reads Re(g * u_i), u_i the mode's analytic
+    // (positive-frequency) velocity phasor and g = gRe + j gIm a complex gain
+    // (a microphone's per-mode radiation gain). gIm = 0 is setPickupShape(gRe).
+    void setPickupGain(int p, int i, double gRe, double gIm) noexcept;
+    // Recomputes the sleep bound from the pickup rows (after overwriting rows).
+    void updatePickupBound() noexcept;
     // Sleep thresholds: zone displacement bound (m) and pickup velocity bound (m/s).
     void setSleepThresholds(double displacement, double velocity) noexcept;
 

@@ -23,7 +23,8 @@ set(PM_TESTS
   test_sympathetic
   test_half_pedal
   test_idle
-  test_decay_trend)
+  test_decay_trend
+  test_radiation)
 
 find_package(Threads REQUIRED)
 foreach(t IN LISTS PM_TESTS)
@@ -52,3 +53,8 @@ endforeach()
 add_executable(test_host test_host.cpp)
 target_link_libraries(test_host PRIVATE pm_api Threads::Threads)
 add_test(NAME test_host COMMAND test_host)
+
+# Room (early reflections + FDN): standalone library.
+add_executable(test_room test_room.cpp)
+target_link_libraries(test_room PRIVATE pm_room)
+add_test(NAME test_room COMMAND test_room)

@@ -71,6 +71,12 @@ bool Engine::prepare(double sampleRate, int maxFrames) noexcept {
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept {
     if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
     boardModel_ = buildPlateBoard(boardCfg_.plate);
+    // The microphone gains (about 0.15 s) are kept while the board and
+    // radiation parameters are unchanged.
+    if (!boardCfg_.enabled || !boardCfg_.radiation.enabled) mics_ = MicGains{};
+    else if (mics_.modes != boardModel_.modes || !(mics_.plate == boardCfg_.plate) ||
+             !(mics_.params == boardCfg_.radiation))
+        mics_ = computeMicGains(boardModel_, boardCfg_.radiation);
     const double g = boardCfg_.enabled ? std::clamp(boardCfg_.sympathetic, 0.0, 1.5) : 0.0;
     const double cutoff = boardCfg_.loopCutoffHz > 0.0 ? boardCfg_.loopCutoffHz
                                                       : loopCutoffForTier(boardCfg_.tier, boardCfg_.plate);
@@ -152,6 +158,15 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     cullOffsetDb_ = 0.0f;
     if (board) {
         if (!loadSoundboard(board_, boardModel_, fs_)) return false;
+        const bool mics = mics_.modes == boardModel_.modes && mics_.modes > 0;
+        if (mics) loadMicGains(board_, mics_);
+        // Transfer from a bridge shape to output channel p: the microphone's
+        // (complex per-mode gains) or the v0 pickup's.
+        auto outTransfer = [&](const double* shape, int p, double f) {
+            return mics ? micModalTransfer(boardModel_, shape, mics_.row(p), f)
+                        : boardModalAdmittance(boardModel_, shape,
+                                               boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, f);
+        };
         symGain_ = static_cast<float>(std::clamp(boardCfg_.sympathetic, 0.0, 1.5));
         for (int k = 0; k < kNumKeys; ++k) {
             keyZone_[k] = boardModel_.keyZone[k];
@@ -176,9 +191,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
         for (int k = 1; k <= kNumKeys; ++k)
             for (int p = 0; p < 2; ++p)
                 for (int m = 0; m < boardModel_.modes; ++m) {
-                    const double y = std::abs(boardModalAdmittance(
-                        boardModel_, boardModel_.shapeOfKey(k),
-                        boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, boardModel_.freq[m]));
+                    const double y = std::abs(outTransfer(boardModel_.shapeOfKey(k), p, boardModel_.freq[m]));
                     peak = std::max(peak, y * keyZone_[k - 1].forceScale * kBoardOutputGain);
                 }
         cullOffsetDb_ = peak > 1.0 ? static_cast<float>(20.0 * std::log10(peak)) : 0.0f;
@@ -190,8 +203,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
         for (int k = 1; k <= kNumKeys; k += 3)
             for (double f = 0.75 * fMax; f < 0.95 * fMax; f *= 1.002)
                 for (int p = 0; p < 2; ++p) {
-                    acc += std::abs(boardModalAdmittance(boardModel_, boardModel_.shapeOfKey(k),
-                                                         boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, f));
+                    acc += std::abs(outTransfer(boardModel_.shapeOfKey(k), p, f));
                     ++cnt;
                 }
         hfGain_ = static_cast<float>(cnt > 0 ? acc / cnt : 0.0);

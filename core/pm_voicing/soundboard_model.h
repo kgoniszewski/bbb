@@ -133,6 +133,7 @@ struct BridgeCurve {
     double x0, y0, cx, cy, x1, y1;  // first key, control point, last key (m)
     int firstKey, lastKey;          // 1..88
     int zones;
+    bool operator==(const BridgeCurve&) const = default;
 };
 
 struct PlateParams {
@@ -172,6 +173,7 @@ struct PlateParams {
     // peaky, sat below its own n / (4 M)); the absolute level is a voicing
     // quantity for M6, so this change alters the statistics only.
     double lowRegimeBridgeLevel = 0.63;
+    bool operator==(const PlateParams&) const = default;
 };
 
 struct BoardModel {
@@ -206,6 +208,12 @@ struct BoardModel {
 BoardModel buildPlateBoard(const PlateParams& p);
 // Built once from the default parameters (thread-safe static).
 const BoardModel& defaultBoard();
+
+// Mass-normalised shape of mode i at (x, y) (the normalisation of pickupShape).
+double boardModeShape(const BoardModel& b, int i, double x, double y) noexcept;
+// The same, separated: shape(xs[a], ys[c]) = fx[a] * fy[c].
+void boardModeShapeAxes(const BoardModel& b, int i, const double* xs, int nx, double* fx, const double* ys, int ny,
+                        double* fy) noexcept;
 
 // Modal part of the vertical (transfer) admittance between two shape rows.
 std::complex<double> boardModalAdmittance(const BoardModel& b, const double* shapeA, const double* shapeB,
