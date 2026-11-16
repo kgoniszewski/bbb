@@ -33,6 +33,14 @@ void* operator new(std::size_t n) { return counted(n, 0); }
 void* operator new[](std::size_t n) { return counted(n, 0); }
 void* operator new(std::size_t n, std::align_val_t a) { return counted(n, static_cast<std::size_t>(a)); }
 void* operator new[](std::size_t n, std::align_val_t a) { return counted(n, static_cast<std::size_t>(a)); }
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept { return counted(n, 0); }
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept { return counted(n, 0); }
+void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept { return counted(n, static_cast<std::size_t>(a)); }
+void* operator new[](std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept { return counted(n, static_cast<std::size_t>(a)); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
 void operator delete(void* p) noexcept { std::free(p); }
 void operator delete[](void* p) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t) noexcept { std::free(p); }
