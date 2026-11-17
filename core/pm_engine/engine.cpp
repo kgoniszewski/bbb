@@ -235,7 +235,69 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     while (queue_.pop(drop)) {}
     resetState();
     prepared_ = true;
+    if (warmUpOnPrepare_) warmUp();
     return true;
+}
+
+// The first strikes after start-up ran the hammer, contact and loop code
+// for the first time on the audio thread (code pages faulted in from the
+// binary, first-touch of tables): one buffer near the deadline on the iPad.
+// Here every path used in playing runs once on the preparing thread, then
+// the state goes back to that of a fresh prepare.
+void Engine::warmUp() noexcept {
+    const int block = std::min(maxFrames_, 4096);
+    std::vector<float> l(static_cast<std::size_t>(block)), r(static_cast<std::size_t>(block));
+    const SubBlockHook hook = subBlockHook_;
+    void* const hookCtx = subBlockCtx_;
+    subBlockHook_ = nullptr;
+    warming_ = true;
+    room_.setEnabled(true);
+    const auto ms = [&](double t) { return static_cast<std::int64_t>(t * 1e-3 * fs_); };
+    const auto ev = [&](double tMs, EventType type, int key, std::uint16_t value) {
+        Event e;
+        e.type = type;
+        e.note = static_cast<std::uint8_t>(key - 1 + kFirstMidiNote);
+        e.value = value;
+        insertPending(ms(tMs), e);
+    };
+    static constexpr int kKeys[] = {1, 16, 40, 52, 64, 76, 88};
+    ev(0.0, EventType::Sustain, 1, 65535);
+    for (int i = 0; i < 7; ++i) ev(0.0 + 1.5 * i, EventType::NoteOn, kKeys[i], std::uint16_t(9000 + 8000 * i));
+    ev(4.0, EventType::UnaCorda, 1, 65535);
+    ev(5.0, EventType::NoteOn, 40, 65535);   // re-strike of a sounding string
+    ev(6.0, EventType::NoteOn, 64, 3000);    // soft
+    ev(8.0, EventType::Sostenuto, 1, 65535);
+    ev(12.0, EventType::Sustain, 1, 30000);  // half pedal
+    ev(14.0, EventType::NoteOff, 16, 0);
+    ev(16.0, EventType::NoteOn, 30, 40000);
+    ev(18.0, EventType::KeyDownSilent, 70, 0);
+    ev(20.0, EventType::Sustain, 1, 0);
+    ev(22.0, EventType::UnaCorda, 1, 0);
+    ev(24.0, EventType::Sostenuto, 1, 0);
+    ev(26.0, EventType::AllNotesOff, 1, 0);
+    const std::int64_t total = ms(40.0);
+    for (std::int64_t t = 0; t < total; t += block) render(l.data(), r.data(), block, nullptr);
+    // Silent buffers after a reset: the idle (sleeping) path.
+    resetState();
+    for (int i = 0; i < 4; ++i) render(l.data(), r.data(), block, nullptr);
+
+    room_.setEnabled(roomOn_.load(std::memory_order_relaxed));
+    warming_ = false;
+    subBlockHook_ = hook;
+    subBlockCtx_ = hookCtx;
+    resetState();
+    info_ = RenderInfo{};
+    prof_ = EngineProfile{};
+    damperUpdates_ = 0;
+    pub_.awakeGroups.store(0, std::memory_order_relaxed);
+    pub_.awakeModes.store(0, std::memory_order_relaxed);
+    pub_.activeHammers.store(0, std::memory_order_relaxed);
+    pub_.peakHammers.store(0, std::memory_order_relaxed);
+    pub_.deferred.store(0, std::memory_order_relaxed);
+    pub_.late.store(0, std::memory_order_relaxed);
+    pub_.limited.store(0, std::memory_order_relaxed);
+    pub_.nonFinite.store(0, std::memory_order_relaxed);
+    pub_.peakPre.store(0.0f, std::memory_order_relaxed);
 }
 
 void Engine::resetState() noexcept {
@@ -559,7 +621,7 @@ void Engine::releaseHammer(int a, bool report) noexcept {
     const int slot = active_[a];
     Hammer& h = hammers_[slot];
     harvestHammer(h);
-    if (report) {
+    if (report && !warming_) {
         const HammerKeyModes m = contact_.view(bank_, h.key);
         StrikeInfo info;
         info.sampleTime = h.launchTime;
@@ -1062,7 +1124,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
     // starts and ends silent wrote zeros and is not added (keeps the sign
     // of zeros, so off is bit-identical).
     bool roomSounding = false;
-    if (roomOn_.load(std::memory_order_relaxed) || !room_.silent()) {
+    if (roomOn_.load(std::memory_order_relaxed) || warming_ || !room_.silent()) {
         const bool wasSilent = room_.silent();
         float* rL = roomL_.data();
         float* rR = roomR_.data();

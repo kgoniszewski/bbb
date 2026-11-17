@@ -320,6 +320,12 @@ public:
     void setSoundboardConfig(const SoundboardConfig& c) noexcept { boardCfg_ = c; }
     const SoundboardConfig& soundboardConfig() const noexcept { return boardCfg_; }
     bool prepared() const noexcept { return prepared_; }
+    // Non-real-time, before prepare(). On (default): prepare() ends by
+    // rendering about 40 ms of a short scene (strikes across the registers,
+    // pedals, releases, room on) and then resets, so that the first strikes
+    // do not run cold code on the audio thread. The engine state, output and
+    // statistics afterwards are those of a prepare without it.
+    void setWarmUpOnPrepare(bool on) noexcept { warmUpOnPrepare_ = on; }
 
     // Producer thread. Returns false (and counts a drop) when the queue is full.
     bool pushEvent(const Event& e) noexcept;
@@ -531,6 +537,7 @@ private:
     static constexpr std::uint8_t kStrikeOnly = 100;  // internal: deferred hammer launch
 
     void resetState() noexcept;
+    void warmUp() noexcept;
     void readParams() noexcept;
     void latchTreble(bool snap) noexcept;
     void processTreble(float* mL, float* mR, int n, bool final) noexcept;
@@ -554,6 +561,8 @@ private:
     float keyAmplitude(int k) const noexcept;
 
     bool prepared_ = false;
+    bool warmUpOnPrepare_ = true;
+    bool warming_ = false;  // inside warmUp(): no strike log, room processed
     double fs_ = 48000.0;
     int maxFrames_ = 0;
     PianoTable table_{};
