@@ -71,6 +71,12 @@ int main(void) {
     EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_SIZE, &v) == 1 && v == 1.5);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_EARLY_LATE, 0.75) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_EARLY_LATE, &v) == 1 && v == 0.75);
+    /* Treble shelf (API 0.16): default -3 dB. */
+    EXPECT(PM_API_VERSION_MINOR >= 16);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == -3.0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_TREBLE_DB, -6.0) == 1);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == -6.0);
+    EXPECT(pm_engine_set_param(eng, PM_PARAM_TREBLE_DB, -3.0) == 1);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_ENABLED, 1.0) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_ENABLED, &v) == 1 && v == 1.0);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_ENABLED, 0.0) == 1);

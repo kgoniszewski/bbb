@@ -57,6 +57,7 @@ void usage() {
         "  --fs, --block, --format, --out, --cull-db, --no-cull as above\n"
         "  --gain-db DB       master gain (default 0)\n"
         "  --width W          stereo width 0..1 (default 0.35)\n"
+        "  --treble DB        high shelf at 3 kHz on the microphones, -12..6 dB (default -3)\n"
         "  --dry              room (reverb) off; default on\n"
         "  --room-level DB    room wet level (default -9; 0 = physical reverberant-to-direct ratio)\n"
         "  --room-decay S     room T60 at mid frequencies, 0.3..6 s (default 1.8)\n"
@@ -87,7 +88,7 @@ bool parseDouble(const char* s, double& v) {
 
 int pianoMain(int argc, char** argv) {
     std::string scorePath, out = "out.wav";
-    double fs = 48000.0, tail = 4.0, gainDb = 0.0, width = 0.35, cullDb = -100.0;
+    double fs = 48000.0, tail = 4.0, gainDb = 0.0, width = 0.35, trebleDb = -3.0, cullDb = -100.0;
     int block = 64;
     bool cull = true, quiet = false;
     pm::TableOptions voicing;
@@ -124,6 +125,7 @@ int pianoMain(int argc, char** argv) {
         else if (a == "--block") ok = num, block = static_cast<int>(d);
         else if (a == "--gain-db") ok = num, gainDb = d;
         else if (a == "--width") ok = num, width = d;
+        else if (a == "--treble") ok = num, trebleDb = d;
         else if (a == "--cull-db") ok = num, cullDb = d;
         else if (a == "--a4") ok = num && d > 0.0, voicing.a4Hz = d;
         else if (a == "--stretch") ok = num && d >= 0.0 && d <= 1.5, voicing.stretch = d;
@@ -161,6 +163,7 @@ int pianoMain(int argc, char** argv) {
     pm::Engine engine;
     engine.setMasterGainDb(static_cast<float>(gainDb));
     engine.setStereoWidth(static_cast<float>(width));
+    engine.setTrebleDb(static_cast<float>(trebleDb));
     engine.setRoomEnabled(room);
     engine.setRoomLevelDb(static_cast<float>(roomLevel));
     engine.setRoomDecay(static_cast<float>(roomDecay));

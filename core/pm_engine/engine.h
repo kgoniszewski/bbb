@@ -331,6 +331,16 @@ public:
     // Atomic parameters, any thread.
     void setMasterGainDb(float db) noexcept { masterGainDb_.store(db, std::memory_order_relaxed); }
     void setStereoWidth(float w) noexcept { width_.store(w, std::memory_order_relaxed); }
+    // Treble: second-order high shelf (RBJ, S = 1) at kTrebleHz on the dry
+    // microphone pair, after the stereo width and before the room, gain in
+    // dB clamped to [-12, 6]. The default -3 dB is an interim voicing
+    // measure (the treble was heard as a little too bright) pending the
+    // register balance of M6. Latched on the 32-sample control grid and
+    // glided over a few ticks; exactly 0 dB bypasses the filter
+    // (bit-identical to the engine without it).
+    static constexpr float kDefaultTrebleDb = -3.0f;
+    static constexpr double kTrebleHz = 3000.0;
+    void setTrebleDb(float db) noexcept { trebleDb_.store(db, std::memory_order_relaxed); }
     // Room (pm_room): its wet signal is added to the dry microphone pair
     // before master gain. Off by default on the bare engine (the physics
     // tests measure the dry output); the host turns it on. Changes are
@@ -406,6 +416,7 @@ public:
     bool loopKernelExact() noexcept { return !boardOn_ || loop_.kernelMatchesRebuild(); }
     float masterGainDb() const noexcept { return masterGainDb_.load(std::memory_order_relaxed); }
     float stereoWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
+    float trebleDb() const noexcept { return trebleDb_.load(std::memory_order_relaxed); }
     bool roomEnabled() const noexcept { return roomOn_.load(std::memory_order_relaxed); }
     float roomLevelDb() const noexcept { return roomLevelDb_.load(std::memory_order_relaxed); }
     float roomDecay() const noexcept { return roomDecay_.load(std::memory_order_relaxed); }
@@ -521,6 +532,8 @@ private:
 
     void resetState() noexcept;
     void readParams() noexcept;
+    void latchTreble(bool snap) noexcept;
+    void processTreble(float* mL, float* mR, int n, bool final) noexcept;
     void drainQueue(const ClockMapping* clock) noexcept;
     bool insertPending(std::int64_t when, const Event& e) noexcept;
     void applyEvent(const Event& e, std::int64_t now) noexcept;
@@ -638,6 +651,11 @@ private:
     // Output stage.
     float gainL_[kNumKeys]{}, gainR_[kNumKeys]{};
     float appliedWidth_ = -1.0f;
+    // Treble shelf: latched target and gliding gain (dB), coefficients
+    // (b0..b2, a1, a2 normalised) and direct-form-I state per channel.
+    float trebleTarget_ = 0.0f, trebleCur_ = 0.0f;
+    float shB_[3]{1.0f, 0.0f, 0.0f}, shA_[2]{};
+    float shX_[2][2]{}, shY_[2][2]{};
     float masterGain_ = 1.0f, masterTarget_ = 1.0f;
     float dcX_[2]{}, dcY_[2]{};
     float dcCoef_ = 0.9995f;
@@ -654,6 +672,7 @@ private:
     // Parameters.
     std::atomic<float> masterGainDb_{0.0f};
     std::atomic<float> width_{0.35f};
+    std::atomic<float> trebleDb_{kDefaultTrebleDb};
     std::atomic<bool> roomOn_{false};
     std::atomic<float> roomLevelDb_{float(Room::kDefaultLevelDb)}, roomDecay_{1.8f}, roomHf_{0.5f}, roomSize_{1.0f},
         roomBal_{0.5f};

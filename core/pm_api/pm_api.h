@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 15
+#define PM_API_VERSION_MINOR 16
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -88,7 +88,8 @@ enum pm_param {
     PM_PARAM_ROOM_DECAY = 25,             /* T60 at mid frequencies, s, 0.3 .. 6, default 1.8 */
     PM_PARAM_ROOM_HF_RATIO = 26,          /* T60(8 kHz) / T60(mid), 0.1 .. 1, default 0.5 */
     PM_PARAM_ROOM_SIZE = 27,              /* room scale 0.5 .. 2, default 1 (change fades out and in) */
-    PM_PARAM_ROOM_EARLY_LATE = 28         /* 0 early only, 1 late only, 0.5 both at physical level (default) */
+    PM_PARAM_ROOM_EARLY_LATE = 28,        /* 0 early only, 1 late only, 0.5 both at physical level (default) */
+    PM_PARAM_TREBLE_DB = 29               /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default -3 */
 };
 
 /* Partials below the loop band are fed back by the string-board loop

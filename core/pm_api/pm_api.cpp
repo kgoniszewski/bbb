@@ -87,6 +87,7 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
         case PM_PARAM_ROOM_HF_RATIO: e.setRoomHfRatio(static_cast<float>(value)); return 1;
         case PM_PARAM_ROOM_SIZE: e.setRoomSize(static_cast<float>(value)); return 1;
         case PM_PARAM_ROOM_EARLY_LATE: e.setRoomEarlyLate(static_cast<float>(value)); return 1;
+        case PM_PARAM_TREBLE_DB: e.setTrebleDb(static_cast<float>(value)); return 1;
         case PM_PARAM_SCHEDULING_MODE:
             e.setSchedulingMode(value >= 0.5 ? pm::SchedulingMode::ConstantLatency
                                              : pm::SchedulingMode::LowestLatency);
@@ -155,6 +156,7 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_ROOM_HF_RATIO: *value = e.roomHfRatio(); return 1;
         case PM_PARAM_ROOM_SIZE: *value = e.roomSize(); return 1;
         case PM_PARAM_ROOM_EARLY_LATE: *value = e.roomEarlyLate(); return 1;
+        case PM_PARAM_TREBLE_DB: *value = e.trebleDb(); return 1;
         case PM_PARAM_SCHEDULING_MODE: *value = static_cast<double>(e.schedulingMode()); return 1;
         case PM_PARAM_CONSTANT_LATENCY_FRAMES: *value = e.constantLatencyFrames(); return 1;
         case PM_PARAM_CULL_THRESHOLD_DB: *value = e.cullThresholdDb(); return 1;
