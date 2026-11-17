@@ -34,6 +34,7 @@ duplex yet.
 | `core/pm_hammer/` | Hunt-Crossley felt hammer and the contact solver for one hammer on 1-3 strings, on normal modes |
 | `core/pm_board/` | Real-time soundboard modal bank (zone ports in and out, pickup read-outs, sleep) and the key/zone mixing of the coupling loop |
 | `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface (smooth placeholder kept for unit tests), soundboard mode set v0 and its admittances (`soundboard_model.h`), unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
+| `core/pm_api/param_table.*`, `preset.*` | M5b: the parameter descriptor table (stable ids and keys, ranges, units, defaults, class, flags; C API 0.17 `pm_param_info`) and versioned JSON presets (C API 0.18 `pm_preset_write` / `pm_preset_read`, host variants). C API 0.16 added `PM_PARAM_TREBLE_DB`. |
 | `core/pm_room/` | Room, real-time: image-source early reflections and a 16-line feedback delay network, stereo in, wet stereo out (M5a). Radiation to the two microphones is in `core/pm_voicing/radiation_model.h`. C API 0.15 adds the parameters `PM_PARAM_ROOM_ENABLED`, `_LEVEL_DB`, `_DECAY`, `_HF_RATIO`, `_SIZE`, `_EARLY_LATE`; the app host turns the room on, the bare engine has it off. `bench_engine --dry` measures without it. |
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
@@ -311,7 +312,10 @@ low-frequency regime, A/B), `--sympathetic G`, `--knock N`,
 pickups instead of the two microphones, A/B), `--dry` (room off; it is on
 by default and adds its decay time to the default tail), `--room-level DB`
 (default -9), `--room-decay S` (default 1.8), `--room-size X` (0.5-2),
-`--room-hf R`. `--help` lists all options.
+`--room-hf R`, `--treble DB` (high shelf at 3 kHz on the microphones,
+default -3). Presets: `--preset FILE` (JSON, applied after all other
+options), `--save-preset FILE` (the effective settings, full state).
+`--help` lists all options.
 
 ## Analyse
 
@@ -577,8 +581,8 @@ yet measured there.
 
 ## Tests
 
-`ctest` runs 33 suites (M5a added `test_radiation`, `test_room` and
-`test_room_engine`). The app host ones: `test_midi_parser` (running
+`ctest` runs 36 suites (M5a added `test_radiation`, `test_room` and
+`test_room_engine`; M5b `test_treble`, `test_params` and `test_preset`). The app host ones: `test_midi_parser` (running
 status, real-time bytes inside messages, SysEx, malformed input, UMP in
 MIDI 1.0 and 2.0 protocol, the `MIDIEventList` layout, controller mapping,
 fuzzing), `test_load_meter` and `test_host` (MIDI host timestamps land on
