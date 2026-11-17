@@ -61,6 +61,11 @@ add_executable(test_params test_params.cpp)
 target_link_libraries(test_params PRIVATE pm_api Threads::Threads)
 add_test(NAME test_params COMMAND test_params)
 
+# Presets and state: JSON writer/reader, migration, robustness (through the C API).
+add_executable(test_preset test_preset.cpp)
+target_link_libraries(test_preset PRIVATE pm_api Threads::Threads)
+add_test(NAME test_preset COMMAND test_preset)
+
 # Room (early reflections + FDN): standalone library.
 add_executable(test_room test_room.cpp)
 target_link_libraries(test_room PRIVATE pm_room)

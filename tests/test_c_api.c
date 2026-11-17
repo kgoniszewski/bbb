@@ -90,6 +90,16 @@ int main(void) {
         EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == 6.0);
         EXPECT(pm_engine_set_param(eng, PM_PARAM_TREBLE_DB, -3.0) == 1);
     }
+    /* Presets (API 0.18). */
+    EXPECT(PM_API_VERSION_MINOR >= 18 && PM_PRESET_VERSION == 1);
+    {
+        char json[2048];
+        pm_preset_result_t pr;
+        size_t n = pm_preset_write(eng, "c", 0, json, sizeof json);
+        EXPECT(n > 0 && n < sizeof json && json[n] == 0);
+        EXPECT(pm_preset_read(eng, json, n, 0, &pr) == 1 && pr.ok == 1 && pr.needs_prepare == 0);
+        EXPECT(pm_preset_read(eng, json, n - 1, 0, &pr) == 0 && pr.error_offset >= 0);
+    }
     EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_ENABLED, 1.0) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_ENABLED, &v) == 1 && v == 1.0);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_ENABLED, 0.0) == 1);
