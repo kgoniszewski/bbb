@@ -1018,6 +1018,29 @@ mean / p99 / max in % of the buffer:
 | Typical | 4.82 | 6.73 | 14.12 |
 | Idle | 0.02 | 0.03 | 0.04 |
 
+After M5a (2026-11-17, API 0.15.0: 279 board modes, microphones, room on;
+same device and method):
+
+| Scene | Mean | p99 | Max |
+|---|---|---|---|
+| Worst (88 keys held, pedal) | 18.18 (242.3 µs) | 32.52 | 72.68 * |
+| Worst, culling off | 21.31 | 33.87 | 47.26 |
+| Cluster | 10.40 | 34.71 | 35.40 |
+| Bloom | 17.30 | 20.04 | 29.36 |
+| Pedalling | 17.55 | 22.53 | 32.18 |
+| Pedalled chords | 17.56 | 22.26 | 34.34 |
+| Fresh-key burst | 17.57 | 23.09 | 36.20 |
+| Hammer burst | 8.49 | 15.38 | 31.59 |
+| Release of a 10-note chord | 7.98 | 9.93 | 33.76 |
+| Legato | 7.60 | 9.84 | 13.92 |
+| Typical | 6.15 | 8.23 | 15.67 |
+| Idle | 0.07 | 0.07 | 0.07 |
+
+\* One buffer: 876 µs in the hammer phase for 80 hammer-samples (normally
+about 30 µs) with a migration between cores, i.e. the benchmark thread
+interrupted; the next largest in that scene is below the p99 + a few points.
+The real-audio-thread run is still to be made.
+
 The worst case is 1.34× the Mac mini M4's back-to-back time at the same 48
 kHz / 64 frames (212.5 vs 158.1 µs). Headroom sweep on the real audio
 thread (worst scene, app engine, 2250 buffers per row):
