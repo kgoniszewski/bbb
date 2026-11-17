@@ -184,7 +184,7 @@ struct Parser {
                 for (;;) {
                     ws();
                     if (p >= e || *p != '"') return fail(p, "expected a key string");
-                    std::pair<std::string, Value> m;
+                    Member m;
                     if (!string(m.first)) return false;
                     ws();
                     if (p >= e || *p != ':') return fail(p, "expected ':'");
@@ -360,7 +360,7 @@ bool migrateV0toV1(Value& root, Report& rep) {
                 const auto n = static_cast<std::int32_t>(id->num);
                 key = pm::paramDescriptor(n) ? pm::paramDescriptor(n)->key : "#v0_id_" + std::to_string(n);
             }
-            obj.obj.emplace_back(std::move(key), val ? *val : Value{});
+            obj.obj.push_back(pm::json::Member{std::move(key), val ? *val : Value{}});
         }
         *params = std::move(obj);
     }

@@ -10,15 +10,24 @@
 
 namespace pm::json {
 
+struct Member;
+
 struct Value {
     enum Type { Null, Bool, Number, String, Array, Object } type = Null;
     bool b = false;
     double num = 0.0;
     std::string str;
     std::vector<Value> arr;
-    std::vector<std::pair<std::string, Value>> obj;  // in document order; duplicates kept
+    // std::vector of an incomplete element type is allowed since C++17, but
+    // std::pair<std::string, Value> is not (libstdc++ with clang rejects it).
+    std::vector<Member> obj;  // in document order; duplicates kept
 
     const Value* find(const char* key) const noexcept;  // the last member with this key
+};
+
+struct Member {
+    std::string first;  // key
+    Value second;
 };
 
 constexpr int kMaxDepth = 32;
