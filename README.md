@@ -1049,6 +1049,8 @@ worst 22.11 / 37.25 / 48.96 (before M5a 19.59 / 35.25 / 48.8); cluster
 bloom 21.16 / 25.50 / 34.85; typical 9.35 / 13.50 / 21.48; idle 0.33 /
 0.50 / 0.54. The "culling off" and "board off" rows there run the app's
 engine as configured, i.e. the worst scene again (same awake-mode counts).
+Live playing after M5a: 76,362 buffers (about 1.7 min), mean 17.1 %, p99
+25.2 %, max 37.0 % (a pedal motion), none over 70 %, 0 MIDI messages dropped.
 
 The worst case is 1.34× the Mac mini M4's back-to-back time at the same 48
 kHz / 64 frames (212.5 vs 158.1 µs). Headroom sweep on the real audio
