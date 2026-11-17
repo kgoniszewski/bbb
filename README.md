@@ -581,7 +581,7 @@ yet measured there.
 
 ## Tests
 
-`ctest` runs 36 suites (M5a added `test_radiation`, `test_room` and
+`ctest` runs 37 suites (warm-up: `test_warm_up`; M5a added `test_radiation`, `test_room` and
 `test_room_engine`; M5b `test_treble`, `test_params` and `test_preset`). The app host ones: `test_midi_parser` (running
 status, real-time bytes inside messages, SysEx, malformed input, UMP in
 MIDI 1.0 and 2.0 protocol, the `MIDIEventList` layout, controller mapping,
@@ -1055,6 +1055,15 @@ bloom 21.16 / 25.50 / 34.85; typical 9.35 / 13.50 / 21.48; idle 0.33 /
 engine as configured, i.e. the worst scene again (same awake-mode counts).
 Live playing after M5a: 76,362 buffers (about 1.7 min), mean 17.1 %, p99
 25.2 %, max 37.0 % (a pedal motion), none over 70 %, 0 MIDI messages dropped.
+
+After the treble control and presets (API 0.18, same method) the means are
+unchanged within 0.4 points. The first run after installing a new build had
+one buffer at 90.1 % (1201 µs, no overrun): the first hammer strikes, with
+1042 µs in the hammer phase. Repeat runs, a run after 5 minutes idle and a
+relaunch did not reproduce it (47-52 %). Since then the engine warms up at
+prepare (`Engine::warmUp()`, 40 ms of strikes and pedals rendered on the
+preparing thread, then reset; bit-identical output, `test_warm_up`); the
+first run after the next install should show whether that removes it.
 
 The worst case is 1.34× the Mac mini M4's back-to-back time at the same 48
 kHz / 64 frames (212.5 vs 158.1 µs). Headroom sweep on the real audio
