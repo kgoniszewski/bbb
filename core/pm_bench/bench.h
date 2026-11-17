@@ -120,6 +120,7 @@ struct Config {
     std::size_t evictBytes = 0;  // paced only: scratch walked between buffers (0: none)
     int probeEvery = 0;       // > 0: the speed probe right before every Nth render call (untimed), as the host does
     int load = 1;             // engines rendered per buffer (load multiplier, see above), 1..kMaxLoad
+    bool room = true;         // room (reverb) on, the product configuration; false: dry engine
     // Paced only: called on this thread (event: 0 begin, ns = period; 1
     // before a render call, ns = time to its deadline; 2 after it; 3 end).
     void (*paceHook)(void* ctx, int event, std::int64_t ns) = nullptr;
@@ -151,6 +152,7 @@ struct Case {
     bool board;
     QualityTier tier;
     bool coldMotion = false;  // eviction walk before pedal-motion buffers (see "pedal lift, cold")
+    bool room = true;         // room on (Config::room)
 };
 
 // Engine scenarios, in bench_engine's order.

@@ -17,16 +17,32 @@
 // string-board hybridisation all come out of this loop; there is no special
 // case for any of them.
 //
-// Output (PLACEHOLDER until the radiation model, M5/M8): the board velocity
-// at two pickup points (bass side -> left, treble side -> right), plus a
-// high-frequency direct path for partials above the board's modal range:
-// the panned bridge forces, high-passed at 0.9 times the modal range and
-// scaled by the board's mean transfer admittance to the pickups near the
-// top of that range. Stereo width scales the side signal. Level (with the
-// MIDI dynamics mf = 80, ff = 112): mf single notes C3-C5 peak at -33 to
-// -22 dBFS, velocity 127 at -17 dBFS at most; 12-note clusters every 100 ms
-// at -7 (ff) to -5 dBFS (127, pedal down); all 88 keys at velocity 127 at
-// once -1.4 dBFS, just below the limiter.
+// Output (radiation v0, plan §1.7; pm_voicing/radiation_model.h): two
+// virtual microphones (a spaced pair 0.6 m apart, 0.5 m above the board,
+// bass side -> left, treble side -> right). The pressure of the baffled
+// board (Rayleigh integral) plus the open lid as a mirror source is reduced
+// to one complex gain per mode and microphone, evaluated at the mode's own
+// frequency with each microphone's bulk delay (to the board centre) removed;
+// it rides on the board's pickup rows, at no run-time cost. Limitation: a
+// mode radiates with the gain of its own frequency, so its off-resonance
+// forced response has a phase error (bounded by removing the bulk delay).
+// The gains are scaled by one factor so that their geometric mean over the
+// modes in 200 Hz-2 kHz equals that of the v0 pickups (board velocity at
+// two points, SoundboardConfig::radiation.enabled = false, bit-identical).
+// Above the modal range a high-frequency direct path: the panned bridge
+// forces, high-passed at 0.9 times the modal range and scaled by the mean
+// |modal transfer| from the bridge points to the microphones near the top of
+// that range. Stereo width scales the side signal. Level, measured with
+// render_cli (MIDI dynamics mf = 80, ff = 112; microphones, then the v0
+// pickups in brackets): mf single notes C2-C7 peak at -35 to -27 dBFS
+// (-36 to -24), C3-C5 at -33 to -31 (-32 to -24); velocity 127, A0 and
+// every C, at -20 dBFS at most (-19); 12-note clusters (keys 48-59) every
+// 100 ms for 2 s at -12.9 (ff) and -11.3 dBFS (127, pedal down) (-4.9 and
+// -3.2); all 88 keys at velocity 127 at once -3.5 dBFS (-3.6), no sample
+// limited. The microphones tilt the spectrum (pressure rises with frequency
+// relative to board velocity, about 6 dB/octave): the treble sits up to
+// 9 dB above the v0 pickups, the mid-range clusters 8 dB below; the level
+// trim (kMicLevelTrim) is a convention, the balance is M6 voicing.
 //
 // Pedals. Sustain (CC64) is continuous (plan §1.9). The pedal position is
 // smoothed (pedal and lever inertia, 10 ms) and mapped per register to a
@@ -125,8 +141,10 @@
 #include "pm_board/soundboard.h"
 #include "pm_engine/events.h"
 #include "pm_hammer/hammer.h"
+#include "pm_room/room.h"
 #include "pm_string/mode_bank.h"
 #include "pm_voicing/bridge_admittance.h"
+#include "pm_voicing/radiation_model.h"
 #include "pm_voicing/piano_table.h"
 #include "pm_voicing/soundboard_model.h"
 
@@ -169,7 +187,7 @@ struct RenderInfo {
     int newtonEvals = 0;       // contact-solver Newton evaluations (each S felt forces)
     int fallbackSolves = 0;    // contact substeps that needed the bracketed fallback
     int awakeModes = 0;        // at the end of the buffer
-    int idleSubBlocks = 0;     // sub-blocks skipped as silent (board, loop and bank asleep)
+    int idleSubBlocks = 0;     // sub-blocks skipped as silent (board, loop and bank asleep, room silent)
     // Events applied, by kind (note-on with velocity 0 counts as a note-off;
     // pedal: sustain, sostenuto, una corda).
     int noteOns = 0, noteOffs = 0, pedalEvents = 0;
@@ -248,6 +266,7 @@ struct SoundboardConfig {
     QualityTier tier = QualityTier::Full;
     double loopCutoffHz = 0.0;  // > 0: overrides the tier's loop band
     PlateParams plate{};
+    RadiationParams radiation{};  // enabled = false: the v0 pickups (A/B)
 };
 
 // Half-pedal lift curve (plan §1.9). Pedal position P in 0..1; the key's
@@ -312,6 +331,19 @@ public:
     // Atomic parameters, any thread.
     void setMasterGainDb(float db) noexcept { masterGainDb_.store(db, std::memory_order_relaxed); }
     void setStereoWidth(float w) noexcept { width_.store(w, std::memory_order_relaxed); }
+    // Room (pm_room): its wet signal is added to the dry microphone pair
+    // before master gain. Off by default on the bare engine (the physics
+    // tests measure the dry output); the host turns it on. Changes are
+    // latched by the room at its own 32-sample control grid and smoothed.
+    void setRoomEnabled(bool on) noexcept {
+        roomOn_.store(on, std::memory_order_relaxed);
+        room_.setEnabled(on);
+    }
+    void setRoomLevelDb(float db) noexcept { roomLevelDb_.store(db, std::memory_order_relaxed); room_.setLevelDb(db); }
+    void setRoomDecay(float s) noexcept { roomDecay_.store(s, std::memory_order_relaxed); room_.setDecay(s); }
+    void setRoomHfRatio(float r) noexcept { roomHf_.store(r, std::memory_order_relaxed); room_.setHfRatio(r); }
+    void setRoomSize(float x) noexcept { roomSize_.store(x, std::memory_order_relaxed); room_.setSize(x); }
+    void setRoomEarlyLate(float b) noexcept { roomBal_.store(b, std::memory_order_relaxed); room_.setEarlyLateBalance(b); }
     void setSchedulingMode(SchedulingMode m) noexcept {
         schedMode_.store(static_cast<int>(m), std::memory_order_relaxed);
     }
@@ -374,6 +406,13 @@ public:
     bool loopKernelExact() noexcept { return !boardOn_ || loop_.kernelMatchesRebuild(); }
     float masterGainDb() const noexcept { return masterGainDb_.load(std::memory_order_relaxed); }
     float stereoWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
+    bool roomEnabled() const noexcept { return roomOn_.load(std::memory_order_relaxed); }
+    float roomLevelDb() const noexcept { return roomLevelDb_.load(std::memory_order_relaxed); }
+    float roomDecay() const noexcept { return roomDecay_.load(std::memory_order_relaxed); }
+    float roomHfRatio() const noexcept { return roomHf_.load(std::memory_order_relaxed); }
+    float roomSize() const noexcept { return roomSize_.load(std::memory_order_relaxed); }
+    float roomEarlyLate() const noexcept { return roomBal_.load(std::memory_order_relaxed); }
+    bool roomSilent() const noexcept { return room_.silent(); }
     SchedulingMode schedulingMode() const noexcept {
         return static_cast<SchedulingMode>(schedMode_.load(std::memory_order_relaxed));
     }
@@ -517,11 +556,14 @@ private:
     AlignedArray<float> keyBuf_;   // kNumKeys x kSubBlock
     AlignedArray<float> mixL_, mixR_;
     AlignedArray<float> hfL_, hfR_;       // high-frequency direct bus, kSubBlock
+    AlignedArray<float> roomL_, roomR_;   // room wet output, kSubBlock
+    Room room_;
     AlignedArray<float> dampShape_;       // per bank mode: displacement at the damper per |z|
 
     // Soundboard.
     SoundboardConfig boardCfg_{};
     BoardModel boardModel_{};
+    MicGains mics_{};  // empty with the v0 pickups
     Soundboard board_;
     bool boardOn_ = false;
     float symGain_ = 0.0f;
@@ -612,6 +654,9 @@ private:
     // Parameters.
     std::atomic<float> masterGainDb_{0.0f};
     std::atomic<float> width_{0.35f};
+    std::atomic<bool> roomOn_{false};
+    std::atomic<float> roomLevelDb_{float(Room::kDefaultLevelDb)}, roomDecay_{1.8f}, roomHf_{0.5f}, roomSize_{1.0f},
+        roomBal_{0.5f};
     std::atomic<int> schedMode_{0};
     std::atomic<int> latency_{0};
     std::atomic<bool> cullOn_{true};

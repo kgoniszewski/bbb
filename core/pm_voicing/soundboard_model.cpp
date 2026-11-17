@@ -327,6 +327,24 @@ const BoardModel& defaultBoard() {
     return board;
 }
 
+double boardModeShape(const BoardModel& b, int i, double x, double y) noexcept {
+    const bool low = b.lowRegime[i] != 0;
+    const double norm = low ? 1.0 / std::sqrt(b.mass) : 1.0 / std::sqrt(0.25 * b.mass);
+    return norm * modeShape(b.params, low, b.mIndex[i], b.nIndex[i], x, y);
+}
+
+void boardModeShapeAxes(const BoardModel& b, int i, const double* xs, int nx, double* fx, const double* ys, int ny,
+                        double* fy) noexcept {
+    const PlateParams& p = b.params;
+    const bool low = b.lowRegime[i] != 0;
+    const double norm = low ? 1.0 / std::sqrt(b.mass) : 1.0 / std::sqrt(0.25 * b.mass);
+    const int m = b.mIndex[i], n = b.nIndex[i];
+    for (int j = 0; j < nx; ++j)
+        fx[j] = norm * (low ? clampedBeam(m, xs[j] / p.lengthX) : std::sin(m * kPi * xs[j] / p.lengthX));
+    for (int j = 0; j < ny; ++j)
+        fy[j] = low ? clampedBeam(n, ys[j] / p.widthY) : std::sin(n * kPi * ys[j] / p.widthY);
+}
+
 cd boardModalAdmittance(const BoardModel& b, const double* sa, const double* sb, double f) noexcept {
     const double w = 2.0 * kPi * f;
     cd y = 0.0;

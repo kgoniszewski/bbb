@@ -606,6 +606,8 @@ TEST(scene_on_audio_path) {
     // Reference: a fresh engine, prepared the same way, fed the same events.
     pm_engine* ref = pm_engine_create();
     pm_engine_set_param(ref, PM_PARAM_SOUNDBOARD_ENABLED, 0.0);
+    // Scenes run the product configuration, room on (pm::bench::Config::room).
+    pm_engine_set_param(ref, PM_PARAM_ROOM_ENABLED, 1.0);
     CHECK(pm_engine_prepare(ref, kFs, kFrames) == 1);
     std::vector<pm::Event> events;
     pm::bench::sceneEvents(pm::bench::Scene::Typical, kFs, static_cast<std::uint64_t>(2.0 * kFs), events);

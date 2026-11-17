@@ -15,7 +15,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 14
+#define PM_API_VERSION_MINOR 15
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -79,7 +79,16 @@ enum pm_param {
                                              culling threshold, default 120 (never) */
     /* Soundboard loop quality: take effect at the next pm_engine_prepare. */
     PM_PARAM_QUALITY_TIER = 21,           /* pm_quality_tier, default PM_QUALITY_FULL */
-    PM_PARAM_LOOP_CUTOFF_HZ = 22          /* > 0 overrides the tier's loop band (Hz), default 0 */
+    PM_PARAM_LOOP_CUTOFF_HZ = 22,         /* > 0 overrides the tier's loop band (Hz), default 0 */
+    /* API 0.15: the room (reverb), added to the dry pair before master gain.
+     * Real-time; smoothed. Off by default on a bare pm_engine; pm_host_create
+     * turns it on at the default level. */
+    PM_PARAM_ROOM_ENABLED = 23,           /* 0 / 1, default 0 (pm_host: 1) */
+    PM_PARAM_ROOM_LEVEL_DB = 24,          /* wet level, 0 = physical reverberant-to-direct ratio, default -9 */
+    PM_PARAM_ROOM_DECAY = 25,             /* T60 at mid frequencies, s, 0.3 .. 6, default 1.8 */
+    PM_PARAM_ROOM_HF_RATIO = 26,          /* T60(8 kHz) / T60(mid), 0.1 .. 1, default 0.5 */
+    PM_PARAM_ROOM_SIZE = 27,              /* room scale 0.5 .. 2, default 1 (change fades out and in) */
+    PM_PARAM_ROOM_EARLY_LATE = 28         /* 0 early only, 1 late only, 0.5 both at physical level (default) */
 };
 
 /* Partials below the loop band are fed back by the string-board loop

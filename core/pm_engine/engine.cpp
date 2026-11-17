@@ -71,6 +71,12 @@ bool Engine::prepare(double sampleRate, int maxFrames) noexcept {
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept {
     if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
     boardModel_ = buildPlateBoard(boardCfg_.plate);
+    // The microphone gains (about 0.15 s) are kept while the board and
+    // radiation parameters are unchanged.
+    if (!boardCfg_.enabled || !boardCfg_.radiation.enabled) mics_ = MicGains{};
+    else if (mics_.modes != boardModel_.modes || !(mics_.plate == boardCfg_.plate) ||
+             !(mics_.params == boardCfg_.radiation))
+        mics_ = computeMicGains(boardModel_, boardCfg_.radiation);
     const double g = boardCfg_.enabled ? std::clamp(boardCfg_.sympathetic, 0.0, 1.5) : 0.0;
     const double cutoff = boardCfg_.loopCutoffHz > 0.0 ? boardCfg_.loopCutoffHz
                                                       : loopCutoffForTier(boardCfg_.tier, boardCfg_.plate);
@@ -127,7 +133,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     if (!contact_.allocate(bank_.capacity(), kNumKeys)) return false;
     if (!io_.allocate(kNumKeys) || !keyBuf_.allocate(std::size_t{kNumKeys} * kSubBlock) ||
         !mixL_.allocate(kSubBlock) || !mixR_.allocate(kSubBlock) || !hfL_.allocate(kSubBlock) ||
-        !hfR_.allocate(kSubBlock) || !dampShape_.allocate(static_cast<std::size_t>(bank_.capacity())) ||
+        !hfR_.allocate(kSubBlock) || !roomL_.allocate(kSubBlock) || !roomR_.allocate(kSubBlock) || !dampShape_.allocate(static_cast<std::size_t>(bank_.capacity())) ||
         !groupModes_.allocate(static_cast<std::size_t>(bank_.groupCount())))
         return false;
     for (int k = 0; k < kNumKeys; ++k) {
@@ -152,6 +158,15 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     cullOffsetDb_ = 0.0f;
     if (board) {
         if (!loadSoundboard(board_, boardModel_, fs_)) return false;
+        const bool mics = mics_.modes == boardModel_.modes && mics_.modes > 0;
+        if (mics) loadMicGains(board_, mics_);
+        // Transfer from a bridge shape to output channel p: the microphone's
+        // (complex per-mode gains) or the v0 pickup's.
+        auto outTransfer = [&](const double* shape, int p, double f) {
+            return mics ? micModalTransfer(boardModel_, shape, mics_.row(p), f)
+                        : boardModalAdmittance(boardModel_, shape,
+                                               boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, f);
+        };
         symGain_ = static_cast<float>(std::clamp(boardCfg_.sympathetic, 0.0, 1.5));
         for (int k = 0; k < kNumKeys; ++k) {
             keyZone_[k] = boardModel_.keyZone[k];
@@ -176,9 +191,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
         for (int k = 1; k <= kNumKeys; ++k)
             for (int p = 0; p < 2; ++p)
                 for (int m = 0; m < boardModel_.modes; ++m) {
-                    const double y = std::abs(boardModalAdmittance(
-                        boardModel_, boardModel_.shapeOfKey(k),
-                        boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, boardModel_.freq[m]));
+                    const double y = std::abs(outTransfer(boardModel_.shapeOfKey(k), p, boardModel_.freq[m]));
                     peak = std::max(peak, y * keyZone_[k - 1].forceScale * kBoardOutputGain);
                 }
         cullOffsetDb_ = peak > 1.0 ? static_cast<float>(20.0 * std::log10(peak)) : 0.0f;
@@ -190,8 +203,7 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
         for (int k = 1; k <= kNumKeys; k += 3)
             for (double f = 0.75 * fMax; f < 0.95 * fMax; f *= 1.002)
                 for (int p = 0; p < 2; ++p) {
-                    acc += std::abs(boardModalAdmittance(boardModel_, boardModel_.shapeOfKey(k),
-                                                         boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, f));
+                    acc += std::abs(outTransfer(boardModel_.shapeOfKey(k), p, f));
                     ++cnt;
                 }
         hfGain_ = static_cast<float>(cnt > 0 ? acc / cnt : 0.0);
@@ -215,6 +227,9 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     if (latency_.load(std::memory_order_relaxed) == 0)
         latency_.store(maxFrames, std::memory_order_relaxed);
     if (!velocitySet_) setVelocityFunction(velocityCurveFn, &defaultCurve_);
+
+    room_.setEnabled(roomOn_.load(std::memory_order_relaxed));
+    if (!room_.prepare(fs_, kSubBlock)) return false;
 
     Event drop;
     while (queue_.pop(drop)) {}
@@ -269,6 +284,7 @@ void Engine::resetState() noexcept {
     peakPre_ = 0.0f;
     peakHammers_ = 0;
     quietRun_ = stableTicks_ = 0;
+    room_.reset();
 }
 
 void Engine::setVelocityFunction(VelocityFn fn, const void* user) noexcept {
@@ -887,7 +903,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
     ++info_.subBlocks;
     float* mL = mixL_.data();
     float* mR = mixR_.data();
-    bool idle = false;
+    bool idle = false, settled = false;
     if (boardOn_) {
         // Idle: no string mode awake, no hammer, the board asleep and
         // nothing driving it. After two such sub-blocks every loop input
@@ -899,9 +915,9 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
         // buffering, since it is decided per sub-block.
         const bool quiet = activeCount_ == 0 && bank_.activeGroups() == 0 && board_.asleep() && nKnocks_ == 0 &&
                            noiseAmp_ == 0.0f && !bank_.coupledPending();
-        idle = quiet && quietRun_ >= 2 && idleSleep_;
+        settled = quiet && quietRun_ >= 2;
+        idle = settled && idleSleep_;
         if (idle) {
-            ++info_.idleSubBlocks;
             PM_PROF_LAP(Events);
             bank_.endCoupled(io_.data(), n);
             std::fill(mL, mL + n, 0.0f);
@@ -968,6 +984,39 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
         }
     }
 
+    // Room: fed the dry pair (after width, before master gain and the DC
+    // blocker) once per sub-block; it is split-invariant, so the engine's
+    // buffer-size invariance holds. Skipped while off and silent (the dry
+    // output is then exactly the room-less one); otherwise it runs on every
+    // sub-block, idle ones included, so its control grid stays on absolute
+    // engine time and idle sleep on/off stay bit-identical. A span that
+    // starts and ends silent wrote zeros and is not added (keeps the sign
+    // of zeros, so off is bit-identical).
+    bool roomSounding = false;
+    if (roomOn_.load(std::memory_order_relaxed) || !room_.silent()) {
+        const bool wasSilent = room_.silent();
+        float* rL = roomL_.data();
+        float* rR = roomR_.data();
+        room_.process(mL, mR, rL, rR, n);
+        roomSounding = !(wasSilent && room_.silent());
+        if (roomSounding)
+            for (int i = 0; i < n; ++i) {
+                mL[i] += rL[i];
+                mR[i] += rR[i];
+            }
+    }
+    // Idle only with the room silent as well (its tail runs on a sleeping
+    // board: the board's work is skipped all the same).
+    if (idle && !roomSounding) ++info_.idleSubBlocks;
+    // The room cuts its tail at -140 dBFS; the 5 Hz DC blocker would then
+    // take seconds to decay from there to exact zero, so with the room on
+    // its state is flushed below -300 dBFS once nothing sounds (decided
+    // whether idle sleep is on or off, so both stay bit-identical; room
+    // off leaves the dry output untouched).
+    if (settled && !roomSounding && roomOn_.load(std::memory_order_relaxed))
+        for (int c = 0; c < 2; ++c)
+            if (dcX_[c] == 0.0f && std::fabs(dcY_[c]) < 1e-15f) dcY_[c] = 0.0f;
+
     // Hammers are released only on a grid relative to their own launch, so
     // the hand-over back to the bank (which sums modes in another order)
     // happens at the same point of the note whatever the buffering.
@@ -982,7 +1031,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
     }
 
     const float gStep = 1.0f - std::exp(-1.0f / (0.01f * static_cast<float>(fs_)));
-    if (idle && dcX_[0] == 0.0f && dcX_[1] == 0.0f && dcY_[0] == 0.0f && dcY_[1] == 0.0f) {
+    if (idle && !roomSounding && dcX_[0] == 0.0f && dcX_[1] == 0.0f && dcY_[0] == 0.0f && dcY_[1] == 0.0f) {
         // Silent input and settled filters: the output is exactly zero.
         for (int i = 0; i < n; ++i) masterGain_ += (masterTarget_ - masterGain_) * gStep;
         std::fill(left, left + n, 0.0f);
@@ -1156,6 +1205,10 @@ int Engine::describe(char* buf, int size) const noexcept {
     put("half_pedal %.3f %.3f %.3f\n", static_cast<double>(hpP0T_.load(std::memory_order_relaxed)),
         static_cast<double>(hpP0B_.load(std::memory_order_relaxed)), static_cast<double>(hpW_.load(std::memory_order_relaxed)));
     put("stereo_width %.3f\n", static_cast<double>(width_.load(std::memory_order_relaxed)));
+    put("room_enabled %d\n", roomOn_.load(std::memory_order_relaxed) ? 1 : 0);
+    put("room_level_db %.2f\n", static_cast<double>(roomLevelDb_.load(std::memory_order_relaxed)));
+    put("room_decay_s %.2f\n", static_cast<double>(roomDecay_.load(std::memory_order_relaxed)));
+    put("room_size %.2f\n", static_cast<double>(roomSize_.load(std::memory_order_relaxed)));
     put("master_gain_db %.2f\n", static_cast<double>(masterGainDb_.load(std::memory_order_relaxed)));
     put("scheduling %d latency %d\n", schedMode_.load(std::memory_order_relaxed), latency_.load(std::memory_order_relaxed));
     put("phase_timing %d\n", phaseTiming() ? 1 : 0);

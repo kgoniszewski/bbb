@@ -6,6 +6,7 @@ add_library(pm_voicing STATIC
   bridge_admittance.cpp
   unison.cpp
   tuning.cpp
-  soundboard_model.cpp)
+  soundboard_model.cpp
+  radiation_model.cpp)
 target_include_directories(pm_voicing PUBLIC ${PROJECT_SOURCE_DIR}/core)
 target_link_libraries(pm_voicing PUBLIC pm_string pm_hammer pm_board)
