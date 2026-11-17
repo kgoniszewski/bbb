@@ -17,7 +17,7 @@ using namespace pm_test;
 namespace {
 
 constexpr double kFs = 48000.0;
-constexpr int kBlock = 64;
+int kBlock = 64;  // render and prepare block size of the current case
 const int kN = static_cast<int>(1.5 * kFs);
 
 std::vector<pm::Event> scene() {
@@ -63,7 +63,8 @@ bool same(const Run& a, const Run& b) {
            std::memcmp(&a.last, &b.last, sizeof(pm::RenderInfo)) == 0 && a.strikes == b.strikes;
 }
 
-void checkRoom(bool room) {
+void checkRoom(bool room, int block = 64) {
+    kBlock = block;
     auto cold = std::make_unique<pm::Engine>();
     auto warm = std::make_unique<pm::Engine>();
     cold->setWarmUpOnPrepare(false);
@@ -75,7 +76,7 @@ void checkRoom(bool room) {
     auto t1 = Clock::now();
     CHECK(warm->prepare(kFs, kBlock));
     auto t2 = Clock::now();
-    std::printf("  room %d: prepare %.1f ms without warm-up, %.1f ms with\n", int(room),
+    std::printf("  room %d, block %d: prepare %.1f ms without warm-up, %.1f ms with\n", int(room), block,
                 std::chrono::duration<double, std::milli>(t1 - t0).count(),
                 std::chrono::duration<double, std::milli>(t2 - t1).count());
     // Fresh statistics before anything is played.
@@ -100,3 +101,6 @@ void checkRoom(bool room) {
 
 TEST(warm_up_is_invisible_room_off) { checkRoom(false); }
 TEST(warm_up_is_invisible_room_on) { checkRoom(true); }
+// Block 1: the warm-up leaves the bank's cull-pass phase elsewhere than 0.
+TEST(warm_up_is_invisible_block_1) { checkRoom(false, 1); }
+TEST(warm_up_is_invisible_block_37) { checkRoom(true, 37); }

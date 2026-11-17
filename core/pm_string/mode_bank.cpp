@@ -239,6 +239,10 @@ void ModeBank::setState(int i, float re, float im) noexcept {
 void ModeBank::clearState() noexcept {
     for (int i = 0; i < capacity_; ++i) zr_[i] = zi_[i] = 0.0f;
     for (int g = 0; g < groupCount(); ++g) active_[g] = cullEnabled_ ? 0 : 1;
+    // The cull-pass phase and the input gathered towards it are state too:
+    // without this a cleared bank culls at other samples than a fresh one.
+    sinceCull_ = 0;
+    for (int s = 0; s < nSeg_; ++s) segInput_[s] = segInPrev_[s] = 0.0f;
     syncActive();
     touchAll();
     clearSpans();
