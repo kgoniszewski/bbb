@@ -1038,7 +1038,7 @@ same device and method):
 
 \* One buffer: 876 µs in the hammer phase for 80 hammer-samples (normally
 about 30 µs) with a migration between cores, i.e. the benchmark thread
-interrupted; the next largest in that scene is below the p99 + a few points.
+interrupted; p99 of that scene is 32.5 %.
 The real-audio-thread run is still to be made.
 
 The worst case is 1.34× the Mac mini M4's back-to-back time at the same 48
