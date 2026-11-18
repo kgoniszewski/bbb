@@ -634,8 +634,10 @@ been built and run on an iPad Pro 11" M2 (iPad14,3, iPadOS 27.0.1; API
 where the CPU measurements below were taken. The C++ part it relies on
 (`core/pm_host`, the C API) is tested by CTest on Linux x86_64, and the
 Swift package builds and passes its smoke test with `swift build` /
-`swift test` on Linux (Swift 6.1); the CTest suites have not yet run on
-Apple silicon (only the engine itself has run there).
+`swift test` on Linux (Swift 6.1). On Apple silicon (Mac mini M4, NEON,
+Release, 2026-11-18, API 0.18) all 37 CTest suites pass (`ctest -j 8`,
+109 s); this is the first run of the NEON kernels against their scalar
+references on real hardware.
 
 ### Structure
 
