@@ -34,6 +34,7 @@ duplex yet.
 | `core/pm_hammer/` | Hunt-Crossley felt hammer and the contact solver for one hammer on 1-3 strings, on normal modes |
 | `core/pm_board/` | Real-time soundboard modal bank (zone ports in and out, pickup read-outs, sleep) and the key/zone mixing of the coupling loop |
 | `core/pm_voicing/` | Non-real-time: 88-key table v0, complex eigen-solver, bridge admittance interface (smooth placeholder kept for unit tests), soundboard mode set v0 and its admittances (`soundboard_model.h`), unison normal modes, virtual tuner, velocity curve, key parameters to bank and contact coefficients |
+| `core/pm_api/param_table.*`, `preset.*` | M5b: the parameter descriptor table (stable ids and keys, ranges, units, defaults, class, flags; C API 0.17 `pm_param_info`) and versioned JSON presets (C API 0.18 `pm_preset_write` / `pm_preset_read`, host variants). C API 0.16 added `PM_PARAM_TREBLE_DB`. |
 | `core/pm_room/` | Room, real-time: image-source early reflections and a 16-line feedback delay network, stereo in, wet stereo out (M5a). Radiation to the two microphones is in `core/pm_voicing/radiation_model.h`. C API 0.15 adds the parameters `PM_PARAM_ROOM_ENABLED`, `_LEVEL_DB`, `_DECAY`, `_HF_RATIO`, `_SIZE`, `_EARLY_LATE`; the app host turns the room on, the bare engine has it off. `bench_engine --dry` measures without it. |
 | `core/pm_engine/` | Engine: event queue and scheduling, hammer pool, dampers and the three pedals (continuous sustain), soundboard loop, noise hooks, render loop, output stage |
 | `core/pm_host/` | App host glue, real-time and portable: MIDI 1.0 byte-stream parser (running status), UMP decoder (MIDI 1.0 and 2.0 protocol), Core MIDI `MIDIEventList` reader, MIDI to engine events, MIDI/UI/monitor queues, prepare gate, render-load meter |
@@ -311,7 +312,10 @@ low-frequency regime, A/B), `--sympathetic G`, `--knock N`,
 pickups instead of the two microphones, A/B), `--dry` (room off; it is on
 by default and adds its decay time to the default tail), `--room-level DB`
 (default -9), `--room-decay S` (default 1.8), `--room-size X` (0.5-2),
-`--room-hf R`. `--help` lists all options.
+`--room-hf R`, `--treble DB` (high shelf at 3 kHz on the microphones,
+default -3). Presets: `--preset FILE` (JSON, applied after all other
+options), `--save-preset FILE` (the effective settings, full state).
+`--help` lists all options.
 
 ## Analyse
 
@@ -577,8 +581,8 @@ yet measured there.
 
 ## Tests
 
-`ctest` runs 33 suites (M5a added `test_radiation`, `test_room` and
-`test_room_engine`). The app host ones: `test_midi_parser` (running
+`ctest` runs 37 suites (warm-up: `test_warm_up`; M5a added `test_radiation`, `test_room` and
+`test_room_engine`; M5b `test_treble`, `test_params` and `test_preset`). The app host ones: `test_midi_parser` (running
 status, real-time bytes inside messages, SysEx, malformed input, UMP in
 MIDI 1.0 and 2.0 protocol, the `MIDIEventList` layout, controller mapping,
 fuzzing), `test_load_meter` and `test_host` (MIDI host timestamps land on
@@ -630,8 +634,10 @@ been built and run on an iPad Pro 11" M2 (iPad14,3, iPadOS 27.0.1; API
 where the CPU measurements below were taken. The C++ part it relies on
 (`core/pm_host`, the C API) is tested by CTest on Linux x86_64, and the
 Swift package builds and passes its smoke test with `swift build` /
-`swift test` on Linux (Swift 6.1); the CTest suites have not yet run on
-Apple silicon (only the engine itself has run there).
+`swift test` on Linux (Swift 6.1). On Apple silicon (Mac mini M4, NEON,
+Release, 2026-11-18, API 0.18) all 37 CTest suites pass (`ctest -j 8`,
+109 s); this is the first run of the NEON kernels against their scalar
+references on real hardware.
 
 ### Structure
 
@@ -1017,6 +1023,50 @@ mean / p99 / max in % of the buffer:
 | Legato | 6.08 | 8.45 | 12.49 |
 | Typical | 4.82 | 6.73 | 14.12 |
 | Idle | 0.02 | 0.03 | 0.04 |
+
+After M5a (2026-11-17, API 0.15.0: 279 board modes, microphones, room on;
+same device and method):
+
+| Scene | Mean | p99 | Max |
+|---|---|---|---|
+| Worst (88 keys held, pedal) | 18.18 (242.3 µs) | 32.52 | 72.68 * |
+| Worst, culling off | 21.31 | 33.87 | 47.26 |
+| Cluster | 10.40 | 34.71 | 35.40 |
+| Bloom | 17.30 | 20.04 | 29.36 |
+| Pedalling | 17.55 | 22.53 | 32.18 |
+| Pedalled chords | 17.56 | 22.26 | 34.34 |
+| Fresh-key burst | 17.57 | 23.09 | 36.20 |
+| Hammer burst | 8.49 | 15.38 | 31.59 |
+| Release of a 10-note chord | 7.98 | 9.93 | 33.76 |
+| Legato | 7.60 | 9.84 | 13.92 |
+| Typical | 6.15 | 8.23 | 15.67 |
+| Idle | 0.07 | 0.07 | 0.07 |
+
+\* One buffer: 876 µs in the hammer phase for 80 hammer-samples (normally
+about 30 µs) with a migration between cores, i.e. the benchmark thread
+interrupted; p99 of that scene is 32.5 %.
+
+On the real audio thread (app engine, 2250 buffers per scene, 0 overruns in
+every scene, all buffers on performance cores), mean / p99 / max in %:
+worst 22.11 / 37.25 / 48.96 (before M5a 19.59 / 35.25 / 48.8); cluster
+13.93 / 41.50 / 46.29; pedalling 21.76 / 27.75 / 40.00; pedalled chords
+21.76 / 27.75 / 38.95; fresh-key burst 21.75 / 28.25 / 38.45; release of a
+10-note chord 11.33 / 15.75 / 42.80; hammer burst 11.85 / 19.75 / 37.92;
+bloom 21.16 / 25.50 / 34.85; typical 9.35 / 13.50 / 21.48; idle 0.33 /
+0.50 / 0.54. The "culling off" and "board off" rows there run the app's
+engine as configured, i.e. the worst scene again (same awake-mode counts).
+Live playing after M5a: 76,362 buffers (about 1.7 min), mean 17.1 %, p99
+25.2 %, max 37.0 % (a pedal motion), none over 70 %, 0 MIDI messages dropped.
+
+After the treble control and presets (API 0.18, same method) the means are
+unchanged within 0.4 points. The first run after installing a new build had
+one buffer at 90.1 % (1201 µs, no overrun): the first hammer strikes, with
+1042 µs in the hammer phase. Repeat runs, a run after 5 minutes idle and a
+relaunch did not reproduce it (47-52 %). Since then the engine warms up at
+prepare (`Engine::warmUp()`, 40 ms of strikes and pedals rendered on the
+preparing thread, then reset; bit-identical output, `test_warm_up`); the
+first run after installing it (2026-11-18): worst scene mean 21.75 %, p99
+34.75 %, max 48.28 % in an ordinary buffer, no first-strike spike.
 
 The worst case is 1.34× the Mac mini M4's back-to-back time at the same 48
 kHz / 64 frames (212.5 vs 158.1 µs). Headroom sweep on the real audio

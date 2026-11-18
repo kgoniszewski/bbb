@@ -235,7 +235,69 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     while (queue_.pop(drop)) {}
     resetState();
     prepared_ = true;
+    if (warmUpOnPrepare_) warmUp();
     return true;
+}
+
+// The first strikes after start-up ran the hammer, contact and loop code
+// for the first time on the audio thread (code pages faulted in from the
+// binary, first-touch of tables): one buffer near the deadline on the iPad.
+// Here every path used in playing runs once on the preparing thread, then
+// the state goes back to that of a fresh prepare.
+void Engine::warmUp() noexcept {
+    const int block = std::min(maxFrames_, 4096);
+    std::vector<float> l(static_cast<std::size_t>(block)), r(static_cast<std::size_t>(block));
+    const SubBlockHook hook = subBlockHook_;
+    void* const hookCtx = subBlockCtx_;
+    subBlockHook_ = nullptr;
+    warming_ = true;
+    room_.setEnabled(true);
+    const auto ms = [&](double t) { return static_cast<std::int64_t>(t * 1e-3 * fs_); };
+    const auto ev = [&](double tMs, EventType type, int key, std::uint16_t value) {
+        Event e;
+        e.type = type;
+        e.note = static_cast<std::uint8_t>(key - 1 + kFirstMidiNote);
+        e.value = value;
+        insertPending(ms(tMs), e);
+    };
+    static constexpr int kKeys[] = {1, 16, 40, 52, 64, 76, 88};
+    ev(0.0, EventType::Sustain, 1, 65535);
+    for (int i = 0; i < 7; ++i) ev(0.0 + 1.5 * i, EventType::NoteOn, kKeys[i], std::uint16_t(9000 + 8000 * i));
+    ev(4.0, EventType::UnaCorda, 1, 65535);
+    ev(5.0, EventType::NoteOn, 40, 65535);   // re-strike of a sounding string
+    ev(6.0, EventType::NoteOn, 64, 3000);    // soft
+    ev(8.0, EventType::Sostenuto, 1, 65535);
+    ev(12.0, EventType::Sustain, 1, 30000);  // half pedal
+    ev(14.0, EventType::NoteOff, 16, 0);
+    ev(16.0, EventType::NoteOn, 30, 40000);
+    ev(18.0, EventType::KeyDownSilent, 70, 0);
+    ev(20.0, EventType::Sustain, 1, 0);
+    ev(22.0, EventType::UnaCorda, 1, 0);
+    ev(24.0, EventType::Sostenuto, 1, 0);
+    ev(26.0, EventType::AllNotesOff, 1, 0);
+    const std::int64_t total = ms(40.0);
+    for (std::int64_t t = 0; t < total; t += block) render(l.data(), r.data(), block, nullptr);
+    // Silent buffers after a reset: the idle (sleeping) path.
+    resetState();
+    for (int i = 0; i < 4; ++i) render(l.data(), r.data(), block, nullptr);
+
+    room_.setEnabled(roomOn_.load(std::memory_order_relaxed));
+    warming_ = false;
+    subBlockHook_ = hook;
+    subBlockCtx_ = hookCtx;
+    resetState();
+    info_ = RenderInfo{};
+    prof_ = EngineProfile{};
+    damperUpdates_ = 0;
+    pub_.awakeGroups.store(0, std::memory_order_relaxed);
+    pub_.awakeModes.store(0, std::memory_order_relaxed);
+    pub_.activeHammers.store(0, std::memory_order_relaxed);
+    pub_.peakHammers.store(0, std::memory_order_relaxed);
+    pub_.deferred.store(0, std::memory_order_relaxed);
+    pub_.late.store(0, std::memory_order_relaxed);
+    pub_.limited.store(0, std::memory_order_relaxed);
+    pub_.nonFinite.store(0, std::memory_order_relaxed);
+    pub_.peakPre.store(0.0f, std::memory_order_relaxed);
 }
 
 void Engine::resetState() noexcept {
@@ -278,6 +340,8 @@ void Engine::resetState() noexcept {
     seq_ = 0;
     sampleTime_ = 0;
     appliedWidth_ = -1.0f;
+    latchTreble(true);
+    for (int c = 0; c < 2; ++c) shX_[c][0] = shX_[c][1] = shY_[c][0] = shY_[c][1] = 0.0f;
     masterGain_ = masterTarget_ = std::pow(10.0f, masterGainDb_.load() / 20.0f);
     dcX_[0] = dcX_[1] = dcY_[0] = dcY_[1] = 0.0f;
     deferred_ = late_ = limited_ = nonFinite_ = 0;
@@ -557,7 +621,7 @@ void Engine::releaseHammer(int a, bool report) noexcept {
     const int slot = active_[a];
     Hammer& h = hammers_[slot];
     harvestHammer(h);
-    if (report) {
+    if (report && !warming_) {
         const HammerKeyModes m = contact_.view(bank_, h.key);
         StrikeInfo info;
         info.sampleTime = h.launchTime;
@@ -774,6 +838,71 @@ bool Engine::tickIsNoOp() const noexcept {
 
 // ---------------------------------------------------------------- render
 
+// Called at every point of the 32-sample control grid (and on reset, with
+// snap): the host's value is sampled on a grid fixed to the music, so the
+// glide is the same whatever the buffering. The gain moves halfway (in dB)
+// per tick and lands exactly on the target (0 dB -> unity coefficients).
+void Engine::latchTreble(bool snap) noexcept {
+    float t = trebleDb_.load(std::memory_order_relaxed);
+    t = t == t ? std::clamp(t, -12.0f, 6.0f) : 0.0f;
+    trebleTarget_ = t;
+    if (trebleCur_ == t && !snap) return;
+    if (snap) {
+        trebleCur_ = t;
+    } else {
+        trebleCur_ += 0.5f * (t - trebleCur_);
+        if (std::fabs(t - trebleCur_) < 0.02f) trebleCur_ = t;
+    }
+    // RBJ cookbook high shelf, S = 1: alpha = sin(w0)/2 * sqrt(2).
+    const double A = std::pow(10.0, trebleCur_ / 40.0), w0 = 2.0 * kPi * kTrebleHz / fs_;
+    const double cw = std::cos(w0), sa = 2.0 * std::sqrt(A) * std::sin(w0) / 2.0 * std::sqrt(2.0);
+    const double a0 = (A + 1) - (A - 1) * cw + sa;
+    shB_[0] = static_cast<float>(A * ((A + 1) + (A - 1) * cw + sa) / a0);
+    shB_[1] = static_cast<float>(-2.0 * A * ((A - 1) + (A + 1) * cw) / a0);
+    shB_[2] = static_cast<float>(A * ((A + 1) + (A - 1) * cw - sa) / a0);
+    shA_[0] = static_cast<float>(2.0 * ((A - 1) - (A + 1) * cw) / a0);
+    shA_[1] = static_cast<float>(((A + 1) - (A - 1) * cw - sa) / a0);
+}
+
+// Treble shelf on the dry pair. At 0 dB with a zero state it is skipped (the
+// output is then bit-identical to the engine without it). State clean-up is
+// decided only at a final sub-block end (a point fixed to the music): at 0 dB
+// the unity filter's leftover transient is dropped once below 1e-12, and a
+// state decaying on silence is cleared below 1e-20 so idle output is exact zero.
+void Engine::processTreble(float* mL, float* mR, int n, bool final) noexcept {
+    bool st = false;
+    for (int c = 0; c < 2; ++c)
+        st = st || shX_[c][0] != 0.0f || shX_[c][1] != 0.0f || shY_[c][0] != 0.0f || shY_[c][1] != 0.0f;
+    if (trebleCur_ == 0.0f && !st) return;
+    float* bus[2] = {mL, mR};
+    for (int c = 0; c < 2; ++c) {
+        float x1 = shX_[c][0], x2 = shX_[c][1], y1 = shY_[c][0], y2 = shY_[c][1];
+        float* b = bus[c];
+        for (int i = 0; i < n; ++i) {
+            const float x = b[i];
+            const float y = shB_[0] * x + shB_[1] * x1 + shB_[2] * x2 - shA_[0] * y1 - shA_[1] * y2;
+            x2 = x1;
+            x1 = x;
+            y2 = y1;
+            y1 = y;
+            b[i] = y;
+        }
+        shX_[c][0] = x1;
+        shX_[c][1] = x2;
+        shY_[c][0] = y1;
+        shY_[c][1] = y2;
+    }
+    if (!final) return;
+    bool tiny = true, unityDone = trebleCur_ == 0.0f && trebleTarget_ == 0.0f;
+    for (int c = 0; c < 2; ++c)
+        for (int j = 0; j < 2; ++j) {
+            tiny = tiny && std::fabs(shX_[c][j]) < 1e-20f && std::fabs(shY_[c][j]) < 1e-20f;
+            unityDone = unityDone && std::fabs(shX_[c][j] - shY_[c][j]) < 1e-12f;
+        }
+    if (tiny || unityDone)
+        for (int c = 0; c < 2; ++c) shX_[c][0] = shX_[c][1] = shY_[c][0] = shY_[c][1] = 0.0f;
+}
+
 void Engine::readParams() noexcept {
     idleSleep_ = idleOn_.load(std::memory_order_relaxed);
     exactRespApplied_ = exactResp_.load(std::memory_order_relaxed);
@@ -984,7 +1113,9 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
         }
     }
 
-    // Room: fed the dry pair (after width, before master gain and the DC
+    processTreble(mL, mR, n, final);
+
+    // Room: fed the dry pair (after width and treble, before master gain and the DC
     // blocker) once per sub-block; it is split-invariant, so the engine's
     // buffer-size invariance holds. Skipped while off and silent (the dry
     // output is then exactly the room-less one); otherwise it runs on every
@@ -993,7 +1124,7 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
     // starts and ends silent wrote zeros and is not added (keeps the sign
     // of zeros, so off is bit-identical).
     bool roomSounding = false;
-    if (roomOn_.load(std::memory_order_relaxed) || !room_.silent()) {
+    if (roomOn_.load(std::memory_order_relaxed) || warming_ || !room_.silent()) {
         const bool wasSilent = room_.silent();
         float* rL = roomL_.data();
         float* rR = roomR_.data();
@@ -1113,6 +1244,7 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             // the host buffer or the sub-block.
             bank_.beginResponseTick(exactRespApplied_ ? -1 : kResponseBudget);
             if (!tickIsNoOp()) controlTick(now);
+            latchTreble(false);
         }
         // Sub-block end: the next point of the absolute grid, event or
         // hammer grid (fixed relative to the music), or the end of the
@@ -1205,6 +1337,7 @@ int Engine::describe(char* buf, int size) const noexcept {
     put("half_pedal %.3f %.3f %.3f\n", static_cast<double>(hpP0T_.load(std::memory_order_relaxed)),
         static_cast<double>(hpP0B_.load(std::memory_order_relaxed)), static_cast<double>(hpW_.load(std::memory_order_relaxed)));
     put("stereo_width %.3f\n", static_cast<double>(width_.load(std::memory_order_relaxed)));
+    put("treble_db %.2f\n", static_cast<double>(trebleDb_.load(std::memory_order_relaxed)));
     put("room_enabled %d\n", roomOn_.load(std::memory_order_relaxed) ? 1 : 0);
     put("room_level_db %.2f\n", static_cast<double>(roomLevelDb_.load(std::memory_order_relaxed)));
     put("room_decay_s %.2f\n", static_cast<double>(roomDecay_.load(std::memory_order_relaxed)));

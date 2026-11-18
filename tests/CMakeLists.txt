@@ -24,7 +24,9 @@ set(PM_TESTS
   test_half_pedal
   test_idle
   test_decay_trend
+  test_warm_up
   test_room_engine
+  test_treble
   test_radiation)
 
 find_package(Threads REQUIRED)
@@ -54,6 +56,16 @@ endforeach()
 add_executable(test_host test_host.cpp)
 target_link_libraries(test_host PRIVATE pm_api Threads::Threads)
 add_test(NAME test_host COMMAND test_host)
+
+# Parameter descriptor table (through the C API).
+add_executable(test_params test_params.cpp)
+target_link_libraries(test_params PRIVATE pm_api Threads::Threads)
+add_test(NAME test_params COMMAND test_params)
+
+# Presets and state: JSON writer/reader, migration, robustness (through the C API).
+add_executable(test_preset test_preset.cpp)
+target_link_libraries(test_preset PRIVATE pm_api Threads::Threads)
+add_test(NAME test_preset COMMAND test_preset)
 
 # Room (early reflections + FDN): standalone library.
 add_executable(test_room test_room.cpp)

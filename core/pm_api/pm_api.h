@@ -8,6 +8,7 @@
 #ifndef PM_API_H
 #define PM_API_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -15,7 +16,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 15
+#define PM_API_VERSION_MINOR 18
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -88,7 +89,8 @@ enum pm_param {
     PM_PARAM_ROOM_DECAY = 25,             /* T60 at mid frequencies, s, 0.3 .. 6, default 1.8 */
     PM_PARAM_ROOM_HF_RATIO = 26,          /* T60(8 kHz) / T60(mid), 0.1 .. 1, default 0.5 */
     PM_PARAM_ROOM_SIZE = 27,              /* room scale 0.5 .. 2, default 1 (change fades out and in) */
-    PM_PARAM_ROOM_EARLY_LATE = 28         /* 0 early only, 1 late only, 0.5 both at physical level (default) */
+    PM_PARAM_ROOM_EARLY_LATE = 28,        /* 0 early only, 1 late only, 0.5 both at physical level (default) */
+    PM_PARAM_TREBLE_DB = 29               /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default -3 */
 };
 
 /* Partials below the loop band are fed back by the string-board loop
@@ -131,11 +133,125 @@ int pm_engine_push_event(pm_engine* engine, const pm_event* event);
 void pm_engine_render(pm_engine* engine, float* left, float* right, int32_t frames,
                       const pm_clock* clock);
 
-/* Return 1 on success, 0 for an unknown id. */
+/* Return 1 on success, 0 for an unknown id. API 0.17: set_param also
+ * returns 0 for NaN and, for parameters with PM_PARAM_FLAG_REJECTS_OUT_OF_RANGE,
+ * for a value outside [min, max] of its descriptor; every other out-of-range
+ * value is clamped to [min, max] (get_param then returns the clamped value). */
 int pm_engine_set_param(pm_engine* engine, int32_t id, double value);
 int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value);
 
 void pm_engine_get_stats(const pm_engine* engine, pm_stats* stats);
+
+/* ------------------------------------------------------------------------
+ * Parameter descriptors (API 0.17, plan §5.3): the single source of truth for
+ * every pm_param (range, unit, defaults, curve, class); the AUParameterTree
+ * and any UI are generated from it.
+ *
+ * Stability: a parameter's numeric id and its key are stable forever. A new
+ * parameter gets a new id (and key); a removed parameter's id and key are
+ * never reused. Names, units and ranges may be refined.
+ *
+ * default_value is the product default (an engine made by pm_host_create);
+ * engine_default is what a bare pm_engine_create engine has, where it
+ * differs (e.g. room_enabled: 1 vs 0). */
+enum pm_param_curve {
+    PM_PARAM_CURVE_LINEAR = 0,
+    PM_PARAM_CURVE_LOG = 1,      /* min > 0; a control should move in log(value) */
+    PM_PARAM_CURVE_DB = 2,       /* linear in dB */
+    PM_PARAM_CURVE_BOOLEAN = 3,  /* 0 / 1; set_param treats >= 0.5 as 1 */
+    PM_PARAM_CURVE_INTEGER = 4   /* integer or enumeration (enum_names when given) */
+};
+
+enum pm_param_class {
+    PM_PARAM_CLASS_REALTIME = 0, /* (A) takes effect while running: smoothed or latched per block */
+    PM_PARAM_CLASS_PREPARE = 1   /* (B) takes effect at the next pm_engine_prepare / pm_host_prepare */
+};
+
+enum pm_param_flags {
+    PM_PARAM_FLAG_AUTOMATABLE = 1,           /* a host may automate it (class A, musical) */
+    PM_PARAM_FLAG_HIDDEN = 2,                /* expert / diagnostic: not in the default UI or AU tree */
+    PM_PARAM_FLAG_SMOOTHED = 4,              /* class A: ramped in the engine, not latched */
+    PM_PARAM_FLAG_REJECTS_OUT_OF_RANGE = 8,  /* set_param returns 0 outside [min, max] instead of clamping */
+    PM_PARAM_FLAG_NON_REALTIME_SET = 16      /* set only from a non-real-time thread */
+};
+
+typedef struct pm_param_info_t {
+    int32_t id;                    /* pm_param */
+    const char* key;               /* stable snake_case identifier */
+    const char* name;              /* display name (English) */
+    const char* unit;              /* "dB", "s", "Hz", "m/s", "frames", ... or "" */
+    double min, max;
+    double default_value;          /* product (pm_host) default */
+    double engine_default;         /* bare pm_engine default */
+    int32_t curve;                 /* pm_param_curve */
+    int32_t cls;                   /* pm_param_class */
+    int32_t flags;                 /* pm_param_flags */
+    int32_t enum_count;            /* number of enum_names (0: none) */
+    const char* const* enum_names; /* names of the values min .. min + enum_count - 1 */
+} pm_param_info_t;
+
+int32_t pm_param_count(void);
+/* index 0 .. pm_param_count() - 1 (not necessarily equal to the id).
+ * Returns 1 and fills *out, or 0 for a bad index or null out. Strings are
+ * static. */
+int pm_param_info(int32_t index, pm_param_info_t* out);
+/* The id of a key, or -1 if unknown (or null). */
+int32_t pm_param_id_from_key(const char* key);
+
+/* ------------------------------------------------------------------------
+ * Presets and state (API 0.18, plan §5.3): a versioned JSON document holding
+ * parameters by their stable key, in table order:
+ *   {"format":"pm-preset","version":1,"name":"...","api":"0.18.0",
+ *    "params":{"master_gain_db":0,"stereo_width":0.34999999403953552,...}}
+ * Numbers are the shortest form that round-trips the double exactly;
+ * integer and boolean parameters are written as integers. Writing again
+ * after reading gives byte-identical JSON. Non-real-time; allocates.
+ *
+ * Reading is strict on syntax (error message and byte offset; nothing is
+ * applied) and tolerant on content: unknown keys and wrong types are
+ * skipped and counted, out-of-range values are clamped to [min, max] of the
+ * descriptor and counted, true/false are taken as 1/0. Parameters missing
+ * from the document keep their current value, unless
+ * PM_PRESET_READ_MISSING_TO_DEFAULT (then non-hidden ones get default_value).
+ * Older versions are migrated (v0: "params":[{"id":n,"value":x},...]);
+ * newer versions than PM_PRESET_VERSION are refused.
+ *
+ * Deferred: per-key voicing tables, soundboard mode-set references (by hash),
+ * controller profiles (separate files). */
+#define PM_PRESET_VERSION 1
+
+enum pm_preset_write_flags {
+    PM_PRESET_WRITE_FULL_STATE = 1  /* include HIDDEN parameters (AU fullState, diagnostics) */
+};
+
+enum pm_preset_read_flags {
+    PM_PRESET_READ_MISSING_TO_DEFAULT = 1, /* missing non-hidden parameters get default_value */
+    PM_PRESET_READ_REPREPARE = 2           /* if a PREPARE-class value changed and the engine (host) is
+                                              prepared, re-prepare at its current rate and buffer size */
+};
+
+typedef struct pm_preset_result_t {
+    int32_t ok;              /* 1: parsed and applied; 0: nothing applied (see error) */
+    int32_t version;         /* version of the document as read (before migration) */
+    int32_t applied;         /* parameters set */
+    int32_t clamped;         /* of those, values clamped into range */
+    int32_t unknown;         /* unknown keys (parameters and top-level fields) */
+    int32_t wrong_type;      /* parameter values that are not numbers or booleans */
+    int32_t missing;         /* non-hidden parameters absent from the document */
+    int32_t needs_prepare;   /* a PREPARE-class value changed: call pm_engine_prepare / pm_host_prepare */
+    int32_t reprepared;      /* PM_PRESET_READ_REPREPARE did so (needs_prepare is then 0) */
+    int64_t error_offset;    /* byte offset of a syntax error, else -1 */
+    char error[128];         /* empty when ok */
+    char warnings[256];      /* first warnings, "; "-separated, truncated */
+    char name[64];           /* the preset's name (UTF-8, truncated at a character boundary) */
+} pm_preset_result_t;
+
+/* Writes the JSON (NUL-terminated if cap > 0, truncated to cap - 1 bytes) and
+ * returns its full length without the NUL, like snprintf; 0 on bad
+ * arguments. name may be NULL (""). */
+size_t pm_preset_write(const pm_engine* engine, const char* name, int32_t flags, char* buf, size_t cap);
+/* Returns result.ok. json need not be NUL-terminated. out may be NULL. */
+int pm_preset_read(pm_engine* engine, const char* json, size_t len, int32_t flags, pm_preset_result_t* out);
 
 /* ------------------------------------------------------------------------
  * App host (API 0.6). A pm_host owns an engine and connects it to the
@@ -227,6 +343,10 @@ double pm_host_ticks_per_sample(double sample_rate, uint32_t numer, uint32_t den
  * (tuning, soundboard, quality tier). Queued events are discarded. */
 int pm_host_prepare(pm_host* host, double sample_rate, int32_t max_frames);
 int pm_host_is_prepared(const pm_host* host);
+/* Presets on the host's engine (API 0.18). PM_PRESET_READ_REPREPARE calls
+ * pm_host_prepare at the host's current rate and maximum buffer size. */
+size_t pm_host_preset_write(pm_host* host, const char* name, int32_t flags, char* buf, size_t cap);
+int pm_host_preset_read(pm_host* host, const char* json, size_t len, int32_t flags, pm_preset_result_t* out);
 double pm_host_sample_rate(const pm_host* host);
 
 /* Audio thread. Forwards queued events, renders, and records the render

@@ -2,6 +2,7 @@
 
 #include <new>
 
+#include "pm_api/param_table.h"
 #include "pm_api/pm_api_internal.h"
 #include "pm_engine/engine.h"
 
@@ -77,6 +78,9 @@ void pm_engine_render(pm_engine* engine, float* left, float* right, int32_t fram
 
 int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
     if (!engine) return 0;
+    const pm_param_info_t* d = pm::paramDescriptor(id);
+    if (!d || !pm::paramAccept(*d, &value)) return 0;
+    // Range checks and clamping come from the descriptor table.
     pm::Engine& e = engine->engine;
     switch (id) {
         case PM_PARAM_MASTER_GAIN_DB: e.setMasterGainDb(static_cast<float>(value)); return 1;
@@ -87,6 +91,7 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
         case PM_PARAM_ROOM_HF_RATIO: e.setRoomHfRatio(static_cast<float>(value)); return 1;
         case PM_PARAM_ROOM_SIZE: e.setRoomSize(static_cast<float>(value)); return 1;
         case PM_PARAM_ROOM_EARLY_LATE: e.setRoomEarlyLate(static_cast<float>(value)); return 1;
+        case PM_PARAM_TREBLE_DB: e.setTrebleDb(static_cast<float>(value)); return 1;
         case PM_PARAM_SCHEDULING_MODE:
             e.setSchedulingMode(value >= 0.5 ? pm::SchedulingMode::ConstantLatency
                                              : pm::SchedulingMode::LowestLatency);
@@ -109,21 +114,17 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
             e.setVelocityFunction(pm::velocityCurveFn, &engine->curve);
             return 1;
         }
-        case PM_PARAM_A4_HZ:
-            if (!(value >= 300.0 && value <= 600.0)) return 0;
-            engine->voicing.a4Hz = value;
-            return 1;
-        case PM_PARAM_TUNING_STRETCH: engine->voicing.stretch = value < 0.0 ? 0.0 : (value > 1.5 ? 1.5 : value); return 1;
+        case PM_PARAM_A4_HZ: engine->voicing.a4Hz = value; return 1;
+        case PM_PARAM_TUNING_STRETCH: engine->voicing.stretch = value; return 1;
         case PM_PARAM_EQUAL_TEMPERAMENT: engine->voicing.equalTemperament = value >= 0.5; return 1;
-        case PM_PARAM_UNISON_WIDTH: engine->voicing.unisonWidth = value < 0.0 ? 0.0 : (value > 5.0 ? 5.0 : value); return 1;
+        case PM_PARAM_UNISON_WIDTH: engine->voicing.unisonWidth = value; return 1;
         case PM_PARAM_SOUNDBOARD_ENABLED: engine->board.enabled = value >= 0.5; return 1;
-        case PM_PARAM_SYMPATHETIC: engine->board.sympathetic = value < 0.0 ? 0.0 : (value > 1.5 ? 1.5 : value); return 1;
+        case PM_PARAM_SYMPATHETIC: engine->board.sympathetic = value; return 1;
         case PM_PARAM_KNOCK_LEVEL: e.setNoiseLevels(static_cast<float>(value), e.damperNoiseLevel()); return 1;
         case PM_PARAM_DAMPER_NOISE_LEVEL: e.setNoiseLevels(e.knockLevel(), static_cast<float>(value)); return 1;
         case PM_PARAM_HALF_PEDAL_P0_TREBLE:
         case PM_PARAM_HALF_PEDAL_P0_BASS:
         case PM_PARAM_HALF_PEDAL_WIDTH: {
-            if (!(value >= 0.0 && value <= 1.0)) return 0;
             pm::HalfPedalCurve c = e.halfPedalCurve();
             if (id == PM_PARAM_HALF_PEDAL_P0_TREBLE) c.p0Treble = static_cast<float>(value);
             else if (id == PM_PARAM_HALF_PEDAL_P0_BASS) c.p0Bass = static_cast<float>(value);
@@ -134,11 +135,10 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
         case PM_PARAM_DAMPED_CULL_OFFSET_DB: e.setDampedCullOffsetDb(static_cast<float>(value)); return 1;
         case PM_PARAM_QUALITY_TIER: {
             const int t = static_cast<int>(value);
-            if (!(value >= 0.0) || t > PM_QUALITY_ECO) return 0;
             engine->board.tier = static_cast<pm::QualityTier>(t);
             return 1;
         }
-        case PM_PARAM_LOOP_CUTOFF_HZ: engine->board.loopCutoffHz = value > 0.0 ? value : 0.0; return 1;
+        case PM_PARAM_LOOP_CUTOFF_HZ: engine->board.loopCutoffHz = value; return 1;
         default: return 0;
     }
 }
@@ -155,6 +155,7 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_ROOM_HF_RATIO: *value = e.roomHfRatio(); return 1;
         case PM_PARAM_ROOM_SIZE: *value = e.roomSize(); return 1;
         case PM_PARAM_ROOM_EARLY_LATE: *value = e.roomEarlyLate(); return 1;
+        case PM_PARAM_TREBLE_DB: *value = e.trebleDb(); return 1;
         case PM_PARAM_SCHEDULING_MODE: *value = static_cast<double>(e.schedulingMode()); return 1;
         case PM_PARAM_CONSTANT_LATENCY_FRAMES: *value = e.constantLatencyFrames(); return 1;
         case PM_PARAM_CULL_THRESHOLD_DB: *value = e.cullThresholdDb(); return 1;

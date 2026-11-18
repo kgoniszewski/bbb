@@ -1,4 +1,4 @@
-add_library(pm_api STATIC pm_api.cpp pm_host_api.cpp pm_bench_api.cpp)
+add_library(pm_api STATIC pm_api.cpp param_table.cpp preset.cpp pm_host_api.cpp pm_bench_api.cpp)
 target_include_directories(pm_api PUBLIC ${PROJECT_SOURCE_DIR}/core)
 target_link_libraries(pm_api PUBLIC pm_engine pm_host pm_bench)
 if(NOT MSVC)

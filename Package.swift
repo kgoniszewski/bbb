@@ -38,6 +38,8 @@ let package = Package(
                 "pm_api/pm_api.cpp",
                 "pm_api/pm_host_api.cpp",
                 "pm_api/pm_bench_api.cpp",
+                "pm_api/param_table.cpp",
+                "pm_api/preset.cpp",
             ],
             publicHeadersPath: "pm_api/include",
             cxxSettings: [
