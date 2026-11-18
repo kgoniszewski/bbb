@@ -1063,7 +1063,8 @@ one buffer at 90.1 % (1201 µs, no overrun): the first hammer strikes, with
 relaunch did not reproduce it (47-52 %). Since then the engine warms up at
 prepare (`Engine::warmUp()`, 40 ms of strikes and pedals rendered on the
 preparing thread, then reset; bit-identical output, `test_warm_up`); the
-first run after the next install should show whether that removes it.
+first run after installing it (2026-11-18): worst scene mean 21.75 %, p99
+34.75 %, max 48.28 % in an ordinary buffer, no first-strike spike.
 
 The worst case is 1.34× the Mac mini M4's back-to-back time at the same 48
 kHz / 64 frames (212.5 vs 158.1 µs). Headroom sweep on the real audio
