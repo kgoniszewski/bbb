@@ -17,6 +17,7 @@ struct PianoApp: App {
                 // Meter and monitor polling only while the app is active.
                 .onChange(of: scenePhase) { _, phase in
                     model.setAppActive(phase == .active)
+                    if phase == .background { model.presets.saveStateNow() }
                 }
         }
     }
@@ -31,6 +32,10 @@ struct ContentView: View {
             PlayView(model: model)
                 .tabItem {
                     Label("Play", systemImage: "pianokeys")
+                }
+            SoundView(model: model)
+                .tabItem {
+                    Label("Sound", systemImage: "slider.horizontal.3")
                 }
             MonitorView(model: model, store: model.monitorStore)
                 .tabItem {

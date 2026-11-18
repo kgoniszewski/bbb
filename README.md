@@ -727,6 +727,40 @@ Build Settings set Swift Language Version to 5 and the iOS deployment
 target to 17.0; in Signing & Capabilities add Background Modes > Audio;
 edit the scheme's Run configuration to Release.
 
+### Sound tab, presets and AUv3 (M5c, not yet compiled)
+
+Written 2026-11-18 in a container without Xcode; the first build on the
+Mac may need small compile fixes. Run `xcodegen` again first (new Swift
+files and two new targets).
+
+- **Sound tab** (`SoundView.swift`, `ParamModel.swift`,
+  `PresetStore.swift`): preset menu (factory presets from
+  `PianoApp/Presets/*.json`, user presets in Application
+  Support/Presets), Save As, Delete, Reset to defaults, Panic, and a
+  control for every non-hidden engine parameter, generated from
+  `pm_param_info`. Quality-tier, tuning and other prepare-time changes
+  re-prepare the engine (about a second of silence). The full state is
+  saved to Application Support/state.json and restored at the next launch.
+- **AUv3** (`apple/PianoAU/`, `apple/AUv3Extension/`; targets
+  `PianoAUv3` and `PianoAUv3Mac`, embedded in the apps): instrument
+  `aumu Pmd1 Pmdl`, "Piano Model: Concert Grand". The app itself still
+  renders through its own audio node, not the AU.
+
+What to test:
+
+1. Build and run `PianoAppMac` once (this registers the extension), then:
+
+```bash
+auval -v aumu Pmd1 Pmdl
+```
+
+2. Load the instrument in a host (Logic Pro or GarageBand on the Mac,
+   AUM or GarageBand on the iPad), play from MIDI, move the room and
+   treble parameters, save and reopen the project (fullState).
+3. In the app: pick each factory preset, save a user preset, change the
+   quality tier, quit and relaunch (the settings come back without a
+   second prepare).
+
 ### What to test (M2 acceptance, plan §7)
 
 Status (2026-11-13): the app runs on the iPad Pro M2 at the requested 48

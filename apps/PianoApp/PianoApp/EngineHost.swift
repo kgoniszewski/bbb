@@ -87,6 +87,60 @@ final class EngineHost {
         _ = pm_engine_set_param(engine, Int32(id.rawValue), value)
     }
 
+    // MARK: - Presets and state
+
+    /// The current parameters as preset JSON (fullState: hidden ones too).
+    /// Main thread; reads parameters like param(), so a value queued by
+    /// setPrepareTimeParam may not be in it yet.
+    func presetJSON(name: String, fullState: Bool) -> String {
+        let flags = Int32(fullState ? PM_PRESET_WRITE_FULL_STATE.rawValue : 0)
+        return name.withCString { cName -> String in
+            let n = pm_host_preset_write(raw, cName, flags, nil, 0)
+            guard n > 0 else { return "" }
+            var buf = [CChar](repeating: 0, count: n + 1)
+            let written = buf.withUnsafeMutableBufferPointer { p in
+                pm_host_preset_write(raw, cName, flags, p.baseAddress, p.count)
+            }
+            guard written == n else { return "" }
+            return String(decoding: buf.prefix(n).map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        }
+    }
+
+    /// Applies preset JSON on the prepare queue (it may set prepare-time
+    /// parameters and re-prepare at the current rate), then calls completion
+    /// on the main thread.
+    func applyPreset(_ json: String, missingToDefault: Bool, completion: @escaping (pm_preset_result_t) -> Void) {
+        let hostBits = Int(bitPattern: raw)
+        var flags = Int32(PM_PRESET_READ_REPREPARE.rawValue)
+        if missingToDefault { flags |= Int32(PM_PRESET_READ_MISSING_TO_DEFAULT.rawValue) }
+        let readFlags = flags
+        prepareQueue.async { [self] in
+            let result = withExtendedLifetime(self) {
+                EngineHost.readPreset(hostBits: hostBits, json: json, flags: readFlags)
+            }
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    /// Applies preset JSON synchronously on the calling thread. Only before
+    /// the first prepare (nothing else touches the engine yet), so restored
+    /// prepare-time values are used by that prepare.
+    func applyPresetBeforePrepare(_ json: String, missingToDefault: Bool) -> pm_preset_result_t {
+        let flags = Int32(missingToDefault ? PM_PRESET_READ_MISSING_TO_DEFAULT.rawValue : 0)
+        return EngineHost.readPreset(hostBits: Int(bitPattern: raw), json: json, flags: flags)
+    }
+
+    private static func readPreset(hostBits: Int, json: String, flags: Int32) -> pm_preset_result_t {
+        var result = pm_preset_result_t()
+        let length = json.utf8.count
+        json.withCString { c in
+            _ = pm_host_preset_read(OpaquePointer(bitPattern: hostBits), c, length, flags, &result)
+        }
+        return result
+    }
+
     var isPrepared: Bool { pm_host_is_prepared(raw) == 1 }
     var preparedSampleRate: Double { pm_host_sample_rate(raw) }
 
