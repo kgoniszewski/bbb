@@ -1,5 +1,7 @@
 #include "pm_api/pm_api.h"
 
+#include <algorithm>
+#include <cmath>
 #include <new>
 
 #include "pm_api/param_table.h"
@@ -8,7 +10,9 @@
 
 struct pm_engine {
     pm::Engine engine;
-    pm::VelocityCurve curve;
+    pm::VelocityCurve curve;      // as set through PM_PARAM_VELOCITY_*
+    pm::VelocityCurve effective;  // curve with the touch applied (the engine reads this)
+    int touch = 1;                // PM_PARAM_TOUCH
     pm::TableOptions voicing;
     pm::SoundboardConfig board;
 };
@@ -16,6 +20,17 @@ struct pm_engine {
 pm::Engine* pmEngineOf(pm_engine* engine) noexcept { return engine ? &engine->engine : nullptr; }
 
 namespace {
+// Touch scales the exponent of x^exponent: below 1 a given key velocity gives
+// a faster hammer (light), above 1 a slower one (strong); x = 0 and 1 keep vMin
+// and vMax. Medium multiplies by exactly 1, so it is bit-identical.
+constexpr double kTouchExponentScale[3] = {2.0 / 3.0, 1.0, 1.5};
+
+void applyVelocityCurve(pm_engine* e) noexcept {
+    e->effective = e->curve;
+    e->effective.exponent = e->curve.exponent * kTouchExponentScale[e->touch];
+    e->engine.setVelocityFunction(pm::velocityCurveFn, &e->effective);
+}
+
 static_assert(sizeof(pm_event) == sizeof(pm::Event), "pm_event must mirror pm::Event");
 static_assert(sizeof(pm_clock) == sizeof(pm::ClockMapping), "pm_clock must mirror ClockMapping");
 }  // namespace
@@ -37,7 +52,7 @@ const char* pm_version_string(void) {
 
 pm_engine* pm_engine_create(void) {
     pm_engine* e = new (std::nothrow) pm_engine();
-    if (e) e->engine.setVelocityFunction(pm::velocityCurveFn, &e->curve);
+    if (e) applyVelocityCurve(e);
     return e;
 }
 
@@ -111,9 +126,13 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
             if (id == PM_PARAM_VELOCITY_MIN) engine->curve.vMin = value;
             else if (id == PM_PARAM_VELOCITY_MAX) engine->curve.vMax = value;
             else engine->curve.exponent = value;
-            e.setVelocityFunction(pm::velocityCurveFn, &engine->curve);
+            applyVelocityCurve(engine);
             return 1;
         }
+        case PM_PARAM_TOUCH:
+            engine->touch = std::clamp(static_cast<int>(std::lround(value)), 0, 2);
+            applyVelocityCurve(engine);
+            return 1;
         case PM_PARAM_A4_HZ: engine->voicing.a4Hz = value; return 1;
         case PM_PARAM_TUNING_STRETCH: engine->voicing.stretch = value; return 1;
         case PM_PARAM_EQUAL_TEMPERAMENT: engine->voicing.equalTemperament = value >= 0.5; return 1;
@@ -171,6 +190,7 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_VELOCITY_MIN: *value = engine->curve.vMin; return 1;
         case PM_PARAM_VELOCITY_MAX: *value = engine->curve.vMax; return 1;
         case PM_PARAM_VELOCITY_EXPONENT: *value = engine->curve.exponent; return 1;
+        case PM_PARAM_TOUCH: *value = engine->touch; return 1;
         case PM_PARAM_A4_HZ: *value = engine->voicing.a4Hz; return 1;
         case PM_PARAM_TUNING_STRETCH: *value = engine->voicing.stretch; return 1;
         case PM_PARAM_EQUAL_TEMPERAMENT: *value = engine->voicing.equalTemperament ? 1.0 : 0.0; return 1;

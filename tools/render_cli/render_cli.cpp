@@ -150,7 +150,7 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
         } else {
             if (r.warnings[0]) std::fprintf(stderr, "%s: %s\n", presetPath.c_str(), r.warnings);
             // Parameters render_cli does not model (it drives pm::Engine with raw hammer speeds).
-            const int32_t ignored[] = {PM_PARAM_VELOCITY_MIN, PM_PARAM_VELOCITY_MAX, PM_PARAM_VELOCITY_EXPONENT,
+            const int32_t ignored[] = {PM_PARAM_VELOCITY_MIN, PM_PARAM_VELOCITY_MAX, PM_PARAM_VELOCITY_EXPONENT, PM_PARAM_TOUCH,
                                        PM_PARAM_HALF_PEDAL_P0_TREBLE, PM_PARAM_HALF_PEDAL_P0_BASS,
                                        PM_PARAM_HALF_PEDAL_WIDTH, PM_PARAM_ROOM_EARLY_LATE,
                                        PM_PARAM_SCHEDULING_MODE, PM_PARAM_CONSTANT_LATENCY_FRAMES,

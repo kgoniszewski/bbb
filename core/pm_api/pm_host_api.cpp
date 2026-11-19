@@ -333,9 +333,15 @@ pm_host* pm_host_create(void) {
         delete h;
         return nullptr;
     }
-    // The product configuration: the room on at its default level (the bare
-    // engine keeps it off for the physics tests).
+    // The product configuration: the room on at its default level and the
+    // master volume at its product default (the bare engine keeps the room off
+    // and 0 dB for the physics tests). +14 dB puts a 6-note ff chord near
+    // -4 dBFS and every single ff key at or below -5 dBFS, under the soft
+    // clipper's knee (0.89, -1 dBFS).
     pm_engine_set_param(h->engine, PM_PARAM_ROOM_ENABLED, 1.0);
+    pm_param_info_t gain{};
+    pm_param_info(PM_PARAM_MASTER_GAIN_DB, &gain);
+    pm_engine_set_param(h->engine, PM_PARAM_MASTER_GAIN_DB, gain.default_value);
     return h;
 }
 

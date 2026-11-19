@@ -38,7 +38,7 @@ struct ParamDescriptor: Identifiable {
         var names: [String] = []
         if let list = info.enum_names, info.enum_count > 0 {
             for i in 0..<Int(info.enum_count) {
-                names.append(list[i].map { String(cString: $0) } ?? "")
+                names.append(list[i].map { String(cString: $0).capitalized } ?? "")
             }
         }
         enumNames = names

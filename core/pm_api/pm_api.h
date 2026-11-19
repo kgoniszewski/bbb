@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 19
+#define PM_API_VERSION_MINOR 20
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -53,7 +53,7 @@ typedef struct pm_clock {
 } pm_clock;
 
 enum pm_param {
-    PM_PARAM_MASTER_GAIN_DB = 0,          /* -96 .. 24, default 0 */
+    PM_PARAM_MASTER_GAIN_DB = 0,          /* -96 .. 24, default 0 (pm_host: +14) */
     PM_PARAM_STEREO_WIDTH = 1,            /* 0 .. 1, default 0.7 */
     PM_PARAM_SCHEDULING_MODE = 2,         /* 0 lowest latency (default), 1 constant latency */
     PM_PARAM_CONSTANT_LATENCY_FRAMES = 3, /* default: max_frames from prepare */
@@ -100,7 +100,12 @@ enum pm_param {
     PM_PARAM_VOICING_STRING_LOSS = 34,    /* x frequency-independent string loss b1, 0.25 .. 4, default 1 */
     PM_PARAM_VOICING_HF_LOSS = 35,        /* x frequency-dependent string loss b3, 0.25 .. 4, default 1 */
     PM_PARAM_VOICING_INHARMONICITY = 36,  /* x B with the sounding f1 kept, 0 .. 2, default 1 */
-    PM_PARAM_VOICING_BOARD_DAMPING = 37   /* x soundboard loss factors etaLow, etaHigh, etaBass, 0.25 .. 4, default 1 */
+    PM_PARAM_VOICING_BOARD_DAMPING = 37,  /* x soundboard loss factors etaLow, etaHigh, etaBass, 0.25 .. 4, default 1 */
+    /* API 0.20: touch (dynamics curve), set like PM_PARAM_VELOCITY_*. Scales
+     * the velocity exponent: 0 Light x2/3, 1 Medium x1 (default), 2 Strong
+     * x1.5; the hammer speeds at velocity 0+ and 127 are unchanged. The
+     * PM_PARAM_VELOCITY_* parameters are hidden from 0.20 on. */
+    PM_PARAM_TOUCH = 38                   /* 0 Light, 1 Medium (default), 2 Strong */
 };
 
 /* Partials below the loop band are fed back by the string-board loop
