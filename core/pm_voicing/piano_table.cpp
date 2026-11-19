@@ -126,12 +126,12 @@ void buildPianoTable(PianoTable& table, const TableOptions& opt) noexcept {
         k.f1 = f1[i];
         k.length = interpAnchorsLog(kLength, key);
         k.tension = interpAnchorsLog(kTension, key);
-        k.B = B[i];
+        k.B = B[i] * opt.inharmonicityScale;  // f1 was tuned on the unscaled B and is kept
         k.f0 = k.f1 / std::sqrt(1.0 + k.B);
         const double c2L = 2.0 * k.length * k.f0;  // wave speed
         k.linearDensity = k.tension / (c2L * c2L);
-        k.b1 = interpAnchorsLog(kB1, key);
-        k.b3 = interpAnchorsLog(kB3, key);
+        k.b1 = interpAnchorsLog(kB1, key) * opt.stringLossScale;
+        k.b3 = interpAnchorsLog(kB3, key) * opt.hfLossScale;
 
         k.strings = defaultStringCount(k.key);
         if (k.strings > 1) {
@@ -160,8 +160,17 @@ void buildPianoTable(PianoTable& table, const TableOptions& opt) noexcept {
         k.hammerMass = 1e-3 * interpAnchorsLog(kMassG, key);
         k.feltK = interpAnchorsLog(kK, key);
         k.feltP = interpLin(kP, key);
+        {
+            // Felt scales about the key's own working point, computed from the
+            // unscaled hammer: K' x_ref^p' = hardness K x_ref^p.
+            const double xRef = voicingRefCompression(k.hammerMass, k.strings, k.feltK, k.feltP);
+            const double p = std::max(1.5, k.feltP + opt.feltExponentOffset);
+            k.feltK = opt.feltHardness * k.feltK * std::pow(xRef, k.feltP - p);
+            k.feltP = p;
+            k.hammerMass *= opt.hammerMassScale;
+        }
         k.feltMu = 0.04;
-        k.strikePos = interpLin(kStrike, key);
+        k.strikePos = std::clamp(interpLin(kStrike, key) * opt.strikePosScale, 0.02, 0.30);
         // Contact oversampling: keeps the substep short against the contact
         // time and the highest partials. With R = 1 throughout, partial
         // levels miss the 1 dB target from about C4 up (up to 3 dB around C7);
@@ -185,6 +194,12 @@ void buildPianoTable(PianoTable& table, const TableOptions& opt) noexcept {
         k.outputGain = 0.004;
         k.pan = (key - 44.5) / 43.5;
     }
+}
+
+double voicingRefCompression(double mass, int strings, double K, double p) noexcept {
+    // Energy balance of a rigid-string strike: M v^2 / 2 = S K x^(p+1) / (p+1).
+    const double e = 0.5 * mass * kVoicingRefSpeed * kVoicingRefSpeed;
+    return std::pow(e * (p + 1.0) / (std::max(1, strings) * K), 1.0 / (p + 1.0));
 }
 
 double velocityCurveFn(double x, const void* user) noexcept {

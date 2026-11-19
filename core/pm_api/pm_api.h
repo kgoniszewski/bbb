@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 18
+#define PM_API_VERSION_MINOR 19
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -90,7 +90,16 @@ enum pm_param {
     PM_PARAM_ROOM_HF_RATIO = 26,          /* T60(8 kHz) / T60(mid), 0.1 .. 1, default 0.5 */
     PM_PARAM_ROOM_SIZE = 27,              /* room scale 0.5 .. 2, default 1 (change fades out and in) */
     PM_PARAM_ROOM_EARLY_LATE = 28,        /* 0 early only, 1 late only, 0.5 both at physical level (default) */
-    PM_PARAM_TREBLE_DB = 29               /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default -3 */
+    PM_PARAM_TREBLE_DB = 29,              /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default -3 */
+    /* API 0.19: global voicing scales on the per-key table (hidden, for
+     * listening tests). Take effect at the next pm_engine_prepare. */
+    PM_PARAM_VOICING_FELT_HARDNESS = 30,  /* x felt force at the key's reference compression, 0.25 .. 4, default 1 */
+    PM_PARAM_VOICING_FELT_EXPONENT = 31,  /* + felt exponent p (force at the reference kept), -1 .. 1, default 0 */
+    PM_PARAM_VOICING_HAMMER_MASS = 32,    /* x hammer mass, 0.5 .. 2, default 1 */
+    PM_PARAM_VOICING_STRIKE_POSITION = 33,/* x strike position (clamped to 0.02 .. 0.30 of L), 0.5 .. 2, default 1 */
+    PM_PARAM_VOICING_STRING_LOSS = 34,    /* x frequency-independent string loss b1, 0.25 .. 4, default 1 */
+    PM_PARAM_VOICING_HF_LOSS = 35,        /* x frequency-dependent string loss b3, 0.25 .. 4, default 1 */
+    PM_PARAM_VOICING_INHARMONICITY = 36   /* x B with the sounding f1 kept, 0 .. 2, default 1 */
 };
 
 /* Partials below the loop band are fed back by the string-board loop

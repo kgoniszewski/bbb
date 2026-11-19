@@ -81,7 +81,7 @@ int main(void) {
     EXPECT(PM_API_VERSION_MINOR >= 17);
     {
         pm_param_info_t pi;
-        EXPECT(pm_param_count() == PM_PARAM_TREBLE_DB + 1);
+        EXPECT(pm_param_count() == PM_PARAM_VOICING_INHARMONICITY + 1);
         EXPECT(pm_param_info(PM_PARAM_ROOM_ENABLED, &pi) == 1 && pi.id == PM_PARAM_ROOM_ENABLED);
         EXPECT(pi.default_value == 1.0 && pi.engine_default == 0.0 && pi.cls == PM_PARAM_CLASS_REALTIME);
         EXPECT(pm_param_id_from_key(pi.key) == PM_PARAM_ROOM_ENABLED);

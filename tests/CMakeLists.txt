@@ -67,6 +67,11 @@ add_executable(test_preset test_preset.cpp)
 target_link_libraries(test_preset PRIVATE pm_api Threads::Threads)
 add_test(NAME test_preset COMMAND test_preset)
 
+# Global voicing scales on the per-key table (params 30-36).
+add_executable(test_voicing_scales test_voicing_scales.cpp)
+target_link_libraries(test_voicing_scales PRIVATE pm_api Threads::Threads)
+add_test(NAME test_voicing_scales COMMAND test_voicing_scales)
+
 # Factory presets shipped with the app load without unknown, mistyped or clamped values.
 add_executable(test_factory_presets test_factory_presets.cpp)
 target_link_libraries(test_factory_presets PRIVATE pm_api Threads::Threads)

@@ -60,6 +60,13 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_ROOM_SIZE, "room_size", "Room Size", "", 0.5, 2.0, 1.0, 1.0, LOG, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_EARLY_LATE, "room_early_late", "Early / Late Balance", "", 0.0, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 6.0, -3.0, -3.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_VOICING_FELT_HARDNESS, "voicing_felt_hardness", "Felt Hardness", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_FELT_EXPONENT, "voicing_felt_exponent", "Felt Stiffening Offset", "", -1.0, 1.0, 0.0, 0.0, LIN, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_HAMMER_MASS, "voicing_hammer_mass", "Hammer Mass", "", 0.5, 2.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_STRIKE_POSITION, "voicing_strike_position", "Strike Position", "", 0.5, 2.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_STRING_LOSS, "voicing_string_loss", "String Loss", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_HF_LOSS, "voicing_hf_loss", "String HF Loss", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_INHARMONICITY, "voicing_inharmonicity", "Inharmonicity", "", 0.0, 2.0, 1.0, 1.0, LIN, B, HID | NRT, 0, nullptr},
 };
 
 constexpr int kCount = static_cast<int>(sizeof(kParams) / sizeof(kParams[0]));
@@ -71,7 +78,7 @@ constexpr bool idsDense() {
     return true;
 }
 static_assert(idsDense(), "kParams must list ids 0..N-1 in order");
-static_assert(kCount == PM_PARAM_TREBLE_DB + 1, "every pm_param needs a descriptor");
+static_assert(kCount == PM_PARAM_VOICING_INHARMONICITY + 1, "every pm_param needs a descriptor");
 
 }  // namespace
 

@@ -86,11 +86,27 @@ struct TableOptions {
     bool equalTemperament = false;    // plain 12-TET on the first partial
     double unisonWidth = 1.0;         // scales every string's detuning
     double unisonSpreadCents = 0.5;   // per-string offsets about +-this at width 1
+    // Global voicing scales on the per-key values (1 / 0 leave them as they are).
+    // Felt: hardness scales the force at a reference compression (the peak
+    // of a 2 m/s strike, kVoicingRefSpeed); the exponent offset is added to
+    // feltP with that force kept.
+    double feltHardness = 1.0;        // x feltK at the reference compression
+    double feltExponentOffset = 0.0;  // + feltP (result >= 1.5)
+    double hammerMassScale = 1.0;     // x hammerMass
+    double strikePosScale = 1.0;      // x strikePos, then clamped to [0.02, 0.30]
+    double stringLossScale = 1.0;     // x b1
+    double hfLossScale = 1.0;         // x b3
+    double inharmonicityScale = 1.0;  // x B with f1 kept (f0 = f1 / sqrt(1 + B))
     double matingSpreadM = 15e-6;     // hammer-string offsets, +- metres
     std::uint64_t seed = 1;           // detuning and mating offsets
 };
 
 void buildPianoTable(PianoTable& table, const TableOptions& options) noexcept;
+// Hammer speed (m/s) whose undamped peak felt compression is the reference
+// compression of the voicing felt scales.
+inline constexpr double kVoicingRefSpeed = 2.0;
+// That compression (m) for a hammer of 'mass' on 'strings' contacts of K x^p.
+double voicingRefCompression(double mass, int strings, double K, double p) noexcept;
 // Default options with the given A4.
 void buildPianoTable(PianoTable& table, double a4Hz = 440.0) noexcept;
 

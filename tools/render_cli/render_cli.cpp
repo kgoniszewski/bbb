@@ -118,7 +118,11 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
         {PM_PARAM_CULL_THRESHOLD_DB, s.cullDb}, {PM_PARAM_CULLING_ENABLED, s.cull ? 1.0 : 0.0},
         {PM_PARAM_A4_HZ, s.voicing.a4Hz}, {PM_PARAM_TUNING_STRETCH, s.voicing.stretch},
         {PM_PARAM_EQUAL_TEMPERAMENT, s.voicing.equalTemperament ? 1.0 : 0.0},
-        {PM_PARAM_UNISON_WIDTH, s.voicing.unisonWidth}, {PM_PARAM_SOUNDBOARD_ENABLED, s.board.enabled ? 1.0 : 0.0},
+        {PM_PARAM_UNISON_WIDTH, s.voicing.unisonWidth}, {PM_PARAM_VOICING_FELT_HARDNESS, s.voicing.feltHardness},
+        {PM_PARAM_VOICING_FELT_EXPONENT, s.voicing.feltExponentOffset}, {PM_PARAM_VOICING_HAMMER_MASS, s.voicing.hammerMassScale},
+        {PM_PARAM_VOICING_STRIKE_POSITION, s.voicing.strikePosScale}, {PM_PARAM_VOICING_STRING_LOSS, s.voicing.stringLossScale},
+        {PM_PARAM_VOICING_HF_LOSS, s.voicing.hfLossScale}, {PM_PARAM_VOICING_INHARMONICITY, s.voicing.inharmonicityScale},
+        {PM_PARAM_SOUNDBOARD_ENABLED, s.board.enabled ? 1.0 : 0.0},
         {PM_PARAM_SYMPATHETIC, s.board.sympathetic}, {PM_PARAM_QUALITY_TIER, static_cast<double>(s.board.tier)},
         {PM_PARAM_LOOP_CUTOFF_HZ, s.board.loopCutoffHz},
         {PM_PARAM_KNOCK_LEVEL, s.knock >= 0.0 ? s.knock : std::nan("")},
@@ -176,6 +180,13 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
         s.voicing.stretch = get(PM_PARAM_TUNING_STRETCH);
         s.voicing.equalTemperament = get(PM_PARAM_EQUAL_TEMPERAMENT) >= 0.5;
         s.voicing.unisonWidth = get(PM_PARAM_UNISON_WIDTH);
+        s.voicing.feltHardness = get(PM_PARAM_VOICING_FELT_HARDNESS);
+        s.voicing.feltExponentOffset = get(PM_PARAM_VOICING_FELT_EXPONENT);
+        s.voicing.hammerMassScale = get(PM_PARAM_VOICING_HAMMER_MASS);
+        s.voicing.strikePosScale = get(PM_PARAM_VOICING_STRIKE_POSITION);
+        s.voicing.stringLossScale = get(PM_PARAM_VOICING_STRING_LOSS);
+        s.voicing.hfLossScale = get(PM_PARAM_VOICING_HF_LOSS);
+        s.voicing.inharmonicityScale = get(PM_PARAM_VOICING_INHARMONICITY);
         s.board.enabled = get(PM_PARAM_SOUNDBOARD_ENABLED) >= 0.5;
         s.board.sympathetic = get(PM_PARAM_SYMPATHETIC);
         s.board.tier = static_cast<pm::QualityTier>(static_cast<int>(get(PM_PARAM_QUALITY_TIER)));
