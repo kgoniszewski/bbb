@@ -265,6 +265,7 @@ struct SoundboardConfig {
     double sympathetic = 1.0;  // loop gain g, 0..1.5: 0 = the board listens, nothing is fed back
     QualityTier tier = QualityTier::Full;
     double loopCutoffHz = 0.0;  // > 0: overrides the tier's loop band
+    double dampingScale = 1.0;  // x plate.etaLow, etaHigh, etaBass at prepare (voicing)
     PlateParams plate{};
     RadiationParams radiation{};  // enabled = false: the v0 pickups (A/B)
 };

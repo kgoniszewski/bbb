@@ -70,11 +70,17 @@ bool Engine::prepare(double sampleRate, int maxFrames) noexcept {
 
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept {
     if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
-    boardModel_ = buildPlateBoard(boardCfg_.plate);
+    PlateParams plate = boardCfg_.plate;
+    if (boardCfg_.dampingScale != 1.0 && boardCfg_.dampingScale > 0.0 && std::isfinite(boardCfg_.dampingScale)) {
+        plate.etaLow *= boardCfg_.dampingScale;
+        plate.etaHigh *= boardCfg_.dampingScale;
+        plate.etaBass *= boardCfg_.dampingScale;
+    }
+    boardModel_ = buildPlateBoard(plate);
     // The microphone gains (about 0.15 s) are kept while the board and
     // radiation parameters are unchanged.
     if (!boardCfg_.enabled || !boardCfg_.radiation.enabled) mics_ = MicGains{};
-    else if (mics_.modes != boardModel_.modes || !(mics_.plate == boardCfg_.plate) ||
+    else if (mics_.modes != boardModel_.modes || !(mics_.plate == plate) ||
              !(mics_.params == boardCfg_.radiation))
         mics_ = computeMicGains(boardModel_, boardCfg_.radiation);
     const double g = boardCfg_.enabled ? std::clamp(boardCfg_.sympathetic, 0.0, 1.5) : 0.0;

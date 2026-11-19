@@ -99,7 +99,8 @@ enum pm_param {
     PM_PARAM_VOICING_STRIKE_POSITION = 33,/* x strike position (clamped to 0.02 .. 0.30 of L), 0.5 .. 2, default 1 */
     PM_PARAM_VOICING_STRING_LOSS = 34,    /* x frequency-independent string loss b1, 0.25 .. 4, default 1 */
     PM_PARAM_VOICING_HF_LOSS = 35,        /* x frequency-dependent string loss b3, 0.25 .. 4, default 1 */
-    PM_PARAM_VOICING_INHARMONICITY = 36   /* x B with the sounding f1 kept, 0 .. 2, default 1 */
+    PM_PARAM_VOICING_INHARMONICITY = 36,  /* x B with the sounding f1 kept, 0 .. 2, default 1 */
+    PM_PARAM_VOICING_BOARD_DAMPING = 37   /* x soundboard loss factors etaLow, etaHigh, etaBass, 0.25 .. 4, default 1 */
 };
 
 /* Partials below the loop band are fed back by the string-board loop

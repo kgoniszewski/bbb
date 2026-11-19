@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "pm_api/pm_api.h"
+#include "pm_engine/engine.h"
 #include "pm_voicing/piano_table.h"
 #include "test_harness.h"
 
@@ -64,7 +65,7 @@ std::vector<float> render(pm_engine* e) {
 const int32_t kIds[] = {PM_PARAM_VOICING_FELT_HARDNESS, PM_PARAM_VOICING_FELT_EXPONENT,
                         PM_PARAM_VOICING_HAMMER_MASS,   PM_PARAM_VOICING_STRIKE_POSITION,
                         PM_PARAM_VOICING_STRING_LOSS,   PM_PARAM_VOICING_HF_LOSS,
-                        PM_PARAM_VOICING_INHARMONICITY};
+                        PM_PARAM_VOICING_INHARMONICITY, PM_PARAM_VOICING_BOARD_DAMPING};
 
 }  // namespace
 
@@ -189,7 +190,7 @@ TEST(api_clamps_and_rejects_nan) {
         {PM_PARAM_VOICING_FELT_HARDNESS, 0.25, 4.0, 1.0}, {PM_PARAM_VOICING_FELT_EXPONENT, -1.0, 1.0, 0.0},
         {PM_PARAM_VOICING_HAMMER_MASS, 0.5, 2.0, 1.0},    {PM_PARAM_VOICING_STRIKE_POSITION, 0.5, 2.0, 1.0},
         {PM_PARAM_VOICING_STRING_LOSS, 0.25, 4.0, 1.0},   {PM_PARAM_VOICING_HF_LOSS, 0.25, 4.0, 1.0},
-        {PM_PARAM_VOICING_INHARMONICITY, 0.0, 2.0, 1.0}};
+        {PM_PARAM_VOICING_INHARMONICITY, 0.0, 2.0, 1.0},  {PM_PARAM_VOICING_BOARD_DAMPING, 0.25, 4.0, 1.0}};
     for (const auto& p : r) {
         double v = -99.0;
         CHECK(pm_engine_get_param(e, p.id, &v) == 1 && v == p.def);
@@ -201,6 +202,32 @@ TEST(api_clamps_and_rejects_nan) {
         CHECK(pm_engine_get_param(e, p.id, &v) == 1 && v == p.lo);
     }
     pm_engine_destroy(e);
+}
+
+TEST(board_damping_scales_board_loss) {
+    pm::Engine a, b;
+    pm::SoundboardConfig cfg;
+    a.setSoundboardConfig(cfg);
+    cfg.dampingScale = 2.0;
+    b.setSoundboardConfig(cfg);
+    CHECK(a.prepare(48000.0, 64));
+    CHECK(b.prepare(48000.0, 64));
+    const pm::PlateParams& pa = a.boardModel().params;
+    const pm::PlateParams& pb = b.boardModel().params;
+    CHECK(pb.etaLow == 2.0 * pa.etaLow && pb.etaHigh == 2.0 * pa.etaHigh && pb.etaBass == 2.0 * pa.etaBass);
+    CHECK(a.boardModel().modes == b.boardModel().modes && a.boardModel().modes > 0);
+    const int m = a.boardModel().modes / 2;
+    CHECK(a.boardModel().freq[m] == b.boardModel().freq[m]);
+    CHECK_NEAR(b.boardModel().sigma[m] / a.boardModel().sigma[m], 2.0, 0.02);
+    // Through the C API the value reaches the output.
+    pm_engine* r0 = pm_engine_create();
+    pm_engine* r1 = pm_engine_create();
+    CHECK(pm_engine_set_param(r1, PM_PARAM_VOICING_BOARD_DAMPING, 2.0) == 1);
+    CHECK(pm_engine_prepare(r0, 48000.0, 64) == 1);
+    CHECK(pm_engine_prepare(r1, 48000.0, 64) == 1);
+    CHECK(render(r0) != render(r1));
+    pm_engine_destroy(r0);
+    pm_engine_destroy(r1);
 }
 
 // Measured values on C4 at the default and the range ends (for the report).

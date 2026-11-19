@@ -67,6 +67,7 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_VOICING_STRING_LOSS, "voicing_string_loss", "String Loss", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_HF_LOSS, "voicing_hf_loss", "String HF Loss", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_INHARMONICITY, "voicing_inharmonicity", "Inharmonicity", "", 0.0, 2.0, 1.0, 1.0, LIN, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_BOARD_DAMPING, "voicing_board_damping", "Board Damping", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
 };
 
 constexpr int kCount = static_cast<int>(sizeof(kParams) / sizeof(kParams[0]));
@@ -78,7 +79,7 @@ constexpr bool idsDense() {
     return true;
 }
 static_assert(idsDense(), "kParams must list ids 0..N-1 in order");
-static_assert(kCount == PM_PARAM_VOICING_INHARMONICITY + 1, "every pm_param needs a descriptor");
+static_assert(kCount == PM_PARAM_VOICING_BOARD_DAMPING + 1, "every pm_param needs a descriptor");
 
 }  // namespace
 
