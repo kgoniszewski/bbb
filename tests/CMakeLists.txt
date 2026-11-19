@@ -67,6 +67,13 @@ add_executable(test_preset test_preset.cpp)
 target_link_libraries(test_preset PRIVATE pm_api Threads::Threads)
 add_test(NAME test_preset COMMAND test_preset)
 
+# Factory presets shipped with the app load without unknown, mistyped or clamped values.
+add_executable(test_factory_presets test_factory_presets.cpp)
+target_link_libraries(test_factory_presets PRIVATE pm_api Threads::Threads)
+target_compile_definitions(test_factory_presets PRIVATE
+    PM_FACTORY_PRESET_DIR="${CMAKE_SOURCE_DIR}/apps/PianoApp/PianoApp/Presets")
+add_test(NAME test_factory_presets COMMAND test_factory_presets)
+
 # Room (early reflections + FDN): standalone library.
 add_executable(test_room test_room.cpp)
 target_link_libraries(test_room PRIVATE pm_room)

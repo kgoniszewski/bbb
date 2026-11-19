@@ -37,6 +37,7 @@ targets:
     dependencies:
       - package: PianoEngine
         product: PianoCore
+      - target: PianoAUv3            # embedded app extension (AUv3)
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.app
@@ -68,6 +69,7 @@ targets:
     dependencies:
       - package: PianoEngine
         product: PianoCore
+      - target: PianoAUv3Mac
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.mac
@@ -80,6 +82,100 @@ targets:
         CFBundleDisplayName: Piano
         LSApplicationCategoryType: public.app-category.music
         NSHighResolutionCapable: true
+
+  # AUv3 instrument (plan §5.1, M5c): apple/PianoAU (the AUAudioUnit) and
+  # apple/AUv3Extension (factory and view). Component codes must match
+  # PIANO_AU_* in apple/PianoAU/PianoAudioUnit.h. Check on a Mac with
+  #   auval -v aumu Pmd1 Pmdl
+  PianoAUv3:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: ../../apple/PianoAU
+      - path: ../../apple/AUv3Extension
+        excludes: ["*.entitlements"]
+    dependencies:
+      - package: PianoEngine
+        product: PianoCore
+      - sdk: AudioToolbox.framework
+      - sdk: AVFAudio.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: CoreMIDI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.app.auv3
+        PRODUCT_NAME: PianoAUv3
+        TARGETED_DEVICE_FAMILY: "2"
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        CLANG_ENABLE_OBJC_ARC: YES
+        GCC_ENABLE_CPP_EXCEPTIONS: NO
+        GCC_ENABLE_CPP_RTTI: NO
+        OTHER_CPLUSPLUSFLAGS: ["$(inherited)", "-fno-exceptions", "-fno-rtti"]
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../../core/pm_api", "$(SRCROOT)/../../apple/PianoAU"]
+    info:
+      path: Generated/Info-AUv3-iOS.plist
+      properties:
+        CFBundleDisplayName: Piano AUv3
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.AudioUnit-UI
+          NSExtensionPrincipalClass: AudioUnitViewController
+          NSExtensionAttributes:
+            AudioComponents:
+              - type: aumu
+                subtype: Pmd1
+                manufacturer: Pmdl
+                name: "Piano Model: Concert Grand"
+                description: Physically modelled concert grand piano
+                version: 512               # 0x00000200 = 0.2.0 (MARKETING_VERSION)
+                sandboxSafe: true
+                tags: [Synthesizer]
+
+  PianoAUv3Mac:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: ../../apple/PianoAU
+      - path: ../../apple/AUv3Extension
+        excludes: ["*.entitlements"]
+    dependencies:
+      - package: PianoEngine
+        product: PianoCore
+      - sdk: AudioToolbox.framework
+      - sdk: AVFAudio.framework
+      - sdk: CoreAudioKit.framework
+      - sdk: CoreMIDI.framework
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.mac.auv3
+        PRODUCT_NAME: PianoAUv3
+        CODE_SIGN_IDENTITY: "-"
+        ENABLE_HARDENED_RUNTIME: NO
+        CODE_SIGN_ENTITLEMENTS: ../../apple/AUv3Extension/PianoAUv3Mac.entitlements   # App Sandbox (required for AUv3 on macOS)
+        CLANG_CXX_LANGUAGE_STANDARD: c++20
+        CLANG_ENABLE_OBJC_ARC: YES
+        GCC_ENABLE_CPP_EXCEPTIONS: NO
+        GCC_ENABLE_CPP_RTTI: NO
+        OTHER_CPLUSPLUSFLAGS: ["$(inherited)", "-fno-exceptions", "-fno-rtti"]
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/../../core/pm_api", "$(SRCROOT)/../../apple/PianoAU"]
+    info:
+      path: Generated/Info-AUv3-macOS.plist
+      properties:
+        CFBundleDisplayName: Piano AUv3
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.AudioUnit-UI
+          NSExtensionPrincipalClass: AudioUnitViewController
+          NSExtensionAttributes:
+            AudioComponents:
+              - type: aumu
+                subtype: Pmd1
+                manufacturer: Pmdl
+                name: "Piano Model: Concert Grand"
+                description: Physically modelled concert grand piano
+                version: 512               # 0x00000200 = 0.2.0 (MARKETING_VERSION)
+                sandboxSafe: true
+                tags: [Synthesizer]
 
 schemes:
   PianoApp:

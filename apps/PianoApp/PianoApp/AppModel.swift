@@ -208,6 +208,9 @@ final class AppModel: ObservableObject {
     @Published var boardOn = true
     // MIDI monitor
     let monitorStore = MonitorStore()
+    // Sound tab: presets and parameter values (observed only there)
+    let presets: PresetStore
+    let paramValues = ParamValues()
 
     let host: EngineHost?
     private var audioController: AudioController?
@@ -228,8 +231,10 @@ final class AppModel: ObservableObject {
     private var terminateObserver: NSObjectProtocol?
 
     init() {
-        host = EngineHost()
-        guard let host = host else {
+        let created = EngineHost()
+        host = created
+        presets = PresetStore(host: created)
+        guard let host = created else {
             audio.message = "Could not create the engine"
             return
         }
@@ -253,8 +258,47 @@ final class AppModel: ObservableObject {
         }
         midiController = mc
         host.setMonitorEnabled(false)  // until the monitor screen is shown
+        presets.onApplied = { [weak self] in
+            self?.refreshFromEngine()
+        }
+        // Before the first prepare (start()), so restored prepare-time values
+        // are used by it and need no second prepare.
+        presets.restoreStateBeforePrepare()
+        refreshFromEngine()
+    }
+
+    /// Mirrors of engine parameters (tier, soundboard, Sound tab values).
+    func refreshFromEngine() {
+        guard let host = host else { return }
         tier = QualityTier(rawValue: Int(host.param(PM_PARAM_QUALITY_TIER))) ?? .full
         boardOn = host.param(PM_PARAM_SOUNDBOARD_ENABLED) >= 0.5
+        paramValues.refresh(from: host)
+    }
+
+    /// Sound tab controls. Real-time parameters are set while dragging;
+    /// prepare-time ones only on commit (release), then re-prepared.
+    func setParam(_ d: ParamDescriptor, _ value: Double, commit: Bool) {
+        guard let host = host else { return }
+        var v = min(max(value, d.min), d.max)
+        if d.isBoolean {
+            v = v >= 0.5 ? 1.0 : 0.0
+        } else if d.isInteger {
+            v = v.rounded()
+        }
+        paramValues.values[d.id] = v
+        if d.isPrepareClass {
+            guard commit else { return }
+            host.setPrepareTimeParam(d.param, v)
+            if d.id == Int32(PM_PARAM_QUALITY_TIER.rawValue) {
+                tier = QualityTier(rawValue: Int(v)) ?? tier
+            } else if d.id == Int32(PM_PARAM_SOUNDBOARD_ENABLED.rawValue) {
+                boardOn = v >= 0.5
+            }
+            audioController?.reprepare { _ in }
+        } else {
+            host.setRealtimeParam(d.param, v)
+        }
+        presets.noteParamChanged()
     }
 
     // MARK: - Lifecycle
@@ -290,6 +334,7 @@ final class AppModel: ObservableObject {
         monitorTimer?.invalidate()
         monitorTimer = nil
         audioController?.shutdownForTermination()
+        presets.saveStateNow()
     }
 
     func stop() {
@@ -1114,14 +1159,18 @@ final class AppModel: ObservableObject {
         guard let host = host, t != tier else { return }
         tier = t
         host.setPrepareTimeParam(PM_PARAM_QUALITY_TIER, Double(t.rawValue))
+        paramValues.values[Int32(PM_PARAM_QUALITY_TIER.rawValue)] = Double(t.rawValue)
         audioController?.reprepare { _ in }
+        presets.noteParamChanged()
     }
 
     func setBoard(_ on: Bool) {
         guard let host = host, on != boardOn else { return }
         boardOn = on
         host.setPrepareTimeParam(PM_PARAM_SOUNDBOARD_ENABLED, on ? 1.0 : 0.0)
+        paramValues.values[Int32(PM_PARAM_SOUNDBOARD_ENABLED.rawValue)] = on ? 1.0 : 0.0
         audioController?.reprepare { _ in }
+        presets.noteParamChanged()
     }
 
     // MARK: - Monitor
