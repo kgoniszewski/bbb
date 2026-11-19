@@ -55,7 +55,9 @@ TEST(default_board_meets_targets) {
     CHECK(b.freq[0] >= 50.0 && b.freq[0] <= 60.0);
     CHECK(2000.0 / n13 >= 18.0 && 2000.0 / n13 <= 32.0);
     CHECK(2000.0 / n35 >= 18.0 && 2000.0 / n35 <= 32.0);
-    CHECK(etaMin >= 0.01 && etaMid <= 0.035 && etaMax <= 0.11);
+    // Loss factors doubled after A/B listening (2026-11-19): 6 % mid range,
+    // about 0.20 at the first mode (were 0.035 and 0.11 for 3 % / 0.10).
+    CHECK(etaMin >= 0.01 && etaMid <= 0.07 && etaMax <= 0.22);
     CHECK(b.modes >= 150 && b.modes <= 600);
     for (int key : {16, 28, 40, 52, 64, 76}) {
         const double zMid = 1.0 / meanRe(b, key, 200.0, 2000.0);

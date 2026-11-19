@@ -40,9 +40,12 @@ constexpr double kP[kAnchors] = {2.2, 2.3, 2.5, 2.8, 3.0, 3.5};
 // far softer than C7's at every working compression (force at 0.3 mm: A0
 // 3.5, C2 3.2, C4 7.0, C6 13.7, C7 27, C8 1.4 N), so the top-octave contact
 // lasted longer than C7's and put 1e-6 to 1e-8 of the hammer's energy into
-// the strings. C8 now continues the C6-C7 progression (x2 per octave):
+// the strings. C8 then continued the C6-C7 progression (x2 per octave):
 // 50 N at 0.3 mm, K = 50 / (3e-4)^3.5 = 1.1e14 (plan §2.1).
-constexpr double kK[kAnchors] = {2e8, 4e8, 4.5e9, 1e11, 1e12, 1.1e14};
+// x0.7 after A/B listening round 1-3, 2026-11-19: the user preferred softer
+// felt (x0.5 .. x0.7 equal, x0.85 and x1 worse). Forces at 0.3 mm scale by
+// 0.7 too: A0 2.45, C2 2.24, C4 4.9, C6 9.6, C7 18.9, C8 35 N.
+constexpr double kK[kAnchors] = {1.4e8, 2.8e8, 3.15e9, 7e10, 7e11, 7.7e13};
 constexpr double kStrike[kAnchors] = {0.12, 0.12, 0.12, 0.09, 0.0625, 0.06};
 constexpr double kB1[kAnchors] = {0.115, 0.15, 0.335, 0.92, 1.8, 4.0};
 constexpr double kB3[kAnchors] = {1e-8, 8e-9, 3.5e-9, 1.5e-9, 1e-9, 8e-10};

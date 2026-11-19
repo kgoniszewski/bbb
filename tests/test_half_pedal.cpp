@@ -113,25 +113,40 @@ TEST(t60_graded_with_pedal_position) {
 // A note held with the pedal half down, the pedal then moved in steps
 // through the transition zone and back: no step in the output at any pedal
 // event beyond the signal's own sample-to-sample motion (damping changes
-// only decay rates; the pedal is smoothed).
+// only decay rates; the pedal is smoothed). The signal's own motion after
+// event i is taken from a reference render with the same events except
+// event i: the note's partials beat, so its largest step in the 20 ms after
+// an instant can exceed that in the 20 ms before it without any event (the
+// earlier before/after metric read 1.253 at the first move, 0.6, with the
+// reference reading 1.261 at the same instant without the move). A click
+// would make the largest step after the event exceed the reference's.
 TEST(pedal_moves_without_click) {
-    std::vector<pm::Event> ev = {noteOn(0, 48, 90), noteOff(12000, 48), pedal(6000, 1.0)};
     const double steps[] = {0.6, 0.45, 0.4, 0.35, 0.5, 0.0, 1.0};
+    constexpr int nSteps = sizeof(steps) / sizeof(steps[0]);
+    auto scene = [&](int upTo, bool withLast) {
+        std::vector<pm::Event> ev = {noteOn(0, 48, 90), noteOff(12000, 48), pedal(6000, 1.0)};
+        std::uint64_t t = 24000;
+        for (int j = 0; j <= upTo; ++j, t += 4800)
+            if (j < upTo || withLast) ev.push_back(pedal(t + 7, steps[j]));
+        return ev;
+    };
+    auto maxStep = [](const std::vector<float>& x, std::uint64_t a, std::uint64_t b) {
+        double m = 0.0;
+        for (std::uint64_t k = a; k < b; ++k) m = std::max(m, double(std::fabs(x[k + 1] - x[k])));
+        return m;
+    };
+    const Stereo s = render(scene(nSteps - 1, true), 1.4);
+    double worst = 0.0, worstOld = 0.0;
     std::uint64_t t = 24000;
-    for (double p : steps) {
-        ev.push_back(pedal(t + 7, p));
-        t += 4800;
+    for (int i = 0; i < nSteps; ++i, t += 4800) {
+        const Stereo r = render(scene(i, false), double(t + 1000) / kFs);
+        const double around = maxStep(s.l, t, t + 960);
+        worst = std::max(worst, around / maxStep(r.l, t, t + 960));
+        worstOld = std::max(worstOld, around / maxStep(s.l, t - 960, t));
     }
-    const Stereo s = render(ev, 1.4);
-    double worst = 0.0;
-    t = 24000;
-    for (std::size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i, t += 4800) {
-        double before = 0.0, around = 0.0;
-        for (std::uint64_t k = t - 960; k < t; ++k) before = std::max(before, double(std::fabs(s.l[k + 1] - s.l[k])));
-        for (std::uint64_t k = t; k < t + 960; ++k) around = std::max(around, double(std::fabs(s.l[k + 1] - s.l[k])));
-        worst = std::max(worst, around / before);
-    }
-    std::printf("  largest sample step after a pedal move / before it: %.3f\n", worst);
+    std::printf("  largest sample step after a pedal move / same without the move: %.3f "
+                "(after / before the move: %.3f)\n",
+                worst, worstOld);
     CHECK_LE(worst, 1.05);
 }
 

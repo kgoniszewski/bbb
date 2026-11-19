@@ -39,7 +39,10 @@
 // estimate until measured data exist) and a 2 % frequency scatter. Result
 // over keys 1-52, 40-500 Hz: median |Z| 1,130 kg/s, every key's minimum
 // above 150 kg/s, Re Y peaks within 8 times the mean
-// (test_soundboard_model).
+// (test_soundboard_model). These numbers describe the first calibration
+// (etaLow = etaHigh = 0.03, etaBass = 0.08); after A/B listening
+// (2026-11-19) all three loss factors were doubled (6 % mid range,
+// etaBass 0.16, eta about 0.20 at the first mode).
 //
 // Low regime. One stiffness for the whole range (set by the density above
 // 1 kHz) leaves the plate far too sparse below about 1.1 kHz (37 modes
@@ -140,10 +143,12 @@ struct PlateParams {
     double lengthX = 1.93, widthY = 1.25;    // m
     double massPerArea = 6.6;                // kg/m^2
     double Dx = 2430.0, Dy = 20000.0, Dxy = 2090.0;  // N m
-    double etaLow = 0.03, etaHigh = 0.03, etaRefHz = 5000.0, etaExponent = 0.6;
+    // Loss factors x2 after A/B listening round 1-3, 2026-11-19 (the user
+    // preferred the more damped board; x1 sounded "guitar-like").
+    double etaLow = 0.06, etaHigh = 0.06, etaRefHz = 5000.0, etaExponent = 0.6;
     // Extra loss of the lowest modes (rim and case participation, radiation
     // into the case): + etaBass / (1 + (f / etaBassHz)^2).
-    double etaBass = 0.08, etaBassHz = 150.0;
+    double etaBass = 0.16, etaBassHz = 150.0;
     // Irregularity: every mode frequency is scaled by 1 + freqJitter * x,
     // x uniform in [-1, 1) from a fixed hash of (m, n, jitterSeed).
     double freqJitter = 0.02;

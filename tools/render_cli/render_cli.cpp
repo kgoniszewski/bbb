@@ -57,8 +57,8 @@ void usage() {
         "                     time when the room is on)\n"
         "  --fs, --block, --format, --out, --cull-db, --no-cull as above\n"
         "  --gain-db DB       master gain (default 0)\n"
-        "  --width W          stereo width 0..1 (default 0.35)\n"
-        "  --treble DB        high shelf at 3 kHz on the microphones, -12..6 dB (default -3)\n"
+        "  --width W          stereo width 0..1 (default 0.7)\n"
+        "  --treble DB        high shelf at 3 kHz on the microphones, -12..6 dB (default -9)\n"
         "  --dry              room (reverb) off; default on\n"
         "  --room-level DB    room wet level (default -9; 0 = physical reverberant-to-direct ratio)\n"
         "  --room-decay S     room T60 at mid frequencies, 0.3..6 s (default 1.8)\n"
@@ -214,7 +214,7 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
 
 int pianoMain(int argc, char** argv) {
     std::string scorePath, out = "out.wav", presetPath, savePresetPath;
-    double fs = 48000.0, tail = 4.0, gainDb = 0.0, width = 0.35, trebleDb = -3.0, cullDb = -100.0;
+    double fs = 48000.0, tail = 4.0, gainDb = 0.0, width = 0.7, trebleDb = -9.0, cullDb = -100.0;
     int block = 64;
     bool cull = true, quiet = false;
     pm::TableOptions voicing;

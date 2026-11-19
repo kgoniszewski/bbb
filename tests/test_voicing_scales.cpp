@@ -80,10 +80,11 @@ TEST(defaults_leave_table_untouched) {
     explicitDefaults.inharmonicityScale = 1.0;
     const pm::PianoTable a = build(pm::TableOptions{}), b = build(explicitDefaults);
     for (int i = 0; i < pm::kNumKeys; ++i) CHECK(sameKey(a.keys[i], b.keys[i]));
-    // C4 is an anchor row: the plan §2.1 values come through unchanged.
+    // C4 is an anchor row: the plan §2.1 values come through unchanged
+    // (feltK x0.7 after A/B listening, piano_table.cpp).
     const pm::KeyParams& k = a.keys[kC4];
     CHECK_NEAR(k.hammerMass, 9e-3, 1e-15);
-    CHECK_NEAR(k.feltK / 4.5e9, 1.0, 1e-12);
+    CHECK_NEAR(k.feltK / 3.15e9, 1.0, 1e-12);  // plan 4.5e9 x0.7 (A/B listening, 2026-11-19)
     CHECK_NEAR(k.feltP, 2.5, 1e-12);
     CHECK_NEAR(k.strikePos, 0.12, 1e-12);
     CHECK_NEAR(k.b1, 0.335, 1e-12);

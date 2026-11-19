@@ -47,10 +47,28 @@ double bandEnergy(const std::vector<float>& x, double fc) {
 // Renders with the treble set to `db0`, switched to `db1` before the buffer
 // that contains sample `at` (the change is latched at the first control tick
 // of that buffer).
+// The shelf tests run on the voicing before A/B listening rounds 1-3
+// (felt x1/0.7, board loss x0.5 against the current table; width 0.35):
+// with the softer felt and the more damped board the chord has so little
+// energy near 8 kHz that the band filter's skirts (2-4 kHz, where the shelf
+// is still on its slope) dominate, and the measured 8 kHz gain reads -2.3
+// instead of about -2.6 dB for a -3 dB shelf. The shelf itself is unchanged.
+void prepareBrightVoicing(pm::Engine& eng, int maxFrames) {
+    pm::TableOptions o;
+    o.feltHardness = 1.0 / 0.7;
+    pm::PianoTable t;
+    pm::buildPianoTable(t, o);
+    pm::SoundboardConfig c;
+    c.dampingScale = 0.5;
+    eng.setSoundboardConfig(c);
+    eng.setStereoWidth(0.35f);
+    eng.prepare(kFs, maxFrames, t);
+}
+
 Stereo renderChange(float db0, float db1, int at, int n, int block, const std::vector<pm::Event>& ev) {
     pm::Engine eng;
     eng.setTrebleDb(db0);
-    eng.prepare(kFs, 512);
+    prepareBrightVoicing(eng, 512);
     Stereo s;
     s.l.assign(n, 0.0f);
     s.r.assign(n, 0.0f);
@@ -78,7 +96,7 @@ TEST(treble_zero_is_bypass) {
     pm::Engine a;
     CHECK(a.trebleDb() == pm::Engine::kDefaultTrebleDb);
     a.setTrebleDb(0.0f);
-    a.prepare(kFs, 512);
+    prepareBrightVoicing(a, 512);
     const Stereo ra = renderEngine(a, ev, n, 64);
     const Stereo rb = renderChange(-3.0f, 0.0f, 0, n, 64, ev);
     const Stereo rc = renderChange(-3.0f, -3.0f, 0, n, 64, ev);

@@ -54,7 +54,7 @@ typedef struct pm_clock {
 
 enum pm_param {
     PM_PARAM_MASTER_GAIN_DB = 0,          /* -96 .. 24, default 0 */
-    PM_PARAM_STEREO_WIDTH = 1,            /* 0 .. 1, default 0.35 */
+    PM_PARAM_STEREO_WIDTH = 1,            /* 0 .. 1, default 0.7 */
     PM_PARAM_SCHEDULING_MODE = 2,         /* 0 lowest latency (default), 1 constant latency */
     PM_PARAM_CONSTANT_LATENCY_FRAMES = 3, /* default: max_frames from prepare */
     PM_PARAM_CULL_THRESHOLD_DB = 4,       /* default -100 */
@@ -90,7 +90,7 @@ enum pm_param {
     PM_PARAM_ROOM_HF_RATIO = 26,          /* T60(8 kHz) / T60(mid), 0.1 .. 1, default 0.5 */
     PM_PARAM_ROOM_SIZE = 27,              /* room scale 0.5 .. 2, default 1 (change fades out and in) */
     PM_PARAM_ROOM_EARLY_LATE = 28,        /* 0 early only, 1 late only, 0.5 both at physical level (default) */
-    PM_PARAM_TREBLE_DB = 29,              /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default -3 */
+    PM_PARAM_TREBLE_DB = 29,              /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default -9 */
     /* API 0.19: global voicing scales on the per-key table (hidden, for
      * listening tests). Take effect at the next pm_engine_prepare. */
     PM_PARAM_VOICING_FELT_HARDNESS = 30,  /* x felt force at the key's reference compression, 0.25 .. 4, default 1 */

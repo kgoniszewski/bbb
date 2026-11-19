@@ -340,12 +340,12 @@ public:
     void setStereoWidth(float w) noexcept { width_.store(w, std::memory_order_relaxed); }
     // Treble: second-order high shelf (RBJ, S = 1) at kTrebleHz on the dry
     // microphone pair, after the stereo width and before the room, gain in
-    // dB clamped to [-12, 6]. The default -3 dB is an interim voicing
-    // measure (the treble was heard as a little too bright) pending the
+    // dB clamped to [-12, 6]. The default -9 dB was chosen in A/B listening
+    // rounds 1-3 (2026-11-19; earlier interim value -3 dB) pending the
     // register balance of M6. Latched on the 32-sample control grid and
     // glided over a few ticks; exactly 0 dB bypasses the filter
     // (bit-identical to the engine without it).
-    static constexpr float kDefaultTrebleDb = -3.0f;
+    static constexpr float kDefaultTrebleDb = -9.0f;
     static constexpr double kTrebleHz = 3000.0;
     void setTrebleDb(float db) noexcept { trebleDb_.store(db, std::memory_order_relaxed); }
     // Room (pm_room): its wet signal is added to the dry microphone pair
@@ -681,7 +681,7 @@ private:
 
     // Parameters.
     std::atomic<float> masterGainDb_{0.0f};
-    std::atomic<float> width_{0.35f};
+    std::atomic<float> width_{0.7f};
     std::atomic<float> trebleDb_{kDefaultTrebleDb};
     std::atomic<bool> roomOn_{false};
     std::atomic<float> roomLevelDb_{float(Room::kDefaultLevelDb)}, roomDecay_{1.8f}, roomHf_{0.5f}, roomSize_{1.0f},

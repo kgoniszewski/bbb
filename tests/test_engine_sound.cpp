@@ -141,6 +141,10 @@ TEST(restrike_depends_on_phase_without_click) {
     eng.setNoiseLevels(0.0f, 0.0f);  // the hammer knock is an intended impulse
     eng.prepare(kFs, 64);
     const Stereo fresh = renderEngine(eng, {noteOn(0, note, 80)}, 24000);
+    // The first strike alone, as long as the longest restrike render: the
+    // string's own motion at the event instant, without the restrike.
+    eng.prepare(kFs, 64);
+    const Stereo alone = renderEngine(eng, {noteOn(0, note, 100)}, t0 + 200 + 24000);
     std::vector<double> levels;
     for (int q = 0; q < 8; ++q) {
         const int t = t0 + static_cast<int>(std::lround(q * kFs / f1 / 8.0));
@@ -149,17 +153,27 @@ TEST(restrike_depends_on_phase_without_click) {
         // The string's own slope just before the event.
         double ownStep = 0.0;
         for (int k = t - 960; k < t; ++k) ownStep = std::max(ownStep, double(std::fabs(s.l[k + 1] - s.l[k])));
-        double stepAt = 0.0;
-        for (int k = t - 1; k < t + 2; ++k) stepAt = std::max(stepAt, double(std::fabs(s.l[k + 1] - s.l[k])));
+        double stepAt = 0.0, stepAdded = 0.0;
+        for (int k = t - 1; k < t + 2; ++k) {
+            stepAt = std::max(stepAt, double(std::fabs(s.l[k + 1] - s.l[k])));
+            stepAdded = std::max(stepAdded, double(std::fabs((s.l[k + 1] - alone.l[k + 1]) - (s.l[k] - alone.l[k]))));
+        }
         // Level of the restruck note, and its difference from a fresh strike.
         std::vector<float> after(s.l.begin() + t, s.l.end());
         const double lev = rmsDb(after, 2400, 24000);
         double diff = 0.0;
         for (int k = 0; k < 24000; ++k) diff = std::max(diff, double(std::fabs(after[k] - fresh.l[k])));
-        std::printf("  restrike at phase %d/8: step at event %.4f (own max step %.4f), level %.2f dB, "
-                    "max diff from fresh strike %.3f\n",
-                    q, stepAt, ownStep, lev, diff);
-        CHECK_LE(stepAt, 1.0 * ownStep);
+        std::printf("  restrike at phase %d/8: step at event %.4f (own max step %.4f), added by the restrike %.2e, "
+                    "level %.2f dB, max diff from fresh strike %.3f\n",
+                    q, stepAt, ownStep, stepAdded, lev, diff);
+        // The step the restrike adds at the event (restruck minus the first
+        // strike alone), not the output's step: at phase 6/8 the string's
+        // own step at the event instant (0.000872, the same with and without
+        // the restrike) exceeds its largest step in the 20 ms before
+        // (0.000863) as its partials beat. Measured added steps: 0.7-4.5e-7,
+        // under 0.001x the own step; a click (state reset, unramped force)
+        // would be of the order of the own step. Bound 0.05x.
+        CHECK_LE(stepAdded, 0.05 * ownStep);
         CHECK(diff > 0.05 * peakAbs(fresh.l));
         levels.push_back(lev);
     }

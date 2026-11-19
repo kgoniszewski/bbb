@@ -29,7 +29,7 @@ constexpr const char* kTierNames[] = {"full", "balanced", "eco"};
 constexpr pm_param_info_t kParams[] = {
     // id, key, name, unit, min, max, default (product), engine default, curve, class, flags, enum
     {PM_PARAM_MASTER_GAIN_DB, "master_gain_db", "Master Gain", "dB", -96.0, 24.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
-    {PM_PARAM_STEREO_WIDTH, "stereo_width", "Stereo Width", "", 0.0, 1.0, 0.35, 0.35, LIN, A, AUTO, 0, nullptr},
+    {PM_PARAM_STEREO_WIDTH, "stereo_width", "Stereo Width", "", 0.0, 1.0, 0.7, 0.7, LIN, A, AUTO, 0, nullptr},
     {PM_PARAM_SCHEDULING_MODE, "scheduling_mode", "Scheduling Mode", "", 0.0, 1.0, 0.0, 0.0, INT, A, HID, 2, kSchedulingNames},
     // 0 = max_frames of the next prepare (prepare stores that value).
     {PM_PARAM_CONSTANT_LATENCY_FRAMES, "constant_latency_frames", "Constant Latency", "frames", 0.0, 8192.0, 0.0, 0.0, INT, A, HID, 0, nullptr},
@@ -59,7 +59,7 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_ROOM_HF_RATIO, "room_hf_ratio", "Room HF Decay Ratio", "", 0.1, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_SIZE, "room_size", "Room Size", "", 0.5, 2.0, 1.0, 1.0, LOG, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_EARLY_LATE, "room_early_late", "Early / Late Balance", "", 0.0, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
-    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 6.0, -3.0, -3.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 6.0, -9.0, -9.0, DB, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_VOICING_FELT_HARDNESS, "voicing_felt_hardness", "Felt Hardness", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_FELT_EXPONENT, "voicing_felt_exponent", "Felt Stiffening Offset", "", -1.0, 1.0, 0.0, 0.0, LIN, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_HAMMER_MASS, "voicing_hammer_mass", "Hammer Mass", "", 0.5, 2.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},

@@ -1082,7 +1082,8 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
                 hpY_[c][0] = y;
                 mix[c][i] += g * y;
             }
-        // Stereo width scales the side signal (1 at the default 0.35).
+        // Stereo width scales the side signal (1 at 0.35, the earlier default;
+        // the A/B-chosen default 0.7 was heard with this mapping, side x2).
         const float side = appliedWidth_ / 0.35f;
         for (int i = 0; i < n; ++i) {
             const float mid = 0.5f * (mL[i] + mR[i]), sd = 0.5f * (mL[i] - mR[i]) * side;

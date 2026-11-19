@@ -23,8 +23,9 @@ namespace {
 constexpr double kFs = 48000.0;
 constexpr double kPi = std::numbers::pi;
 // Pedal-down residual of a held mf C4 re its direct (partial) energy over
-// 1.1-5.1 s, 100-5300 Hz, as measured with the low-regime board, 2026-11-15 (pedal_residual_per_bark_band).
-constexpr double kC4ResidualReDirectDb = -22.5;
+// 1.1-5.1 s, 100-5300 Hz, as measured with the low-regime board, 2026-11-15 (pedal_residual_per_bark_band);
+// -29.4 dB since the A/B voicing of 2026-11-19 (board loss x2, felt x0.7; was -22.5).
+constexpr double kC4ResidualReDirectDb = -29.4;
 
 pm::Event keyDownSilent(std::uint64_t t, int note) {
     pm::Event e = noteOn(t, note, 1);
