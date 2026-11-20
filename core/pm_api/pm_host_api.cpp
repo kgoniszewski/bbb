@@ -335,8 +335,8 @@ pm_host* pm_host_create(void) {
     }
     // The product configuration: the room on at its default level and the
     // master volume at its product default (the bare engine keeps the room off
-    // and 0 dB for the physics tests). +14 dB puts a 6-note ff chord near
-    // -4 dBFS and every single ff key at or below -5 dBFS, under the soft
+    // and 0 dB for the physics tests). +16 dB (with the A/B round 4 radiation roll-off) puts a 6-note ff chord near
+    // -3.4 dBFS (bare engine -19.4 dBFS + 16), under the soft
     // clipper's knee (0.89, -1 dBFS).
     pm_engine_set_param(h->engine, PM_PARAM_ROOM_ENABLED, 1.0);
     pm_param_info_t gain{};

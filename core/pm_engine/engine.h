@@ -268,9 +268,10 @@ struct SoundboardConfig {
     double dampingScale = 1.0;  // x plate.etaLow, etaHigh, etaBass at prepare (voicing)
     // Radiation tilt (voicing): the microphones' board-mode gains, and the
     // direct path with them, x (f / corner)^(tilt / 6.02) above the corner.
-    // 0: off, bit-identical.
-    double radiationTiltDbPerOct = 0.0;
-    double radiationTiltCornerHz = 1000.0;
+    // 0: off, bit-identical. Default -4 dB/oct above 700 Hz after A/B
+    // round 4, 2026-11-20 (preferred over the -9 dB treble shelf).
+    double radiationTiltDbPerOct = -4.0;
+    double radiationTiltCornerHz = 700.0;
     PlateParams plate{};
     RadiationParams radiation{};  // enabled = false: the v0 pickups (A/B)
 };
@@ -345,12 +346,12 @@ public:
     void setStereoWidth(float w) noexcept { width_.store(w, std::memory_order_relaxed); }
     // Treble: second-order high shelf (RBJ, S = 1) at kTrebleHz on the dry
     // microphone pair, after the stereo width and before the room, gain in
-    // dB clamped to [-12, 6]. The default -9 dB was chosen in A/B listening
-    // rounds 1-3 (2026-11-19; earlier interim value -3 dB) pending the
-    // register balance of M6. Latched on the 32-sample control grid and
+    // dB clamped to [-12, 6]. Default 0 dB (off): A/B round 4 (2026-11-20)
+    // replaced the interim -9 dB shelf of rounds 1-3 with the radiation tilt
+    // (SoundboardConfig::radiationTiltDbPerOct). Latched on the 32-sample control grid and
     // glided over a few ticks; exactly 0 dB bypasses the filter
     // (bit-identical to the engine without it).
-    static constexpr float kDefaultTrebleDb = -9.0f;
+    static constexpr float kDefaultTrebleDb = 0.0f;
     static constexpr double kTrebleHz = 3000.0;
     void setTrebleDb(float db) noexcept { trebleDb_.store(db, std::memory_order_relaxed); }
     // Room (pm_room): its wet signal is added to the dry microphone pair

@@ -242,7 +242,7 @@ TEST(params_master_gain_product_default) {
     pm_host* h = pm_host_create();
     double g = 0.0;
     CHECK(pm_engine_get_param(pm_host_engine(h), PM_PARAM_MASTER_GAIN_DB, &g) == 1);
-    CHECK(g == 14.0);
+    CHECK(g == 16.0);
     pm_host_destroy(h);
     pm_engine* e = pm_engine_create();
     CHECK(pm_engine_get_param(e, PM_PARAM_MASTER_GAIN_DB, &g) == 1);

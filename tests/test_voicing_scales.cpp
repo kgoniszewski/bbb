@@ -197,7 +197,8 @@ TEST(api_clamps_and_rejects_nan) {
         {PM_PARAM_VOICING_HAMMER_MASS, 0.5, 2.0, 1.0},    {PM_PARAM_VOICING_STRIKE_POSITION, 0.5, 2.0, 1.0},
         {PM_PARAM_VOICING_STRING_LOSS, 0.25, 4.0, 1.0},   {PM_PARAM_VOICING_HF_LOSS, 0.25, 4.0, 1.0},
         {PM_PARAM_VOICING_INHARMONICITY, 0.0, 2.0, 1.0},  {PM_PARAM_VOICING_BOARD_DAMPING, 0.25, 4.0, 1.0},
-        {PM_PARAM_VOICING_RADIATION_TILT, -9.0, 0.0, 0.0}, {PM_PARAM_VOICING_RADIATION_CORNER_HZ, 250.0, 8000.0, 1000.0},
+        // Radiation tilt default -4 dB/oct above 700 Hz (A/B round 4, 2026-11-20; was 0 / 1000).
+        {PM_PARAM_VOICING_RADIATION_TILT, -9.0, 0.0, -4.0}, {PM_PARAM_VOICING_RADIATION_CORNER_HZ, 250.0, 8000.0, 700.0},
         {PM_PARAM_VOICING_FELT_DAMPING, 0.25, 8.0, 1.0}};
     for (const auto& p : r) {
         double v = -99.0;
@@ -260,6 +261,9 @@ TEST(felt_damping_scales_felt_mu) {
 TEST(radiation_tilt_scales_mic_gains_and_direct_path) {
     pm::Engine a, b;
     pm::SoundboardConfig cfg;
+    // Reference: the untilted Rayleigh gains. The default tilt (-4 dB/oct
+    // above 700 Hz since A/B round 4) is switched off explicitly.
+    cfg.radiationTiltDbPerOct = 0.0;
     a.setSoundboardConfig(cfg);
     cfg.radiationTiltDbPerOct = -6.0;
     cfg.radiationTiltCornerHz = 1000.0;
@@ -306,6 +310,9 @@ TEST(radiation_tilt_scales_mic_gains_and_direct_path) {
     // Through the C API the value reaches the output.
     pm_engine* r0 = pm_engine_create();
     pm_engine* r1 = pm_engine_create();
+    // r0 tilt off, r1 at -4 dB/oct (the default since A/B round 4, set
+    // explicitly so the check does not depend on the default).
+    CHECK(pm_engine_set_param(r0, PM_PARAM_VOICING_RADIATION_TILT, 0.0) == 1);
     CHECK(pm_engine_set_param(r1, PM_PARAM_VOICING_RADIATION_TILT, -4.0) == 1);
     CHECK(pm_engine_prepare(r0, 48000.0, 64) == 1);
     CHECK(pm_engine_prepare(r1, 48000.0, 64) == 1);

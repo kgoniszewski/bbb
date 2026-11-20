@@ -29,7 +29,7 @@ constexpr const char* kTouchNames[] = {"light", "medium", "strong"};
 // SoundboardConfig, Room) and the pm_host_create overrides.
 constexpr pm_param_info_t kParams[] = {
     // id, key, name, unit, min, max, default (product), engine default, curve, class, flags, enum
-    {PM_PARAM_MASTER_GAIN_DB, "master_gain_db", "Master Volume", "dB", -96.0, 24.0, 14.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_MASTER_GAIN_DB, "master_gain_db", "Master Volume", "dB", -96.0, 24.0, 16.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_STEREO_WIDTH, "stereo_width", "Stereo Width", "", 0.0, 1.0, 0.7, 0.7, LIN, A, AUTO, 0, nullptr},
     {PM_PARAM_SCHEDULING_MODE, "scheduling_mode", "Scheduling Mode", "", 0.0, 1.0, 0.0, 0.0, INT, A, HID, 2, kSchedulingNames},
     // 0 = max_frames of the next prepare (prepare stores that value).
@@ -60,7 +60,7 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_ROOM_HF_RATIO, "room_hf_ratio", "Room HF Decay Ratio", "", 0.1, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_SIZE, "room_size", "Room Size", "", 0.5, 2.0, 1.0, 1.0, LOG, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_EARLY_LATE, "room_early_late", "Early / Late Balance", "", 0.0, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
-    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 6.0, -9.0, -9.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 6.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_VOICING_FELT_HARDNESS, "voicing_felt_hardness", "Felt Hardness", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_FELT_EXPONENT, "voicing_felt_exponent", "Felt Stiffening Offset", "", -1.0, 1.0, 0.0, 0.0, LIN, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_HAMMER_MASS, "voicing_hammer_mass", "Hammer Mass", "", 0.5, 2.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
@@ -70,8 +70,8 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_VOICING_INHARMONICITY, "voicing_inharmonicity", "Inharmonicity", "", 0.0, 2.0, 1.0, 1.0, LIN, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_BOARD_DAMPING, "voicing_board_damping", "Board Damping", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_TOUCH, "touch", "Touch", "", 0.0, 2.0, 1.0, 1.0, INT, A, NRT, 3, kTouchNames},
-    {PM_PARAM_VOICING_RADIATION_TILT, "voicing_radiation_tilt", "Radiation Tilt", "dB/oct", -9.0, 0.0, 0.0, 0.0, LIN, B, HID | NRT, 0, nullptr},
-    {PM_PARAM_VOICING_RADIATION_CORNER_HZ, "voicing_radiation_corner_hz", "Radiation Tilt Corner", "Hz", 250.0, 8000.0, 1000.0, 1000.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_RADIATION_TILT, "voicing_radiation_tilt", "Radiation Tilt", "dB/oct", -9.0, 0.0, -4.0, -4.0, LIN, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_RADIATION_CORNER_HZ, "voicing_radiation_corner_hz", "Radiation Tilt Corner", "Hz", 250.0, 8000.0, 700.0, 700.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_FELT_DAMPING, "voicing_felt_damping", "Felt Damping", "", 0.25, 8.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
 };
 

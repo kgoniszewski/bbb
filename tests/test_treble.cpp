@@ -60,6 +60,10 @@ void prepareBrightVoicing(pm::Engine& eng, int maxFrames) {
     pm::buildPianoTable(t, o);
     pm::SoundboardConfig c;
     c.dampingScale = 0.5;
+    // Radiation tilt off (default -4 dB/oct above 700 Hz since A/B round 4,
+    // 2026-11-20): it removes the 8 kHz energy the same way, and the measured
+    // 8 kHz gain read -2.2 dB. This test measures the shelf, not the voicing.
+    c.radiationTiltDbPerOct = 0.0;
     eng.setSoundboardConfig(c);
     eng.setStereoWidth(0.35f);
     eng.prepare(kFs, maxFrames, t);
