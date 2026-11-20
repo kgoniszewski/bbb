@@ -266,6 +266,11 @@ struct SoundboardConfig {
     QualityTier tier = QualityTier::Full;
     double loopCutoffHz = 0.0;  // > 0: overrides the tier's loop band
     double dampingScale = 1.0;  // x plate.etaLow, etaHigh, etaBass at prepare (voicing)
+    // Radiation tilt (voicing): the microphones' board-mode gains, and the
+    // direct path with them, x (f / corner)^(tilt / 6.02) above the corner.
+    // 0: off, bit-identical.
+    double radiationTiltDbPerOct = 0.0;
+    double radiationTiltCornerHz = 1000.0;
     PlateParams plate{};
     RadiationParams radiation{};  // enabled = false: the v0 pickups (A/B)
 };
@@ -499,6 +504,11 @@ public:
     bool soundboardActive() const noexcept { return boardOn_; }
     const Soundboard& soundboard() const noexcept { return board_; }
     const BoardModel& boardModel() const noexcept { return boardModel_; }
+    // The microphone gains in use (tilted when the radiation tilt is on);
+    // modes == 0 with the v0 pickups.
+    // Level of the direct path above the modal range (output per unit bridge force).
+    float directPathGain() const noexcept { return hfGain_; }
+    const MicGains& micGains() const noexcept { return micsTilted_.modes > 0 ? micsTilted_ : mics_; }
     float sympatheticGain() const noexcept { return symGain_; }
     // Key segment layout (bank modes incl. padding) and the key's coupled modes.
     int keyCoupledModes(int key) const noexcept { return keyCoupled_[key]; }
@@ -587,6 +597,7 @@ private:
     SoundboardConfig boardCfg_{};
     BoardModel boardModel_{};
     MicGains mics_{};  // empty with the v0 pickups
+    MicGains micsTilted_{};  // mics_ with the radiation tilt; empty when the tilt is off
     Soundboard board_;
     bool boardOn_ = false;
     float symGain_ = 0.0f;

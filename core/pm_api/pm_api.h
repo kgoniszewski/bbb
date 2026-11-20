@@ -105,7 +105,11 @@ enum pm_param {
      * the velocity exponent: 0 Light x2/3, 1 Medium x1 (default), 2 Strong
      * x1.5; the hammer speeds at velocity 0+ and 127 are unchanged. The
      * PM_PARAM_VELOCITY_* parameters are hidden from 0.20 on. */
-    PM_PARAM_TOUCH = 38                   /* 0 Light, 1 Medium (default), 2 Strong */
+    PM_PARAM_TOUCH = 38,                  /* 0 Light, 1 Medium (default), 2 Strong */
+    /* API 0.20 (hidden, prepare class, for listening tests): */
+    PM_PARAM_VOICING_RADIATION_TILT = 39, /* dB/octave on the microphones' board-mode gains above the corner, -9 .. 0, default 0 */
+    PM_PARAM_VOICING_RADIATION_CORNER_HZ = 40, /* corner of that tilt, 250 .. 8000 Hz, default 1000 */
+    PM_PARAM_VOICING_FELT_DAMPING = 41    /* x felt Hunt-Crossley damping feltMu, 0.25 .. 8, default 1 */
 };
 
 /* Partials below the loop band are fed back by the string-board loop

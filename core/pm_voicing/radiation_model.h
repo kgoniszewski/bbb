@@ -75,6 +75,12 @@ struct MicGains {
 std::complex<double> micModeGain(const BoardModel& b, const RadiationParams& r, int mic, int i);
 // All modes, both microphones, normalised to the v0 pickup level.
 MicGains computeMicGains(const BoardModel& b, const RadiationParams& r);
+// Radiation tilt: every mode's gain (both microphones) x g(f) = (f / cornerHz)^(dbPerOct / 6.0206)
+// for f > cornerHz, 1 below (f the mode's frequency). One lumped stand-in for
+// the high-frequency losses the 0.5 m Rayleigh model leaves out (listening
+// distance and off-axis directivity, rib and bridge mass loading); fitted by
+// listening, not measured. dbPerOct == 0 leaves the gains untouched.
+void applyRadiationTilt(MicGains& g, const BoardModel& b, double dbPerOct, double cornerHz) noexcept;
 // After loadSoundboard: replaces the pickup rows by the microphones.
 void loadMicGains(Soundboard& sb, const MicGains& g) noexcept;
 // Modal transfer from a shape row (force) to a microphone, the counterpart of

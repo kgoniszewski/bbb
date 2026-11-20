@@ -83,6 +83,15 @@ bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) 
     else if (mics_.modes != boardModel_.modes || !(mics_.plate == plate) ||
              !(mics_.params == boardCfg_.radiation))
         mics_ = computeMicGains(boardModel_, boardCfg_.radiation);
+    // The tilt goes on a copy, so the cached untilted gains survive a change of it.
+    micsTilted_ = MicGains{};
+    {
+        const double tilt = boardCfg_.radiationTiltDbPerOct, corner = boardCfg_.radiationTiltCornerHz;
+        if (mics_.modes > 0 && tilt != 0.0 && std::isfinite(tilt) && corner > 0.0 && std::isfinite(corner)) {
+            micsTilted_ = mics_;
+            applyRadiationTilt(micsTilted_, boardModel_, tilt, corner);
+        }
+    }
     const double g = boardCfg_.enabled ? std::clamp(boardCfg_.sympathetic, 0.0, 1.5) : 0.0;
     const double cutoff = boardCfg_.loopCutoffHz > 0.0 ? boardCfg_.loopCutoffHz
                                                       : loopCutoffForTier(boardCfg_.tier, boardCfg_.plate);
@@ -164,12 +173,16 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     cullOffsetDb_ = 0.0f;
     if (board) {
         if (!loadSoundboard(board_, boardModel_, fs_)) return false;
-        const bool mics = mics_.modes == boardModel_.modes && mics_.modes > 0;
-        if (mics) loadMicGains(board_, mics_);
+        // micGains(): with the radiation tilt on, the tilted gains feed both the
+        // board modes and, through outTransfer, the direct path's level
+        // (hfGain_ below), so the two still join at the top of the modal range.
+        const MicGains& micsOut = micGains();
+        const bool mics = micsOut.modes == boardModel_.modes && micsOut.modes > 0;
+        if (mics) loadMicGains(board_, micsOut);
         // Transfer from a bridge shape to output channel p: the microphone's
         // (complex per-mode gains) or the v0 pickup's.
         auto outTransfer = [&](const double* shape, int p, double f) {
-            return mics ? micModalTransfer(boardModel_, shape, mics_.row(p), f)
+            return mics ? micModalTransfer(boardModel_, shape, micsOut.row(p), f)
                         : boardModalAdmittance(boardModel_, shape,
                                                boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, f);
         };

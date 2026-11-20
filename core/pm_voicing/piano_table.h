@@ -97,6 +97,7 @@ struct TableOptions {
     double stringLossScale = 1.0;     // x b1
     double hfLossScale = 1.0;         // x b3
     double inharmonicityScale = 1.0;  // x B with f1 kept (f0 = f1 / sqrt(1 + B))
+    double feltDampingScale = 1.0;    // x feltMu (Hunt-Crossley damping)
     double matingSpreadM = 15e-6;     // hammer-string offsets, +- metres
     std::uint64_t seed = 1;           // detuning and mating offsets
 };

@@ -172,7 +172,7 @@ void buildPianoTable(PianoTable& table, const TableOptions& opt) noexcept {
             k.feltP = p;
             k.hammerMass *= opt.hammerMassScale;
         }
-        k.feltMu = 0.04;
+        k.feltMu = 0.04 * opt.feltDampingScale;
         k.strikePos = std::clamp(interpLin(kStrike, key) * opt.strikePosScale, 0.02, 0.30);
         // Contact oversampling: keeps the substep short against the contact
         // time and the highest partials. With R = 1 throughout, partial

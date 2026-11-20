@@ -125,6 +125,9 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
         {PM_PARAM_SOUNDBOARD_ENABLED, s.board.enabled ? 1.0 : 0.0},
         {PM_PARAM_SYMPATHETIC, s.board.sympathetic}, {PM_PARAM_QUALITY_TIER, static_cast<double>(s.board.tier)},
         {PM_PARAM_LOOP_CUTOFF_HZ, s.board.loopCutoffHz}, {PM_PARAM_VOICING_BOARD_DAMPING, s.board.dampingScale},
+        {PM_PARAM_VOICING_RADIATION_TILT, s.board.radiationTiltDbPerOct},
+        {PM_PARAM_VOICING_RADIATION_CORNER_HZ, s.board.radiationTiltCornerHz},
+        {PM_PARAM_VOICING_FELT_DAMPING, s.voicing.feltDampingScale},
         {PM_PARAM_KNOCK_LEVEL, s.knock >= 0.0 ? s.knock : std::nan("")},
         {PM_PARAM_DAMPER_NOISE_LEVEL, s.damperNoise >= 0.0 ? s.damperNoise : std::nan("")},
         {PM_PARAM_ROOM_ENABLED, s.room ? 1.0 : 0.0}, {PM_PARAM_ROOM_LEVEL_DB, s.roomLevel},
@@ -192,6 +195,9 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
         s.board.tier = static_cast<pm::QualityTier>(static_cast<int>(get(PM_PARAM_QUALITY_TIER)));
         s.board.loopCutoffHz = get(PM_PARAM_LOOP_CUTOFF_HZ);
         s.board.dampingScale = get(PM_PARAM_VOICING_BOARD_DAMPING);
+        s.board.radiationTiltDbPerOct = get(PM_PARAM_VOICING_RADIATION_TILT);
+        s.board.radiationTiltCornerHz = get(PM_PARAM_VOICING_RADIATION_CORNER_HZ);
+        s.voicing.feltDampingScale = get(PM_PARAM_VOICING_FELT_DAMPING);
         s.knock = get(PM_PARAM_KNOCK_LEVEL);
         s.damperNoise = get(PM_PARAM_DAMPER_NOISE_LEVEL);
         s.room = get(PM_PARAM_ROOM_ENABLED) >= 0.5;

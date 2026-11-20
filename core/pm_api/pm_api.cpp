@@ -145,6 +145,9 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
         case PM_PARAM_VOICING_HF_LOSS: engine->voicing.hfLossScale = value; return 1;
         case PM_PARAM_VOICING_INHARMONICITY: engine->voicing.inharmonicityScale = value; return 1;
         case PM_PARAM_VOICING_BOARD_DAMPING: engine->board.dampingScale = value; return 1;
+        case PM_PARAM_VOICING_RADIATION_TILT: engine->board.radiationTiltDbPerOct = value; return 1;
+        case PM_PARAM_VOICING_RADIATION_CORNER_HZ: engine->board.radiationTiltCornerHz = value; return 1;
+        case PM_PARAM_VOICING_FELT_DAMPING: engine->voicing.feltDampingScale = value; return 1;
         case PM_PARAM_SOUNDBOARD_ENABLED: engine->board.enabled = value >= 0.5; return 1;
         case PM_PARAM_SYMPATHETIC: engine->board.sympathetic = value; return 1;
         case PM_PARAM_KNOCK_LEVEL: e.setNoiseLevels(static_cast<float>(value), e.damperNoiseLevel()); return 1;
@@ -203,6 +206,9 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_VOICING_HF_LOSS: *value = engine->voicing.hfLossScale; return 1;
         case PM_PARAM_VOICING_INHARMONICITY: *value = engine->voicing.inharmonicityScale; return 1;
         case PM_PARAM_VOICING_BOARD_DAMPING: *value = engine->board.dampingScale; return 1;
+        case PM_PARAM_VOICING_RADIATION_TILT: *value = engine->board.radiationTiltDbPerOct; return 1;
+        case PM_PARAM_VOICING_RADIATION_CORNER_HZ: *value = engine->board.radiationTiltCornerHz; return 1;
+        case PM_PARAM_VOICING_FELT_DAMPING: *value = engine->voicing.feltDampingScale; return 1;
         case PM_PARAM_SOUNDBOARD_ENABLED: *value = engine->board.enabled ? 1.0 : 0.0; return 1;
         case PM_PARAM_SYMPATHETIC: *value = engine->board.sympathetic; return 1;
         case PM_PARAM_QUALITY_TIER: *value = static_cast<double>(engine->board.tier); return 1;

@@ -70,6 +70,9 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_VOICING_INHARMONICITY, "voicing_inharmonicity", "Inharmonicity", "", 0.0, 2.0, 1.0, 1.0, LIN, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_BOARD_DAMPING, "voicing_board_damping", "Board Damping", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_TOUCH, "touch", "Touch", "", 0.0, 2.0, 1.0, 1.0, INT, A, NRT, 3, kTouchNames},
+    {PM_PARAM_VOICING_RADIATION_TILT, "voicing_radiation_tilt", "Radiation Tilt", "dB/oct", -9.0, 0.0, 0.0, 0.0, LIN, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_RADIATION_CORNER_HZ, "voicing_radiation_corner_hz", "Radiation Tilt Corner", "Hz", 250.0, 8000.0, 1000.0, 1000.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_FELT_DAMPING, "voicing_felt_damping", "Felt Damping", "", 0.25, 8.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
 };
 
 constexpr int kCount = static_cast<int>(sizeof(kParams) / sizeof(kParams[0]));
@@ -81,7 +84,7 @@ constexpr bool idsDense() {
     return true;
 }
 static_assert(idsDense(), "kParams must list ids 0..N-1 in order");
-static_assert(kCount == PM_PARAM_TOUCH + 1, "every pm_param needs a descriptor");
+static_assert(kCount == PM_PARAM_VOICING_FELT_DAMPING + 1, "every pm_param needs a descriptor");
 
 }  // namespace
 
