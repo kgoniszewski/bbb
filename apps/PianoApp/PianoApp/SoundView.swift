@@ -32,9 +32,10 @@ struct SoundContent: View {
 
     /// Groups by key; a visible parameter not listed goes to the last group.
     static let groupKeys: [(title: String, keys: [String])] = [
+        ("Volume", ["master_gain_db"]),
+        ("EQ", ["bass_db", "mid_db", "treble_db"]),
         ("Microphones", ["stereo_width"]),
         ("Room", ["room_enabled", "room_level_db", "room_decay_s", "room_size", "room_hf_ratio", "room_early_late"]),
-        ("Tone", ["treble_db", "master_gain_db"]),
         ("Touch & instrument", []),
     ]
 

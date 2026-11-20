@@ -344,9 +344,17 @@ public:
     // Atomic parameters, any thread.
     void setMasterGainDb(float db) noexcept { masterGainDb_.store(db, std::memory_order_relaxed); }
     void setStereoWidth(float w) noexcept { width_.store(w, std::memory_order_relaxed); }
+    // Tone EQ on the dry microphone pair, after the stereo width and before
+    // the room, in the order bass, mid, treble; each gain in dB clamped to
+    // [-12, 12], latched and glided like the treble (exactly 0 dB bypasses
+    // the band, bit-identical to the engine without it).
+    // Bass: RBJ low shelf, S = 1, at kBassHz. Mid: RBJ peaking EQ at kMidHz, Q kMidQ.
+    static constexpr double kBassHz = 200.0, kMidHz = 1000.0, kMidQ = 0.7;
+    void setBassDb(float db) noexcept { bassDb_.store(db, std::memory_order_relaxed); }
+    void setMidDb(float db) noexcept { midDb_.store(db, std::memory_order_relaxed); }
     // Treble: second-order high shelf (RBJ, S = 1) at kTrebleHz on the dry
     // microphone pair, after the stereo width and before the room, gain in
-    // dB clamped to [-12, 6]. Default 0 dB (off): A/B round 4 (2026-11-20)
+    // dB clamped to [-12, 12]. Default 0 dB (off): A/B round 4 (2026-11-20)
     // replaced the interim -9 dB shelf of rounds 1-3 with the radiation tilt
     // (SoundboardConfig::radiationTiltDbPerOct). Latched on the 32-sample control grid and
     // glided over a few ticks; exactly 0 dB bypasses the filter
@@ -430,6 +438,8 @@ public:
     float masterGainDb() const noexcept { return masterGainDb_.load(std::memory_order_relaxed); }
     float stereoWidth() const noexcept { return width_.load(std::memory_order_relaxed); }
     float trebleDb() const noexcept { return trebleDb_.load(std::memory_order_relaxed); }
+    float bassDb() const noexcept { return bassDb_.load(std::memory_order_relaxed); }
+    float midDb() const noexcept { return midDb_.load(std::memory_order_relaxed); }
     bool roomEnabled() const noexcept { return roomOn_.load(std::memory_order_relaxed); }
     float roomLevelDb() const noexcept { return roomLevelDb_.load(std::memory_order_relaxed); }
     float roomDecay() const noexcept { return roomDecay_.load(std::memory_order_relaxed); }
@@ -551,8 +561,8 @@ private:
     void resetState() noexcept;
     void warmUp() noexcept;
     void readParams() noexcept;
-    void latchTreble(bool snap) noexcept;
-    void processTreble(float* mL, float* mR, int n, bool final) noexcept;
+    void latchEq(bool snap) noexcept;
+    void processEq(float* mL, float* mR, int n, bool final) noexcept;
     void drainQueue(const ClockMapping* clock) noexcept;
     bool insertPending(std::int64_t when, const Event& e) noexcept;
     void applyEvent(const Event& e, std::int64_t now) noexcept;
@@ -673,11 +683,26 @@ private:
     // Output stage.
     float gainL_[kNumKeys]{}, gainR_[kNumKeys]{};
     float appliedWidth_ = -1.0f;
-    // Treble shelf: latched target and gliding gain (dB), coefficients
-    // (b0..b2, a1, a2 normalised) and direct-form-I state per channel.
-    float trebleTarget_ = 0.0f, trebleCur_ = 0.0f;
-    float shB_[3]{1.0f, 0.0f, 0.0f}, shA_[2]{};
-    float shX_[2][2]{}, shY_[2][2]{};
+    // One EQ band (bass, mid or treble): latched target and gliding gain
+    // (dB), coefficients (b0..b2, a1, a2 normalised) and direct-form-I state
+    // per channel, in precision T. The bass and mid run in double: a float
+    // DF-I low shelf at 200 Hz has a rounding-noise gain that puts its own
+    // noise near -90 dB re peak (measured as the buffer-size variance of the
+    // output at +6 dB); the treble stays float (its output unchanged).
+    enum class EqKind { LowShelf, Peak, HighShelf };
+    template <typename T>
+    struct EqBand {
+        float target = 0.0f, cur = 0.0f;
+        T b[3]{1, 0, 0}, a[2]{};
+        T x[2][2]{}, y[2][2]{};
+        void latch(float db, bool snap, EqKind kind, double f0, double q, double fs) noexcept;
+        void process(float* mL, float* mR, int n, bool final) noexcept;
+        void clearState() noexcept {
+            for (int c = 0; c < 2; ++c) x[c][0] = x[c][1] = y[c][0] = y[c][1] = T(0);
+        }
+    };
+    EqBand<double> bass_, mid_;
+    EqBand<float> treble_;
     float masterGain_ = 1.0f, masterTarget_ = 1.0f;
     float dcX_[2]{}, dcY_[2]{};
     float dcCoef_ = 0.9995f;
@@ -695,6 +720,7 @@ private:
     std::atomic<float> masterGainDb_{0.0f};
     std::atomic<float> width_{0.7f};
     std::atomic<float> trebleDb_{kDefaultTrebleDb};
+    std::atomic<float> bassDb_{0.0f}, midDb_{0.0f};
     std::atomic<bool> roomOn_{false};
     std::atomic<float> roomLevelDb_{float(Room::kDefaultLevelDb)}, roomDecay_{1.8f}, roomHf_{0.5f}, roomSize_{1.0f},
         roomBal_{0.5f};

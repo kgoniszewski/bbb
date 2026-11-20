@@ -60,7 +60,7 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_ROOM_HF_RATIO, "room_hf_ratio", "Room HF Decay Ratio", "", 0.1, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_SIZE, "room_size", "Room Size", "", 0.5, 2.0, 1.0, 1.0, LOG, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_EARLY_LATE, "room_early_late", "Early / Late Balance", "", 0.0, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
-    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 6.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 12.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_VOICING_FELT_HARDNESS, "voicing_felt_hardness", "Felt Hardness", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_FELT_EXPONENT, "voicing_felt_exponent", "Felt Stiffening Offset", "", -1.0, 1.0, 0.0, 0.0, LIN, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_HAMMER_MASS, "voicing_hammer_mass", "Hammer Mass", "", 0.5, 2.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
@@ -73,6 +73,8 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_VOICING_RADIATION_TILT, "voicing_radiation_tilt", "Radiation Tilt", "dB/oct", -9.0, 0.0, -4.0, -4.0, LIN, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_RADIATION_CORNER_HZ, "voicing_radiation_corner_hz", "Radiation Tilt Corner", "Hz", 250.0, 8000.0, 700.0, 700.0, LOG, B, HID | NRT, 0, nullptr},
     {PM_PARAM_VOICING_FELT_DAMPING, "voicing_felt_damping", "Felt Damping", "", 0.25, 8.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_BASS_DB, "bass_db", "Bass", "dB", -12.0, 12.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_MID_DB, "mid_db", "Mid", "dB", -12.0, 12.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
 };
 
 constexpr int kCount = static_cast<int>(sizeof(kParams) / sizeof(kParams[0]));
@@ -84,7 +86,7 @@ constexpr bool idsDense() {
     return true;
 }
 static_assert(idsDense(), "kParams must list ids 0..N-1 in order");
-static_assert(kCount == PM_PARAM_VOICING_FELT_DAMPING + 1, "every pm_param needs a descriptor");
+static_assert(kCount == PM_PARAM_MID_DB + 1, "every pm_param needs a descriptor");
 
 }  // namespace
 

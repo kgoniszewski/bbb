@@ -312,7 +312,7 @@ low-frequency regime, A/B), `--sympathetic G`, `--knock N`,
 pickups instead of the two microphones, A/B), `--dry` (room off; it is on
 by default and adds its decay time to the default tail), `--room-level DB`
 (default -9), `--room-decay S` (default 1.8), `--room-size X` (0.5-2),
-`--room-hf R`, `--treble DB` (high shelf at 3 kHz on the microphones,
+`--room-hf R`, `--bass DB` (low shelf at 200 Hz), `--mid DB` (peak at 1 kHz, Q 0.7), `--treble DB` (high shelf at 3 kHz on the microphones; all three -12..12 dB,
 default 0). Presets: `--preset FILE` (JSON, applied after all other
 options), `--save-preset FILE` (the effective settings, full state).
 `--help` lists all options.

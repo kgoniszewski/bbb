@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 20
+#define PM_API_VERSION_MINOR 21
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -90,7 +90,7 @@ enum pm_param {
     PM_PARAM_ROOM_HF_RATIO = 26,          /* T60(8 kHz) / T60(mid), 0.1 .. 1, default 0.5 */
     PM_PARAM_ROOM_SIZE = 27,              /* room scale 0.5 .. 2, default 1 (change fades out and in) */
     PM_PARAM_ROOM_EARLY_LATE = 28,        /* 0 early only, 1 late only, 0.5 both at physical level (default) */
-    PM_PARAM_TREBLE_DB = 29,              /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default 0 (off; -9 until A/B round 4, 2026-11-20) */
+    PM_PARAM_TREBLE_DB = 29,              /* -12 .. 12 dB high shelf at 3 kHz on the microphones, default 0 (off; -9 until A/B round 4, 2026-11-20) */
     /* API 0.19: global voicing scales on the per-key table (hidden, for
      * listening tests). Take effect at the next pm_engine_prepare. */
     PM_PARAM_VOICING_FELT_HARDNESS = 30,  /* x felt force at the key's reference compression, 0.25 .. 4, default 1 */
@@ -109,7 +109,10 @@ enum pm_param {
     /* API 0.20 (hidden, prepare class, for listening tests): */
     PM_PARAM_VOICING_RADIATION_TILT = 39, /* dB/octave on the microphones' board-mode gains above the corner, -9 .. 0, default -4 dB/oct above 700 Hz after A/B round 4, 2026-11-20 */
     PM_PARAM_VOICING_RADIATION_CORNER_HZ = 40, /* corner of that tilt, 250 .. 8000 Hz, default 700 (A/B round 4, 2026-11-20) */
-    PM_PARAM_VOICING_FELT_DAMPING = 41    /* x felt Hunt-Crossley damping feltMu, 0.25 .. 8, default 1 */
+    PM_PARAM_VOICING_FELT_DAMPING = 41,   /* x felt Hunt-Crossley damping feltMu, 0.25 .. 8, default 1 */
+    /* API 0.21 (tone EQ on the microphones, next to the treble shelf): */
+    PM_PARAM_BASS_DB = 42,                /* -12 .. 12 dB low shelf (S = 1) at 200 Hz, default 0 (off) */
+    PM_PARAM_MID_DB = 43                  /* -12 .. 12 dB peaking EQ at 1 kHz, Q 0.7, default 0 (off) */
 };
 
 /* Partials below the loop band are fed back by the string-board loop

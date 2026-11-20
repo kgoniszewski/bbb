@@ -1,6 +1,8 @@
-// Treble shelf on the dry microphone pair (Engine::setTrebleDb): 0 dB is the
-// unfiltered engine, the measured response is the 3 kHz high shelf, a change
-// keeps the buffer-size invariance, and idle sleep still ends in exact zeros.
+// Tone EQ on the dry microphone pair (Engine::setTrebleDb, setBassDb,
+// setMidDb): 0 dB is the unfiltered engine, the measured responses are the
+// 3 kHz high shelf, the 200 Hz low shelf and the 1 kHz peak, a change keeps
+// the buffer-size invariance and does not click, idle sleep still ends in
+// exact zeros, and the range ends are stable.
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -69,9 +71,18 @@ void prepareBrightVoicing(pm::Engine& eng, int maxFrames) {
     eng.prepare(kFs, maxFrames, t);
 }
 
-Stereo renderChange(float db0, float db1, int at, int n, int block, const std::vector<pm::Event>& ev) {
+enum Band { kTreble, kBass, kMid };
+
+void setBand(pm::Engine& eng, Band band, float db) {
+    if (band == kBass) eng.setBassDb(db);
+    else if (band == kMid) eng.setMidDb(db);
+    else eng.setTrebleDb(db);
+}
+
+Stereo renderChange(float db0, float db1, int at, int n, int block, const std::vector<pm::Event>& ev,
+                    Band band = kTreble) {
     pm::Engine eng;
-    eng.setTrebleDb(db0);
+    setBand(eng, band, db0);
     prepareBrightVoicing(eng, 512);
     Stereo s;
     s.l.assign(n, 0.0f);
@@ -79,7 +90,7 @@ Stereo renderChange(float db0, float db1, int at, int n, int block, const std::v
     std::size_t next = 0;
     for (int pos = 0; pos < n; pos += block) {
         const int m = std::min(block, n - pos);
-        if (pos <= at && at < pos + m) eng.setTrebleDb(db1);
+        if (pos <= at && at < pos + m) setBand(eng, band, db1);
         while (next < ev.size() && ev[next].time < eng.sampleTime() + static_cast<std::uint64_t>(m))
             eng.pushEvent(ev[next++]);
         eng.render(s.l.data() + pos, s.r.data() + pos, m, nullptr);
@@ -154,10 +165,10 @@ struct IdleRun {
     bool idleAtEnd = false;
     int lastNonZero = -1;  // last sample that is not exactly zero
 };
-IdleRun idleRun(float db) {
+IdleRun idleRun(float db, Band band = kTreble) {
     const int n = static_cast<int>(6.0 * kFs), block = 64;
     pm::Engine eng;
-    eng.setTrebleDb(db);
+    setBand(eng, band, db);
     eng.prepare(kFs, block);
     const std::vector<pm::Event> ev = {noteOn(0, 96, 80), noteOff(static_cast<std::uint64_t>(0.2 * kFs), 96)};
     std::vector<float> l(block), r(block);
@@ -187,4 +198,151 @@ TEST(treble_idle_exact_zero) {
     // The 5 Hz DC blocker after the shelf reaches exact zero on its own
     // (as at 0 dB), from a slightly different last value.
     CHECK(a.lastNonZero > 0 && a.lastNonZero < static_cast<int>(5.9 * kFs));
+    // Bass and mid at +-12 dB: the same idle behaviour and exact zeros.
+    for (Band band : {kBass, kMid})
+        for (float db : {-12.0f, 12.0f}) {
+            const IdleRun c = idleRun(db, band);
+            std::printf("  %s %+.0f dB: idle buffers %d, last non-zero sample at %.3f s\n", band == kBass ? "bass" : "mid",
+                        db, c.idleBuffers, c.lastNonZero / kFs);
+            CHECK(c.idleBuffers == b.idleBuffers);
+            CHECK(c.idleAtEnd);
+            CHECK(c.lastNonZero > 0 && c.lastNonZero < static_cast<int>(5.9 * kFs));
+        }
+}
+
+// ---- Bass (200 Hz low shelf) and mid (1 kHz peak, Q 0.7) ----
+
+// (e) 0 dB bypass: bass and mid set to 0 explicitly, and glided from -3 to
+// 0 dB in the silence before the first note, are equal sample for sample to
+// the engine that never sets them.
+TEST(bass_mid_zero_is_bypass) {
+    const int n = 30000;
+    const std::vector<pm::Event> ev = {noteOn(2048, 36, 90), noteOn(2050, 72, 100)};
+    pm::Engine a;
+    CHECK(a.bassDb() == 0.0f && a.midDb() == 0.0f);
+    prepareBrightVoicing(a, 512);
+    const Stereo ra = renderEngine(a, ev, n, 64);
+    for (Band band : {kBass, kMid}) {
+        const Stereo r0 = renderChange(0.0f, 0.0f, 0, n, 64, ev, band);
+        const Stereo rb = renderChange(-3.0f, 0.0f, 0, n, 64, ev, band);
+        const Stereo rc = renderChange(-3.0f, -3.0f, 0, n, 64, ev, band);
+        std::printf("  %s: 0 dB vs unset %.3g, glide -3 -> 0 dB %.3g; vs -3 dB: %.3g\n", band == kBass ? "bass" : "mid",
+                    maxDiff(ra, r0), maxDiff(ra, rb), maxDiff(ra, rc));
+        CHECK(maxDiff(ra, r0) == 0.0);
+        CHECK(maxDiff(ra, rb) == 0.0);
+        CHECK(maxDiff(ra, rc) > 1e-4);
+    }
+}
+
+namespace {
+// Gain of the band at fc (dB) measured as in (b): band energy of one held
+// note with the EQ at `db` against 0 dB. The probe note puts a partial at
+// (or next to) fc so that the band filter is dominated by it and not by
+// partials on the EQ's slopes.
+double bandGainDb(Band band, float db, int note, double fc) {
+    const int n = 24000;
+    const std::vector<pm::Event> ev = {noteOn(0, note, 100), noteOff(20000, note)};
+    const Stereo r0 = renderChange(0.0f, 0.0f, 0, n, 64, ev, band);
+    const Stereo r1 = renderChange(db, db, 0, n, 64, ev, band);
+    return 10.0 * std::log10((bandEnergy(r1.l, fc) + bandEnergy(r1.r, fc)) / (bandEnergy(r0.l, fc) + bandEnergy(r0.r, fc)));
+}
+}  // namespace
+
+// (f) Responses. Probes: G1 (49 Hz), G3 (196 Hz), C7 (2093 Hz), G2 (98 Hz),
+// B5 (988 Hz) and the 5th partial of C7 (about 10.5 kHz) in a 10 kHz band.
+// RBJ design values at +6 dB: low shelf 5.98 dB at 49 Hz, 3.12 at 196 Hz,
+// 0.00 at 2 kHz; peak 6.00 at 988 Hz, 0.13 at 98 Hz, 0.10 at 10 kHz.
+TEST(bass_mid_response) {
+    for (float db : {6.0f, -6.0f}) {
+        const double s = db > 0.0f ? 1.0 : -1.0;
+        const double b50 = bandGainDb(kBass, db, 31, 49.0), b200 = bandGainDb(kBass, db, 55, 196.0),
+                     b2k = bandGainDb(kBass, db, 96, 2093.0);
+        const double m1k = bandGainDb(kMid, db, 83, 987.8), m100 = bandGainDb(kMid, db, 43, 98.0),
+                     m10k = bandGainDb(kMid, db, 96, 10000.0);
+        std::printf("  bass %+.0f dB: 49 Hz %+.2f, 196 Hz %+.2f, 2093 Hz %+.2f dB\n", db, b50, b200, b2k);
+        std::printf("  mid  %+.0f dB: 988 Hz %+.2f, 98 Hz %+.2f, 10 kHz %+.2f dB\n", db, m1k, m100, m10k);
+        CHECK(std::fabs(b50 - s * 6.0) <= 0.5);
+        CHECK(std::fabs(b200 - s * 3.1) <= 0.5);
+        CHECK(std::fabs(b2k) < 0.5);
+        CHECK(std::fabs(m1k - s * 6.0) <= 0.5);
+        CHECK(std::fabs(m100) < 1.5);
+        CHECK(std::fabs(m10k) < 1.5);
+    }
+}
+
+// (g) A step of the gain during a held note glides: the change keeps the
+// buffer-size invariance, and the output's largest sample-to-sample step
+// around the change is no larger than with the final gain held throughout
+// (a click would show as a larger step).
+TEST(bass_mid_change_glides) {
+    const int n = 30000, at = 8192;
+    for (Band band : {kBass, kMid}) {
+        const char* name = band == kBass ? "bass" : "mid";
+        const Stereo ref = renderChange(0.0f, 12.0f, at, n, 64, chord(), band);
+        const Stereo flat = renderChange(0.0f, 0.0f, at, n, 64, chord(), band);
+        const Stereo held = renderChange(12.0f, 12.0f, at, n, 64, chord(), band);
+        CHECK(maxDiff(ref, flat) > 1e-4);
+        for (int block : {32, 37, 512}) {
+            const Stereo s = renderChange(0.0f, 12.0f, at, n, block, chord(), band);
+            const double d = maxDiff(s, ref);
+            const double db = 20.0 * std::log10(d / peakAbs(ref.l) + 1e-30);
+            std::printf("  %s 0 -> +12 dB, block %3d: max difference %.1f dB re peak\n", name, block, db);
+            if (block % 32 == 0) CHECK(d == 0.0);
+            else CHECK_LE(db, -100.0);
+        }
+        auto maxStep = [&](const Stereo& x) {
+            double m = 0.0;
+            for (int i = at - 64; i < at + 2048; ++i)
+                m = std::max(m, std::max(double(std::fabs(x.l[i] - x.l[i - 1])), double(std::fabs(x.r[i] - x.r[i - 1]))));
+            return m;
+        };
+        const double sStep = maxStep(ref), sHeld = maxStep(held), sFlat = maxStep(flat);
+        std::printf("  %s 0 -> +12 dB: max step %.4g (0 dB held %.4g, +12 dB held %.4g)\n", name, sStep, sFlat, sHeld);
+        CHECK_LE(sStep, 1.05 * std::max(sHeld, sFlat));
+    }
+}
+
+// (h) Range ends: every combination of -12 / +12 dB on the three bands,
+// held and switched mid-note, stays finite and bounded at 44.1, 48 and 96 kHz
+// (exact zeros at the end are checked in (d)).
+TEST(eq_range_ends_stable) {
+    for (double fs : {44100.0, 48000.0, 96000.0}) {
+        const int n = static_cast<int>(1.5 * fs), block = 64;
+        double worst = 0.0, ref = 0.0;
+        bool finite = true;
+        for (int combo = -1; combo < 8; ++combo) {
+            pm::Engine eng;
+            eng.prepare(fs, block);
+            auto set = [&](int c) {
+                if (c < 0) return;
+                eng.setBassDb(c & 1 ? 12.0f : -12.0f);
+                eng.setMidDb(c & 2 ? 12.0f : -12.0f);
+                eng.setTrebleDb(c & 4 ? 12.0f : -12.0f);
+            };
+            set(combo);
+            const std::vector<pm::Event> ev = {noteOn(0, 21, 127), noteOn(5, 60, 127), noteOn(9, 108, 127),
+                                               noteOff(static_cast<std::uint64_t>(0.3 * fs), 21),
+                                               noteOff(static_cast<std::uint64_t>(0.3 * fs), 60),
+                                               noteOff(static_cast<std::uint64_t>(0.3 * fs), 108)};
+            std::vector<float> l(block), r(block);
+            std::size_t next = 0;
+            double peak = 0.0;
+            for (int pos = 0; pos < n; pos += block) {
+                if (combo >= 0 && pos == (n / 6) / block * block) set(7 - combo);
+                while (next < ev.size() && ev[next].time < eng.sampleTime() + static_cast<std::uint64_t>(block))
+                    eng.pushEvent(ev[next++]);
+                eng.render(l.data(), r.data(), block, nullptr);
+                for (int i = 0; i < block; ++i) {
+                    finite = finite && std::isfinite(l[i]) && std::isfinite(r[i]);
+                    peak = std::max(peak, double(std::max(std::fabs(l[i]), std::fabs(r[i]))));
+                }
+            }
+            if (combo < 0) ref = peak;
+            else worst = std::max(worst, peak);
+        }
+        std::printf("  fs %.0f: peak at 0 dB %.3g, worst at the range ends %.3g\n", fs, ref, worst);
+        CHECK(finite);
+        CHECK(ref > 1e-3);
+        CHECK(worst < 64.0 * ref);  // three bands at +12 dB: at most 4x each
+    }
 }

@@ -47,13 +47,13 @@ double get(const pm_engine* e, int32_t id) {
 }  // namespace
 
 TEST(params_every_id_has_one_descriptor) {
-    CHECK(pm_param_count() == PM_PARAM_VOICING_FELT_DAMPING + 1);
+    CHECK(pm_param_count() == PM_PARAM_MID_DB + 1);
     std::set<int32_t> ids;
     std::set<std::string> keys;
     for (int32_t i = 0; i < pm_param_count(); ++i) {
         pm_param_info_t d{};
         CHECK(pm_param_info(i, &d) == 1);
-        CHECK(d.id >= 0 && d.id <= PM_PARAM_VOICING_FELT_DAMPING);
+        CHECK(d.id >= 0 && d.id <= PM_PARAM_MID_DB);
         CHECK(ids.insert(d.id).second);
         CHECK(d.key && keys.insert(d.key).second);
         if (!snakeCase(d.key)) std::printf("  key not snake_case: %s\n", d.key);
@@ -75,7 +75,7 @@ TEST(params_every_id_has_one_descriptor) {
             for (int32_t k = 0; k < d.enum_count; ++k) CHECK(snakeCase(d.enum_names[k]));
         }
     }
-    for (int32_t id = 0; id <= PM_PARAM_VOICING_FELT_DAMPING; ++id) CHECK(ids.count(id) == 1);
+    for (int32_t id = 0; id <= PM_PARAM_MID_DB; ++id) CHECK(ids.count(id) == 1);
     pm_param_info_t d{};
     CHECK(pm_param_info(-1, &d) == 0);
     CHECK(pm_param_info(pm_param_count(), &d) == 0);
