@@ -71,9 +71,10 @@ int main(void) {
     EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_SIZE, &v) == 1 && v == 1.5);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_ROOM_EARLY_LATE, 0.75) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_ROOM_EARLY_LATE, &v) == 1 && v == 0.75);
-    /* Treble shelf (API 0.16): default -3 dB. */
+    /* Treble shelf (API 0.16): default 0 dB, off (A/B round 4, 2026-11-20: replaced
+       by the radiation tilt; was -9 dB after rounds 1-3, -3 before). */
     EXPECT(PM_API_VERSION_MINOR >= 16);
-    EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == -3.0);
+    EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == 0.0);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_TREBLE_DB, -6.0) == 1);
     EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == -6.0);
     EXPECT(pm_engine_set_param(eng, PM_PARAM_TREBLE_DB, -3.0) == 1);
@@ -81,13 +82,13 @@ int main(void) {
     EXPECT(PM_API_VERSION_MINOR >= 17);
     {
         pm_param_info_t pi;
-        EXPECT(pm_param_count() == PM_PARAM_TREBLE_DB + 1);
+        EXPECT(pm_param_count() == PM_PARAM_MID_DB + 1);
         EXPECT(pm_param_info(PM_PARAM_ROOM_ENABLED, &pi) == 1 && pi.id == PM_PARAM_ROOM_ENABLED);
         EXPECT(pi.default_value == 1.0 && pi.engine_default == 0.0 && pi.cls == PM_PARAM_CLASS_REALTIME);
         EXPECT(pm_param_id_from_key(pi.key) == PM_PARAM_ROOM_ENABLED);
         EXPECT(pm_param_info(pm_param_count(), &pi) == 0);
         EXPECT(pm_engine_set_param(eng, PM_PARAM_TREBLE_DB, 100.0) == 1);
-        EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == 6.0);
+        EXPECT(pm_engine_get_param(eng, PM_PARAM_TREBLE_DB, &v) == 1 && v == 12.0); /* range -12..12 since API 0.21 */
         EXPECT(pm_engine_set_param(eng, PM_PARAM_TREBLE_DB, -3.0) == 1);
     }
     /* Presets (API 0.18). */

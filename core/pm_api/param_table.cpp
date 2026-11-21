@@ -19,6 +19,7 @@ constexpr int INT = PM_PARAM_CURVE_INTEGER;
 
 constexpr const char* kSchedulingNames[] = {"lowest_latency", "constant_latency"};
 constexpr const char* kTierNames[] = {"full", "balanced", "eco"};
+constexpr const char* kTouchNames[] = {"light", "medium", "strong"};
 
 // Keys are stable forever (pm_api.h); never rename one. Ranges: where the
 // engine clamped or rejected before API 0.17 the same bounds are used; the
@@ -28,16 +29,16 @@ constexpr const char* kTierNames[] = {"full", "balanced", "eco"};
 // SoundboardConfig, Room) and the pm_host_create overrides.
 constexpr pm_param_info_t kParams[] = {
     // id, key, name, unit, min, max, default (product), engine default, curve, class, flags, enum
-    {PM_PARAM_MASTER_GAIN_DB, "master_gain_db", "Master Gain", "dB", -96.0, 24.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
-    {PM_PARAM_STEREO_WIDTH, "stereo_width", "Stereo Width", "", 0.0, 1.0, 0.35, 0.35, LIN, A, AUTO, 0, nullptr},
+    {PM_PARAM_MASTER_GAIN_DB, "master_gain_db", "Master Volume", "dB", -96.0, 24.0, 16.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_STEREO_WIDTH, "stereo_width", "Stereo Width", "", 0.0, 1.0, 0.7, 0.7, LIN, A, AUTO, 0, nullptr},
     {PM_PARAM_SCHEDULING_MODE, "scheduling_mode", "Scheduling Mode", "", 0.0, 1.0, 0.0, 0.0, INT, A, HID, 2, kSchedulingNames},
     // 0 = max_frames of the next prepare (prepare stores that value).
     {PM_PARAM_CONSTANT_LATENCY_FRAMES, "constant_latency_frames", "Constant Latency", "frames", 0.0, 8192.0, 0.0, 0.0, INT, A, HID, 0, nullptr},
     {PM_PARAM_CULL_THRESHOLD_DB, "cull_threshold_db", "Culling Threshold", "dB", -200.0, 0.0, -100.0, -100.0, DB, A, HID, 0, nullptr},
     {PM_PARAM_CULLING_ENABLED, "culling_enabled", "Culling", "", 0.0, 1.0, 1.0, 1.0, BOOL, A, HID, 0, nullptr},
-    {PM_PARAM_VELOCITY_MIN, "velocity_min_mps", "Softest Hammer Speed", "m/s", 0.01, 10.0, 0.3, 0.3, LOG, A, NRT, 0, nullptr},
-    {PM_PARAM_VELOCITY_MAX, "velocity_max_mps", "Loudest Hammer Speed", "m/s", 0.01, 10.0, 5.5, 5.5, LOG, A, NRT, 0, nullptr},
-    {PM_PARAM_VELOCITY_EXPONENT, "velocity_exponent", "Velocity Curve", "", 0.1, 5.0, 1.5, 1.5, LOG, A, NRT, 0, nullptr},
+    {PM_PARAM_VELOCITY_MIN, "velocity_min_mps", "Softest Hammer Speed", "m/s", 0.01, 10.0, 0.3, 0.3, LOG, A, HID | NRT, 0, nullptr},
+    {PM_PARAM_VELOCITY_MAX, "velocity_max_mps", "Loudest Hammer Speed", "m/s", 0.01, 10.0, 5.5, 5.5, LOG, A, HID | NRT, 0, nullptr},
+    {PM_PARAM_VELOCITY_EXPONENT, "velocity_exponent", "Velocity Curve", "", 0.1, 5.0, 1.5, 1.5, LOG, A, HID | NRT, 0, nullptr},
     {PM_PARAM_A4_HZ, "a4_hz", "Reference Pitch A4", "Hz", 300.0, 600.0, 440.0, 440.0, LIN, B, REJ | NRT, 0, nullptr},
     {PM_PARAM_TUNING_STRETCH, "tuning_stretch", "Stretch Tuning", "", 0.0, 1.5, 1.0, 1.0, LIN, B, NRT, 0, nullptr},
     {PM_PARAM_EQUAL_TEMPERAMENT, "equal_temperament", "Plain Equal Temperament", "", 0.0, 1.0, 0.0, 0.0, BOOL, B, NRT, 0, nullptr},
@@ -59,7 +60,21 @@ constexpr pm_param_info_t kParams[] = {
     {PM_PARAM_ROOM_HF_RATIO, "room_hf_ratio", "Room HF Decay Ratio", "", 0.1, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_SIZE, "room_size", "Room Size", "", 0.5, 2.0, 1.0, 1.0, LOG, A, AUTO | SM, 0, nullptr},
     {PM_PARAM_ROOM_EARLY_LATE, "room_early_late", "Early / Late Balance", "", 0.0, 1.0, 0.5, 0.5, LIN, A, AUTO | SM, 0, nullptr},
-    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 6.0, -3.0, -3.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_TREBLE_DB, "treble_db", "Treble", "dB", -12.0, 12.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_VOICING_FELT_HARDNESS, "voicing_felt_hardness", "Felt Hardness", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_FELT_EXPONENT, "voicing_felt_exponent", "Felt Stiffening Offset", "", -1.0, 1.0, 0.0, 0.0, LIN, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_HAMMER_MASS, "voicing_hammer_mass", "Hammer Mass", "", 0.5, 2.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_STRIKE_POSITION, "voicing_strike_position", "Strike Position", "", 0.5, 2.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_STRING_LOSS, "voicing_string_loss", "String Loss", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_HF_LOSS, "voicing_hf_loss", "String HF Loss", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_INHARMONICITY, "voicing_inharmonicity", "Inharmonicity", "", 0.0, 2.0, 1.0, 1.0, LIN, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_BOARD_DAMPING, "voicing_board_damping", "Board Damping", "", 0.25, 4.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_TOUCH, "touch", "Touch", "", 0.0, 2.0, 1.0, 1.0, INT, A, NRT, 3, kTouchNames},
+    {PM_PARAM_VOICING_RADIATION_TILT, "voicing_radiation_tilt", "Radiation Tilt", "dB/oct", -9.0, 0.0, -4.0, -4.0, LIN, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_RADIATION_CORNER_HZ, "voicing_radiation_corner_hz", "Radiation Tilt Corner", "Hz", 250.0, 8000.0, 700.0, 700.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_VOICING_FELT_DAMPING, "voicing_felt_damping", "Felt Damping", "", 0.25, 8.0, 1.0, 1.0, LOG, B, HID | NRT, 0, nullptr},
+    {PM_PARAM_BASS_DB, "bass_db", "Bass", "dB", -12.0, 12.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
+    {PM_PARAM_MID_DB, "mid_db", "Mid", "dB", -12.0, 12.0, 0.0, 0.0, DB, A, AUTO | SM, 0, nullptr},
 };
 
 constexpr int kCount = static_cast<int>(sizeof(kParams) / sizeof(kParams[0]));
@@ -71,7 +86,7 @@ constexpr bool idsDense() {
     return true;
 }
 static_assert(idsDense(), "kParams must list ids 0..N-1 in order");
-static_assert(kCount == PM_PARAM_TREBLE_DB + 1, "every pm_param needs a descriptor");
+static_assert(kCount == PM_PARAM_MID_DB + 1, "every pm_param needs a descriptor");
 
 }  // namespace
 

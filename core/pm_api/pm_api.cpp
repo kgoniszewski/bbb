@@ -1,5 +1,7 @@
 #include "pm_api/pm_api.h"
 
+#include <algorithm>
+#include <cmath>
 #include <new>
 
 #include "pm_api/param_table.h"
@@ -8,7 +10,9 @@
 
 struct pm_engine {
     pm::Engine engine;
-    pm::VelocityCurve curve;
+    pm::VelocityCurve curve;      // as set through PM_PARAM_VELOCITY_*
+    pm::VelocityCurve effective;  // curve with the touch applied (the engine reads this)
+    int touch = 1;                // PM_PARAM_TOUCH
     pm::TableOptions voicing;
     pm::SoundboardConfig board;
 };
@@ -16,6 +20,17 @@ struct pm_engine {
 pm::Engine* pmEngineOf(pm_engine* engine) noexcept { return engine ? &engine->engine : nullptr; }
 
 namespace {
+// Touch scales the exponent of x^exponent: below 1 a given key velocity gives
+// a faster hammer (light), above 1 a slower one (strong); x = 0 and 1 keep vMin
+// and vMax. Medium multiplies by exactly 1, so it is bit-identical.
+constexpr double kTouchExponentScale[3] = {2.0 / 3.0, 1.0, 1.5};
+
+void applyVelocityCurve(pm_engine* e) noexcept {
+    e->effective = e->curve;
+    e->effective.exponent = e->curve.exponent * kTouchExponentScale[e->touch];
+    e->engine.setVelocityFunction(pm::velocityCurveFn, &e->effective);
+}
+
 static_assert(sizeof(pm_event) == sizeof(pm::Event), "pm_event must mirror pm::Event");
 static_assert(sizeof(pm_clock) == sizeof(pm::ClockMapping), "pm_clock must mirror ClockMapping");
 }  // namespace
@@ -37,7 +52,7 @@ const char* pm_version_string(void) {
 
 pm_engine* pm_engine_create(void) {
     pm_engine* e = new (std::nothrow) pm_engine();
-    if (e) e->engine.setVelocityFunction(pm::velocityCurveFn, &e->curve);
+    if (e) applyVelocityCurve(e);
     return e;
 }
 
@@ -92,6 +107,8 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
         case PM_PARAM_ROOM_SIZE: e.setRoomSize(static_cast<float>(value)); return 1;
         case PM_PARAM_ROOM_EARLY_LATE: e.setRoomEarlyLate(static_cast<float>(value)); return 1;
         case PM_PARAM_TREBLE_DB: e.setTrebleDb(static_cast<float>(value)); return 1;
+        case PM_PARAM_BASS_DB: e.setBassDb(static_cast<float>(value)); return 1;
+        case PM_PARAM_MID_DB: e.setMidDb(static_cast<float>(value)); return 1;
         case PM_PARAM_SCHEDULING_MODE:
             e.setSchedulingMode(value >= 0.5 ? pm::SchedulingMode::ConstantLatency
                                              : pm::SchedulingMode::LowestLatency);
@@ -111,13 +128,28 @@ int pm_engine_set_param(pm_engine* engine, int32_t id, double value) {
             if (id == PM_PARAM_VELOCITY_MIN) engine->curve.vMin = value;
             else if (id == PM_PARAM_VELOCITY_MAX) engine->curve.vMax = value;
             else engine->curve.exponent = value;
-            e.setVelocityFunction(pm::velocityCurveFn, &engine->curve);
+            applyVelocityCurve(engine);
             return 1;
         }
+        case PM_PARAM_TOUCH:
+            engine->touch = std::clamp(static_cast<int>(std::lround(value)), 0, 2);
+            applyVelocityCurve(engine);
+            return 1;
         case PM_PARAM_A4_HZ: engine->voicing.a4Hz = value; return 1;
         case PM_PARAM_TUNING_STRETCH: engine->voicing.stretch = value; return 1;
         case PM_PARAM_EQUAL_TEMPERAMENT: engine->voicing.equalTemperament = value >= 0.5; return 1;
         case PM_PARAM_UNISON_WIDTH: engine->voicing.unisonWidth = value; return 1;
+        case PM_PARAM_VOICING_FELT_HARDNESS: engine->voicing.feltHardness = value; return 1;
+        case PM_PARAM_VOICING_FELT_EXPONENT: engine->voicing.feltExponentOffset = value; return 1;
+        case PM_PARAM_VOICING_HAMMER_MASS: engine->voicing.hammerMassScale = value; return 1;
+        case PM_PARAM_VOICING_STRIKE_POSITION: engine->voicing.strikePosScale = value; return 1;
+        case PM_PARAM_VOICING_STRING_LOSS: engine->voicing.stringLossScale = value; return 1;
+        case PM_PARAM_VOICING_HF_LOSS: engine->voicing.hfLossScale = value; return 1;
+        case PM_PARAM_VOICING_INHARMONICITY: engine->voicing.inharmonicityScale = value; return 1;
+        case PM_PARAM_VOICING_BOARD_DAMPING: engine->board.dampingScale = value; return 1;
+        case PM_PARAM_VOICING_RADIATION_TILT: engine->board.radiationTiltDbPerOct = value; return 1;
+        case PM_PARAM_VOICING_RADIATION_CORNER_HZ: engine->board.radiationTiltCornerHz = value; return 1;
+        case PM_PARAM_VOICING_FELT_DAMPING: engine->voicing.feltDampingScale = value; return 1;
         case PM_PARAM_SOUNDBOARD_ENABLED: engine->board.enabled = value >= 0.5; return 1;
         case PM_PARAM_SYMPATHETIC: engine->board.sympathetic = value; return 1;
         case PM_PARAM_KNOCK_LEVEL: e.setNoiseLevels(static_cast<float>(value), e.damperNoiseLevel()); return 1;
@@ -156,6 +188,8 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_ROOM_SIZE: *value = e.roomSize(); return 1;
         case PM_PARAM_ROOM_EARLY_LATE: *value = e.roomEarlyLate(); return 1;
         case PM_PARAM_TREBLE_DB: *value = e.trebleDb(); return 1;
+        case PM_PARAM_BASS_DB: *value = e.bassDb(); return 1;
+        case PM_PARAM_MID_DB: *value = e.midDb(); return 1;
         case PM_PARAM_SCHEDULING_MODE: *value = static_cast<double>(e.schedulingMode()); return 1;
         case PM_PARAM_CONSTANT_LATENCY_FRAMES: *value = e.constantLatencyFrames(); return 1;
         case PM_PARAM_CULL_THRESHOLD_DB: *value = e.cullThresholdDb(); return 1;
@@ -163,10 +197,22 @@ int pm_engine_get_param(const pm_engine* engine, int32_t id, double* value) {
         case PM_PARAM_VELOCITY_MIN: *value = engine->curve.vMin; return 1;
         case PM_PARAM_VELOCITY_MAX: *value = engine->curve.vMax; return 1;
         case PM_PARAM_VELOCITY_EXPONENT: *value = engine->curve.exponent; return 1;
+        case PM_PARAM_TOUCH: *value = engine->touch; return 1;
         case PM_PARAM_A4_HZ: *value = engine->voicing.a4Hz; return 1;
         case PM_PARAM_TUNING_STRETCH: *value = engine->voicing.stretch; return 1;
         case PM_PARAM_EQUAL_TEMPERAMENT: *value = engine->voicing.equalTemperament ? 1.0 : 0.0; return 1;
         case PM_PARAM_UNISON_WIDTH: *value = engine->voicing.unisonWidth; return 1;
+        case PM_PARAM_VOICING_FELT_HARDNESS: *value = engine->voicing.feltHardness; return 1;
+        case PM_PARAM_VOICING_FELT_EXPONENT: *value = engine->voicing.feltExponentOffset; return 1;
+        case PM_PARAM_VOICING_HAMMER_MASS: *value = engine->voicing.hammerMassScale; return 1;
+        case PM_PARAM_VOICING_STRIKE_POSITION: *value = engine->voicing.strikePosScale; return 1;
+        case PM_PARAM_VOICING_STRING_LOSS: *value = engine->voicing.stringLossScale; return 1;
+        case PM_PARAM_VOICING_HF_LOSS: *value = engine->voicing.hfLossScale; return 1;
+        case PM_PARAM_VOICING_INHARMONICITY: *value = engine->voicing.inharmonicityScale; return 1;
+        case PM_PARAM_VOICING_BOARD_DAMPING: *value = engine->board.dampingScale; return 1;
+        case PM_PARAM_VOICING_RADIATION_TILT: *value = engine->board.radiationTiltDbPerOct; return 1;
+        case PM_PARAM_VOICING_RADIATION_CORNER_HZ: *value = engine->board.radiationTiltCornerHz; return 1;
+        case PM_PARAM_VOICING_FELT_DAMPING: *value = engine->voicing.feltDampingScale; return 1;
         case PM_PARAM_SOUNDBOARD_ENABLED: *value = engine->board.enabled ? 1.0 : 0.0; return 1;
         case PM_PARAM_SYMPATHETIC: *value = engine->board.sympathetic; return 1;
         case PM_PARAM_QUALITY_TIER: *value = static_cast<double>(engine->board.tier); return 1;

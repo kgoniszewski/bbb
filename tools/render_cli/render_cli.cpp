@@ -57,8 +57,10 @@ void usage() {
         "                     time when the room is on)\n"
         "  --fs, --block, --format, --out, --cull-db, --no-cull as above\n"
         "  --gain-db DB       master gain (default 0)\n"
-        "  --width W          stereo width 0..1 (default 0.35)\n"
-        "  --treble DB        high shelf at 3 kHz on the microphones, -12..6 dB (default -3)\n"
+        "  --width W          stereo width 0..1 (default 0.7)\n"
+        "  --bass DB          low shelf at 200 Hz on the microphones, -12..12 dB (default 0)\n"
+        "  --mid DB           peaking EQ at 1 kHz (Q 0.7) on the microphones, -12..12 dB (default 0)\n"
+        "  --treble DB        high shelf at 3 kHz on the microphones, -12..12 dB (default 0)\n"
         "  --dry              room (reverb) off; default on\n"
         "  --room-level DB    room wet level (default -9; 0 = physical reverberant-to-direct ratio)\n"
         "  --room-decay S     room T60 at mid frequencies, 0.3..6 s (default 1.8)\n"
@@ -103,7 +105,7 @@ bool readFile(const char* path, std::string& out) {
 
 // The piano-mode settings that have a pm_param, for --preset / --save-preset.
 struct PianoSettings {
-    double& gainDb; double& width; double& trebleDb; double& cullDb; bool& cull;
+    double& gainDb; double& width; double& bassDb; double& midDb; double& trebleDb; double& cullDb; bool& cull;
     pm::TableOptions& voicing; pm::SoundboardConfig& board; double& knock; double& damperNoise;
     bool& room; double& roomLevel; double& roomDecay; double& roomSize; double& roomHf;
 };
@@ -115,12 +117,20 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
     if (!e) return false;
     const struct { int32_t id; double v; } in[] = {
         {PM_PARAM_MASTER_GAIN_DB, s.gainDb}, {PM_PARAM_STEREO_WIDTH, s.width}, {PM_PARAM_TREBLE_DB, s.trebleDb},
+        {PM_PARAM_BASS_DB, s.bassDb}, {PM_PARAM_MID_DB, s.midDb},
         {PM_PARAM_CULL_THRESHOLD_DB, s.cullDb}, {PM_PARAM_CULLING_ENABLED, s.cull ? 1.0 : 0.0},
         {PM_PARAM_A4_HZ, s.voicing.a4Hz}, {PM_PARAM_TUNING_STRETCH, s.voicing.stretch},
         {PM_PARAM_EQUAL_TEMPERAMENT, s.voicing.equalTemperament ? 1.0 : 0.0},
-        {PM_PARAM_UNISON_WIDTH, s.voicing.unisonWidth}, {PM_PARAM_SOUNDBOARD_ENABLED, s.board.enabled ? 1.0 : 0.0},
+        {PM_PARAM_UNISON_WIDTH, s.voicing.unisonWidth}, {PM_PARAM_VOICING_FELT_HARDNESS, s.voicing.feltHardness},
+        {PM_PARAM_VOICING_FELT_EXPONENT, s.voicing.feltExponentOffset}, {PM_PARAM_VOICING_HAMMER_MASS, s.voicing.hammerMassScale},
+        {PM_PARAM_VOICING_STRIKE_POSITION, s.voicing.strikePosScale}, {PM_PARAM_VOICING_STRING_LOSS, s.voicing.stringLossScale},
+        {PM_PARAM_VOICING_HF_LOSS, s.voicing.hfLossScale}, {PM_PARAM_VOICING_INHARMONICITY, s.voicing.inharmonicityScale},
+        {PM_PARAM_SOUNDBOARD_ENABLED, s.board.enabled ? 1.0 : 0.0},
         {PM_PARAM_SYMPATHETIC, s.board.sympathetic}, {PM_PARAM_QUALITY_TIER, static_cast<double>(s.board.tier)},
-        {PM_PARAM_LOOP_CUTOFF_HZ, s.board.loopCutoffHz},
+        {PM_PARAM_LOOP_CUTOFF_HZ, s.board.loopCutoffHz}, {PM_PARAM_VOICING_BOARD_DAMPING, s.board.dampingScale},
+        {PM_PARAM_VOICING_RADIATION_TILT, s.board.radiationTiltDbPerOct},
+        {PM_PARAM_VOICING_RADIATION_CORNER_HZ, s.board.radiationTiltCornerHz},
+        {PM_PARAM_VOICING_FELT_DAMPING, s.voicing.feltDampingScale},
         {PM_PARAM_KNOCK_LEVEL, s.knock >= 0.0 ? s.knock : std::nan("")},
         {PM_PARAM_DAMPER_NOISE_LEVEL, s.damperNoise >= 0.0 ? s.damperNoise : std::nan("")},
         {PM_PARAM_ROOM_ENABLED, s.room ? 1.0 : 0.0}, {PM_PARAM_ROOM_LEVEL_DB, s.roomLevel},
@@ -146,7 +156,7 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
         } else {
             if (r.warnings[0]) std::fprintf(stderr, "%s: %s\n", presetPath.c_str(), r.warnings);
             // Parameters render_cli does not model (it drives pm::Engine with raw hammer speeds).
-            const int32_t ignored[] = {PM_PARAM_VELOCITY_MIN, PM_PARAM_VELOCITY_MAX, PM_PARAM_VELOCITY_EXPONENT,
+            const int32_t ignored[] = {PM_PARAM_VELOCITY_MIN, PM_PARAM_VELOCITY_MAX, PM_PARAM_VELOCITY_EXPONENT, PM_PARAM_TOUCH,
                                        PM_PARAM_HALF_PEDAL_P0_TREBLE, PM_PARAM_HALF_PEDAL_P0_BASS,
                                        PM_PARAM_HALF_PEDAL_WIDTH, PM_PARAM_ROOM_EARLY_LATE,
                                        PM_PARAM_SCHEDULING_MODE, PM_PARAM_CONSTANT_LATENCY_FRAMES,
@@ -170,16 +180,29 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
         s.gainDb = get(PM_PARAM_MASTER_GAIN_DB);
         s.width = get(PM_PARAM_STEREO_WIDTH);
         s.trebleDb = get(PM_PARAM_TREBLE_DB);
+        s.bassDb = get(PM_PARAM_BASS_DB);
+        s.midDb = get(PM_PARAM_MID_DB);
         s.cullDb = get(PM_PARAM_CULL_THRESHOLD_DB);
         s.cull = get(PM_PARAM_CULLING_ENABLED) >= 0.5;
         s.voicing.a4Hz = get(PM_PARAM_A4_HZ);
         s.voicing.stretch = get(PM_PARAM_TUNING_STRETCH);
         s.voicing.equalTemperament = get(PM_PARAM_EQUAL_TEMPERAMENT) >= 0.5;
         s.voicing.unisonWidth = get(PM_PARAM_UNISON_WIDTH);
+        s.voicing.feltHardness = get(PM_PARAM_VOICING_FELT_HARDNESS);
+        s.voicing.feltExponentOffset = get(PM_PARAM_VOICING_FELT_EXPONENT);
+        s.voicing.hammerMassScale = get(PM_PARAM_VOICING_HAMMER_MASS);
+        s.voicing.strikePosScale = get(PM_PARAM_VOICING_STRIKE_POSITION);
+        s.voicing.stringLossScale = get(PM_PARAM_VOICING_STRING_LOSS);
+        s.voicing.hfLossScale = get(PM_PARAM_VOICING_HF_LOSS);
+        s.voicing.inharmonicityScale = get(PM_PARAM_VOICING_INHARMONICITY);
         s.board.enabled = get(PM_PARAM_SOUNDBOARD_ENABLED) >= 0.5;
         s.board.sympathetic = get(PM_PARAM_SYMPATHETIC);
         s.board.tier = static_cast<pm::QualityTier>(static_cast<int>(get(PM_PARAM_QUALITY_TIER)));
         s.board.loopCutoffHz = get(PM_PARAM_LOOP_CUTOFF_HZ);
+        s.board.dampingScale = get(PM_PARAM_VOICING_BOARD_DAMPING);
+        s.board.radiationTiltDbPerOct = get(PM_PARAM_VOICING_RADIATION_TILT);
+        s.board.radiationTiltCornerHz = get(PM_PARAM_VOICING_RADIATION_CORNER_HZ);
+        s.voicing.feltDampingScale = get(PM_PARAM_VOICING_FELT_DAMPING);
         s.knock = get(PM_PARAM_KNOCK_LEVEL);
         s.damperNoise = get(PM_PARAM_DAMPER_NOISE_LEVEL);
         s.room = get(PM_PARAM_ROOM_ENABLED) >= 0.5;
@@ -202,7 +225,7 @@ bool applyPresetFiles(PianoSettings s, const std::string& presetPath, const std:
 
 int pianoMain(int argc, char** argv) {
     std::string scorePath, out = "out.wav", presetPath, savePresetPath;
-    double fs = 48000.0, tail = 4.0, gainDb = 0.0, width = 0.35, trebleDb = -3.0, cullDb = -100.0;
+    double fs = 48000.0, tail = 4.0, gainDb = 0.0, width = 0.7, bassDb = 0.0, midDb = 0.0, trebleDb = 0.0, cullDb = -100.0;
     int block = 64;
     bool cull = true, quiet = false;
     pm::TableOptions voicing;
@@ -242,6 +265,8 @@ int pianoMain(int argc, char** argv) {
         else if (a == "--gain-db") ok = num, gainDb = d;
         else if (a == "--width") ok = num, width = d;
         else if (a == "--treble") ok = num, trebleDb = d;
+        else if (a == "--bass") ok = num, bassDb = d;
+        else if (a == "--mid") ok = num, midDb = d;
         else if (a == "--cull-db") ok = num, cullDb = d;
         else if (a == "--a4") ok = num && d > 0.0, voicing.a4Hz = d;
         else if (a == "--stretch") ok = num && d >= 0.0 && d <= 1.5, voicing.stretch = d;
@@ -274,7 +299,7 @@ int pianoMain(int argc, char** argv) {
         return 2;
     }
     if (!presetPath.empty() || !savePresetPath.empty()) {
-        PianoSettings ps{gainDb, width, trebleDb, cullDb, cull, voicing, board, knock, damperNoise,
+        PianoSettings ps{gainDb, width, bassDb, midDb, trebleDb, cullDb, cull, voicing, board, knock, damperNoise,
                          room, roomLevel, roomDecay, roomSize, roomHf};
         if (!applyPresetFiles(ps, presetPath, savePresetPath)) return 1;
     }
@@ -285,6 +310,8 @@ int pianoMain(int argc, char** argv) {
     engine.setMasterGainDb(static_cast<float>(gainDb));
     engine.setStereoWidth(static_cast<float>(width));
     engine.setTrebleDb(static_cast<float>(trebleDb));
+    engine.setBassDb(static_cast<float>(bassDb));
+    engine.setMidDb(static_cast<float>(midDb));
     engine.setRoomEnabled(room);
     engine.setRoomLevelDb(static_cast<float>(roomLevel));
     engine.setRoomDecay(static_cast<float>(roomDecay));

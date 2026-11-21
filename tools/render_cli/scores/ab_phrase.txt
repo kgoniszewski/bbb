@@ -1,0 +1,64 @@
+# A/B listening material (about 16 s): a short pedalled chorale over the
+# whole range, then single notes C2, C4, C6 at forte without pedal.
+0.00  cc64 127
+0.10  note_on C2 72
+0.10  note_on C3 68
+0.12  note_on E4 70
+0.12  note_on G4 70
+0.14  note_on C5 82
+1.20  note_off C2
+1.20  note_off C3
+1.20  note_off E4
+1.20  note_off G4
+1.20  note_off C5
+1.25  cc64 0
+1.35  cc64 127
+1.40  note_on F2 70
+1.40  note_on F3 66
+1.42  note_on A4 70
+1.42  note_on C5 70
+1.44  note_on F5 84
+2.70  note_off F2
+2.70  note_off F3
+2.70  note_off A4
+2.70  note_off C5
+2.70  note_off F5
+2.75  cc64 0
+2.85  cc64 127
+2.90  note_on G1 76
+2.90  note_on G2 72
+2.92  note_on D4 72
+2.92  note_on B4 72
+2.94  note_on G5 88
+3.60  note_on A5 70
+4.20  note_off A5
+4.20  note_on B5 74
+4.80  note_off B5
+4.80  note_on D6 80
+5.60  note_off G1
+5.60  note_off G2
+5.60  note_off D4
+5.60  note_off B4
+5.60  note_off G5
+5.60  note_off D6
+5.65  cc64 0
+5.75  cc64 127
+5.80  note_on C1 80
+5.80  note_on C2 76
+5.82  note_on E4 72
+5.82  note_on G4 72
+5.84  note_on C5 76
+5.86  note_on C6 84
+8.60  note_off C1
+8.60  note_off C2
+8.60  note_off E4
+8.60  note_off G4
+8.60  note_off C5
+8.60  note_off C6
+8.80  cc64 0
+9.50  note_on C2 100
+11.50 note_off C2
+12.00 note_on C4 100
+14.00 note_off C4
+14.50 note_on C6 100
+16.00 note_off C6

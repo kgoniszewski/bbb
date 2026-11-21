@@ -143,6 +143,16 @@ MicGains computeMicGains(const BoardModel& b, const RadiationParams& r) {
     return m;
 }
 
+void applyRadiationTilt(MicGains& g, const BoardModel& b, double dbPerOct, double cornerHz) noexcept {
+    if (dbPerOct == 0.0 || !(cornerHz > 0.0) || g.modes != b.modes) return;
+    const double e = dbPerOct / (20.0 * std::log10(2.0));
+    for (int i = 0; i < g.modes; ++i) {
+        if (!(b.freq[i] > cornerHz)) continue;
+        const double s = std::pow(b.freq[i] / cornerHz, e);
+        for (int mic = 0; mic < 2; ++mic) g.gain[std::size_t(mic) * g.modes + i] *= s;
+    }
+}
+
 void loadMicGains(Soundboard& sb, const MicGains& g) noexcept {
     for (int mic = 0; mic < 2; ++mic)
         for (int i = 0; i < g.modes; ++i) {

@@ -6,8 +6,10 @@
 #include <cstring>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "pm_api/pm_api.h"
+#include "pm_api/pm_api_internal.h"
 #include "test_harness.h"
 
 namespace {
@@ -45,13 +47,13 @@ double get(const pm_engine* e, int32_t id) {
 }  // namespace
 
 TEST(params_every_id_has_one_descriptor) {
-    CHECK(pm_param_count() == PM_PARAM_TREBLE_DB + 1);
+    CHECK(pm_param_count() == PM_PARAM_MID_DB + 1);
     std::set<int32_t> ids;
     std::set<std::string> keys;
     for (int32_t i = 0; i < pm_param_count(); ++i) {
         pm_param_info_t d{};
         CHECK(pm_param_info(i, &d) == 1);
-        CHECK(d.id >= 0 && d.id <= PM_PARAM_TREBLE_DB);
+        CHECK(d.id >= 0 && d.id <= PM_PARAM_MID_DB);
         CHECK(ids.insert(d.id).second);
         CHECK(d.key && keys.insert(d.key).second);
         if (!snakeCase(d.key)) std::printf("  key not snake_case: %s\n", d.key);
@@ -73,7 +75,7 @@ TEST(params_every_id_has_one_descriptor) {
             for (int32_t k = 0; k < d.enum_count; ++k) CHECK(snakeCase(d.enum_names[k]));
         }
     }
-    for (int32_t id = 0; id <= PM_PARAM_TREBLE_DB; ++id) CHECK(ids.count(id) == 1);
+    for (int32_t id = 0; id <= PM_PARAM_MID_DB; ++id) CHECK(ids.count(id) == 1);
     pm_param_info_t d{};
     CHECK(pm_param_info(-1, &d) == 0);
     CHECK(pm_param_info(pm_param_count(), &d) == 0);
@@ -162,4 +164,88 @@ TEST(params_host_engine_has_product_defaults) {
         CHECK_NEAR(r, d.default_value, 1e-6 * (1.0 + std::fabs(d.default_value)));
     }
     pm_host_destroy(h);
+}
+
+namespace {
+
+std::vector<float> renderTouch(double touch) {  // touch < 0: never set
+    pm_engine* e = pm_engine_create();
+    if (touch >= 0.0) CHECK(pm_engine_set_param(e, PM_PARAM_TOUCH, touch) == 1);
+    CHECK(pm_engine_prepare(e, 48000.0, 64) == 1);
+    for (int n : {48, 60, 64, 67}) {
+        pm_event ev{};
+        ev.type = PM_EVENT_NOTE_ON;
+        ev.time_base = PM_TIME_SAMPLE;
+        ev.note = static_cast<uint8_t>(n);
+        ev.value = static_cast<uint16_t>(65535 * (n - 20) / 100);
+        CHECK(pm_engine_push_event(e, &ev) == 1);
+    }
+    std::vector<float> out;
+    float l[64], r[64];
+    for (int b = 0; b < 48000 / 2 / 64; ++b) {
+        pm_engine_render(e, l, r, 64, nullptr);
+        out.insert(out.end(), l, l + 64);
+        out.insert(out.end(), r, r + 64);
+    }
+    pm_engine_destroy(e);
+    return out;
+}
+
+double hammerSpeed(double touch, int velocity) {
+    pm_engine* e = pm_engine_create();
+    CHECK(pm_engine_set_param(e, PM_PARAM_TOUCH, touch) == 1);
+    const double v = pmEngineOf(e)->hammerVelocityFor(velocity / 127.0);
+    pm_engine_destroy(e);
+    return v;
+}
+
+}  // namespace
+
+TEST(params_touch_medium_is_bit_identical) {
+    const std::vector<float> unset = renderTouch(-1.0);
+    const std::vector<float> medium = renderTouch(1.0);
+    CHECK(unset.size() == medium.size());
+    CHECK(std::memcmp(unset.data(), medium.data(), unset.size() * sizeof(float)) == 0);
+    CHECK(renderTouch(0.0) != unset);
+}
+
+TEST(params_touch_orders_hammer_speed) {
+    pm_param_info_t d{};
+    CHECK(pm_param_info(PM_PARAM_TOUCH, &d) == 1);
+    CHECK(std::strcmp(d.key, "touch") == 0 && d.enum_count == 3);
+    CHECK(d.default_value == 1.0 && d.engine_default == 1.0);
+    for (int vel : {32, 64, 100}) {
+        const double light = hammerSpeed(0, vel), medium = hammerSpeed(1, vel), strong = hammerSpeed(2, vel);
+        std::printf("  velocity %3d: light %.3f medium %.3f strong %.3f m/s\n", vel, light, medium, strong);
+        CHECK(light > medium && medium > strong);
+    }
+    // Same loudest and softest hammer: only the shape of the curve changes.
+    // Tolerance: the engine stores the curve as a float table.
+    CHECK_NEAR(hammerSpeed(0, 127), 5.5, 1e-5);
+    CHECK_NEAR(hammerSpeed(1, 127), 5.5, 1e-5);
+    CHECK_NEAR(hammerSpeed(2, 127), 5.5, 1e-5);
+    for (double t : {0.0, 1.0, 2.0}) {
+        const double v = hammerSpeed(t, 1);
+        CHECK(v >= 0.3 - 1e-6 && v < 0.35);
+    }
+    // Touch sits on top of a custom exponent.
+    pm_engine* e = pm_engine_create();
+    CHECK(pm_engine_set_param(e, PM_PARAM_VELOCITY_EXPONENT, 3.0) == 1);
+    CHECK(pm_engine_set_param(e, PM_PARAM_TOUCH, 0.0) == 1);
+    CHECK_NEAR(pmEngineOf(e)->hammerVelocityFor(0.5), 0.3 + 5.2 * 0.25, 1e-3);
+    double ex = 0.0;
+    CHECK(pm_engine_get_param(e, PM_PARAM_VELOCITY_EXPONENT, &ex) == 1 && ex == 3.0);
+    pm_engine_destroy(e);
+}
+
+TEST(params_master_gain_product_default) {
+    pm_host* h = pm_host_create();
+    double g = 0.0;
+    CHECK(pm_engine_get_param(pm_host_engine(h), PM_PARAM_MASTER_GAIN_DB, &g) == 1);
+    CHECK(g == 16.0);
+    pm_host_destroy(h);
+    pm_engine* e = pm_engine_create();
+    CHECK(pm_engine_get_param(e, PM_PARAM_MASTER_GAIN_DB, &g) == 1);
+    CHECK(g == 0.0);
+    pm_engine_destroy(e);
 }

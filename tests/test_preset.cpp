@@ -340,6 +340,7 @@ TEST(preset_content_tolerance) {
     CHECK(read(e, empty).ok == 1 && get(e, PM_PARAM_MASTER_GAIN_DB) == -20.0);
     const pm_preset_result_t rd = read(e, empty, PM_PRESET_READ_MISSING_TO_DEFAULT);
     CHECK(rd.ok == 1 && rd.applied == visibleCount() && rd.missing == visibleCount());
-    CHECK(get(e, PM_PARAM_MASTER_GAIN_DB) == 0.0 && get(e, PM_PARAM_ROOM_ENABLED) == 1.0);
+    // The product master volume is +16 dB since API 0.20 (+14 before the radiation roll-off of A/B round 4, which lowered ff peaks by about 2.6 dB).
+    CHECK(get(e, PM_PARAM_MASTER_GAIN_DB) == 16.0 && get(e, PM_PARAM_ROOM_ENABLED) == 1.0);
     pm_engine_destroy(e);
 }

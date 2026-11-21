@@ -16,7 +16,7 @@ extern "C" {
 #endif
 
 #define PM_API_VERSION_MAJOR 0
-#define PM_API_VERSION_MINOR 18
+#define PM_API_VERSION_MINOR 21
 #define PM_API_VERSION_PATCH 0
 
 typedef struct pm_engine pm_engine;
@@ -53,8 +53,8 @@ typedef struct pm_clock {
 } pm_clock;
 
 enum pm_param {
-    PM_PARAM_MASTER_GAIN_DB = 0,          /* -96 .. 24, default 0 */
-    PM_PARAM_STEREO_WIDTH = 1,            /* 0 .. 1, default 0.35 */
+    PM_PARAM_MASTER_GAIN_DB = 0,          /* -96 .. 24, default 0 (pm_host: +16) */
+    PM_PARAM_STEREO_WIDTH = 1,            /* 0 .. 1, default 0.7 */
     PM_PARAM_SCHEDULING_MODE = 2,         /* 0 lowest latency (default), 1 constant latency */
     PM_PARAM_CONSTANT_LATENCY_FRAMES = 3, /* default: max_frames from prepare */
     PM_PARAM_CULL_THRESHOLD_DB = 4,       /* default -100 */
@@ -90,7 +90,29 @@ enum pm_param {
     PM_PARAM_ROOM_HF_RATIO = 26,          /* T60(8 kHz) / T60(mid), 0.1 .. 1, default 0.5 */
     PM_PARAM_ROOM_SIZE = 27,              /* room scale 0.5 .. 2, default 1 (change fades out and in) */
     PM_PARAM_ROOM_EARLY_LATE = 28,        /* 0 early only, 1 late only, 0.5 both at physical level (default) */
-    PM_PARAM_TREBLE_DB = 29               /* -12 .. 6 dB high shelf at 3 kHz on the microphones, default -3 */
+    PM_PARAM_TREBLE_DB = 29,              /* -12 .. 12 dB high shelf at 3 kHz on the microphones, default 0 (off; -9 until A/B round 4, 2026-11-20) */
+    /* API 0.19: global voicing scales on the per-key table (hidden, for
+     * listening tests). Take effect at the next pm_engine_prepare. */
+    PM_PARAM_VOICING_FELT_HARDNESS = 30,  /* x felt force at the key's reference compression, 0.25 .. 4, default 1 */
+    PM_PARAM_VOICING_FELT_EXPONENT = 31,  /* + felt exponent p (force at the reference kept), -1 .. 1, default 0 */
+    PM_PARAM_VOICING_HAMMER_MASS = 32,    /* x hammer mass, 0.5 .. 2, default 1 */
+    PM_PARAM_VOICING_STRIKE_POSITION = 33,/* x strike position (clamped to 0.02 .. 0.30 of L), 0.5 .. 2, default 1 */
+    PM_PARAM_VOICING_STRING_LOSS = 34,    /* x frequency-independent string loss b1, 0.25 .. 4, default 1 */
+    PM_PARAM_VOICING_HF_LOSS = 35,        /* x frequency-dependent string loss b3, 0.25 .. 4, default 1 */
+    PM_PARAM_VOICING_INHARMONICITY = 36,  /* x B with the sounding f1 kept, 0 .. 2, default 1 */
+    PM_PARAM_VOICING_BOARD_DAMPING = 37,  /* x soundboard loss factors etaLow, etaHigh, etaBass, 0.25 .. 4, default 1 */
+    /* API 0.20: touch (dynamics curve), set like PM_PARAM_VELOCITY_*. Scales
+     * the velocity exponent: 0 Light x2/3, 1 Medium x1 (default), 2 Strong
+     * x1.5; the hammer speeds at velocity 0+ and 127 are unchanged. The
+     * PM_PARAM_VELOCITY_* parameters are hidden from 0.20 on. */
+    PM_PARAM_TOUCH = 38,                  /* 0 Light, 1 Medium (default), 2 Strong */
+    /* API 0.20 (hidden, prepare class, for listening tests): */
+    PM_PARAM_VOICING_RADIATION_TILT = 39, /* dB/octave on the microphones' board-mode gains above the corner, -9 .. 0, default -4 dB/oct above 700 Hz after A/B round 4, 2026-11-20 */
+    PM_PARAM_VOICING_RADIATION_CORNER_HZ = 40, /* corner of that tilt, 250 .. 8000 Hz, default 700 (A/B round 4, 2026-11-20) */
+    PM_PARAM_VOICING_FELT_DAMPING = 41,   /* x felt Hunt-Crossley damping feltMu, 0.25 .. 8, default 1 */
+    /* API 0.21 (tone EQ on the microphones, next to the treble shelf): */
+    PM_PARAM_BASS_DB = 42,                /* -12 .. 12 dB low shelf (S = 1) at 200 Hz, default 0 (off) */
+    PM_PARAM_MID_DB = 43                  /* -12 .. 12 dB peaking EQ at 1 kHz, Q 0.7, default 0 (off) */
 };
 
 /* Partials below the loop band are fed back by the string-board loop

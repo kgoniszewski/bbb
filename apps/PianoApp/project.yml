@@ -102,6 +102,7 @@ targets:
       - sdk: AVFAudio.framework
       - sdk: CoreAudioKit.framework
       - sdk: CoreMIDI.framework
+      - sdk: UIKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.app.auv3
@@ -146,6 +147,7 @@ targets:
       - sdk: AVFAudio.framework
       - sdk: CoreAudioKit.framework
       - sdk: CoreMIDI.framework
+      - sdk: AppKit.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.piano.mac.auv3

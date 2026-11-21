@@ -84,8 +84,8 @@ std::vector<double> octaveBand(const std::vector<double>& x, double fc) {
 }
 
 // T60 from the Schroeder energy decay curve of x[from..]: line fit of the
-// curve between -5 and -25 dB (T20), extrapolated to 60 dB.
-double t60(const std::vector<double>& x, int from) {
+// curve between -5 dB and `lowDb` (T20 by default), extrapolated to 60 dB.
+double t60(const std::vector<double>& x, int from, double lowDb = -25.0) {
     std::vector<double> edc(x.size() - from);
     double acc = 0.0;
     for (int i = static_cast<int>(x.size()) - 1; i >= from; --i) edc[i - from] = (acc += x[i] * x[i]);
@@ -93,7 +93,7 @@ double t60(const std::vector<double>& x, int from) {
     int m = 0;
     for (std::size_t i = 0; i < edc.size(); ++i) {
         const double db = 10.0 * std::log10(edc[i] / edc[0] + 1e-300);
-        if (db > -5.0 || db < -25.0) continue;
+        if (db > -5.0 || db < lowDb) continue;
         const double t = i / kFs;
         sx += t, sy += db, sxx += t * t, sxy += t * db, ++m;
     }
@@ -167,7 +167,16 @@ TEST(room_tail_decays_at_set_t60) {
         std::vector<double> w(n);
         for (int i = 0; i < n; ++i) w[i] = double(a.l[i] - b.l[i]) + double(a.r[i] - b.r[i]);
         const int from = static_cast<int>(0.8 * kFs);  // 0.3 s after note-off, past the damped string
-        const double tBand = t60(octaveBand(w, 1000.0), from), tBroad = t60(w, from);
+        // T30 (-5 to -35 dB), not T20: a single note excites the room only
+        // at a few partials (C4: 785, 1046, 1308 Hz in this band), so the
+        // energy curve of its wet tail carries the beating of the few room
+        // modes near them. With T20 the 1.8 s estimate swings from 1.59 to
+        // 2.13 s as the start moves from 0.6 to 1.6 s (2.08 s at 0.8 s); with
+        // T30 from 1.69 to 1.93 s (1.93 s at 0.8 s). The room itself is on
+        // target: its impulse response gives 1.75-1.82 s at 707-1308 Hz
+        // (3.0 s setting: 2.93-3.06 s), and the standalone Room fed this
+        // dry signal gives the same 2.08 s T20, so on-minus-off is exact.
+        const double tBand = t60(octaveBand(w, 1000.0), from, -35.0), tBroad = t60(w, from);
         std::printf("  decay %.1f s: T60 1 kHz octave %.2f s (%+.1f %%), broadband %.2f s\n", decay, tBand,
                     100.0 * (tBand / decay - 1.0), tBroad);
         CHECK_NEAR(tBand, decay, 0.15 * decay);

@@ -70,13 +70,28 @@ bool Engine::prepare(double sampleRate, int maxFrames) noexcept {
 
 bool Engine::prepare(double sampleRate, int maxFrames, const PianoTable& table) noexcept {
     if (!(sampleRate > 0.0) || maxFrames <= 0) return false;
-    boardModel_ = buildPlateBoard(boardCfg_.plate);
+    PlateParams plate = boardCfg_.plate;
+    if (boardCfg_.dampingScale != 1.0 && boardCfg_.dampingScale > 0.0 && std::isfinite(boardCfg_.dampingScale)) {
+        plate.etaLow *= boardCfg_.dampingScale;
+        plate.etaHigh *= boardCfg_.dampingScale;
+        plate.etaBass *= boardCfg_.dampingScale;
+    }
+    boardModel_ = buildPlateBoard(plate);
     // The microphone gains (about 0.15 s) are kept while the board and
     // radiation parameters are unchanged.
     if (!boardCfg_.enabled || !boardCfg_.radiation.enabled) mics_ = MicGains{};
-    else if (mics_.modes != boardModel_.modes || !(mics_.plate == boardCfg_.plate) ||
+    else if (mics_.modes != boardModel_.modes || !(mics_.plate == plate) ||
              !(mics_.params == boardCfg_.radiation))
         mics_ = computeMicGains(boardModel_, boardCfg_.radiation);
+    // The tilt goes on a copy, so the cached untilted gains survive a change of it.
+    micsTilted_ = MicGains{};
+    {
+        const double tilt = boardCfg_.radiationTiltDbPerOct, corner = boardCfg_.radiationTiltCornerHz;
+        if (mics_.modes > 0 && tilt != 0.0 && std::isfinite(tilt) && corner > 0.0 && std::isfinite(corner)) {
+            micsTilted_ = mics_;
+            applyRadiationTilt(micsTilted_, boardModel_, tilt, corner);
+        }
+    }
     const double g = boardCfg_.enabled ? std::clamp(boardCfg_.sympathetic, 0.0, 1.5) : 0.0;
     const double cutoff = boardCfg_.loopCutoffHz > 0.0 ? boardCfg_.loopCutoffHz
                                                       : loopCutoffForTier(boardCfg_.tier, boardCfg_.plate);
@@ -158,12 +173,16 @@ bool Engine::prepareImpl(double sampleRate, int maxFrames, const PianoTable& tab
     cullOffsetDb_ = 0.0f;
     if (board) {
         if (!loadSoundboard(board_, boardModel_, fs_)) return false;
-        const bool mics = mics_.modes == boardModel_.modes && mics_.modes > 0;
-        if (mics) loadMicGains(board_, mics_);
+        // micGains(): with the radiation tilt on, the tilted gains feed both the
+        // board modes and, through outTransfer, the direct path's level
+        // (hfGain_ below), so the two still join at the top of the modal range.
+        const MicGains& micsOut = micGains();
+        const bool mics = micsOut.modes == boardModel_.modes && micsOut.modes > 0;
+        if (mics) loadMicGains(board_, micsOut);
         // Transfer from a bridge shape to output channel p: the microphone's
         // (complex per-mode gains) or the v0 pickup's.
         auto outTransfer = [&](const double* shape, int p, double f) {
-            return mics ? micModalTransfer(boardModel_, shape, mics_.row(p), f)
+            return mics ? micModalTransfer(boardModel_, shape, micsOut.row(p), f)
                         : boardModalAdmittance(boardModel_, shape,
                                                boardModel_.pickupShape.data() + std::size_t(p) * boardModel_.modes, f);
         };
@@ -340,8 +359,10 @@ void Engine::resetState() noexcept {
     seq_ = 0;
     sampleTime_ = 0;
     appliedWidth_ = -1.0f;
-    latchTreble(true);
-    for (int c = 0; c < 2; ++c) shX_[c][0] = shX_[c][1] = shY_[c][0] = shY_[c][1] = 0.0f;
+    latchEq(true);
+    bass_.clearState();
+    mid_.clearState();
+    treble_.clearState();
     masterGain_ = masterTarget_ = std::pow(10.0f, masterGainDb_.load() / 20.0f);
     dcX_[0] = dcX_[1] = dcY_[0] = dcY_[1] = 0.0f;
     deferred_ = late_ = limited_ = nonFinite_ = 0;
@@ -842,65 +863,100 @@ bool Engine::tickIsNoOp() const noexcept {
 // snap): the host's value is sampled on a grid fixed to the music, so the
 // glide is the same whatever the buffering. The gain moves halfway (in dB)
 // per tick and lands exactly on the target (0 dB -> unity coefficients).
-void Engine::latchTreble(bool snap) noexcept {
-    float t = trebleDb_.load(std::memory_order_relaxed);
-    t = t == t ? std::clamp(t, -12.0f, 6.0f) : 0.0f;
-    trebleTarget_ = t;
-    if (trebleCur_ == t && !snap) return;
+template <typename T>
+void Engine::EqBand<T>::latch(float t, bool snap, EqKind kind, double f0, double q, double fs) noexcept {
+    t = t == t ? std::clamp(t, -12.0f, 12.0f) : 0.0f;
+    target = t;
+    if (cur == t && !snap) return;
     if (snap) {
-        trebleCur_ = t;
+        cur = t;
     } else {
-        trebleCur_ += 0.5f * (t - trebleCur_);
-        if (std::fabs(t - trebleCur_) < 0.02f) trebleCur_ = t;
+        cur += 0.5f * (t - cur);
+        if (std::fabs(t - cur) < 0.02f) cur = t;
     }
-    // RBJ cookbook high shelf, S = 1: alpha = sin(w0)/2 * sqrt(2).
-    const double A = std::pow(10.0, trebleCur_ / 40.0), w0 = 2.0 * kPi * kTrebleHz / fs_;
-    const double cw = std::cos(w0), sa = 2.0 * std::sqrt(A) * std::sin(w0) / 2.0 * std::sqrt(2.0);
-    const double a0 = (A + 1) - (A - 1) * cw + sa;
-    shB_[0] = static_cast<float>(A * ((A + 1) + (A - 1) * cw + sa) / a0);
-    shB_[1] = static_cast<float>(-2.0 * A * ((A - 1) + (A + 1) * cw) / a0);
-    shB_[2] = static_cast<float>(A * ((A + 1) + (A - 1) * cw - sa) / a0);
-    shA_[0] = static_cast<float>(2.0 * ((A - 1) - (A + 1) * cw) / a0);
-    shA_[1] = static_cast<float>(((A + 1) - (A - 1) * cw - sa) / a0);
+    const double A = std::pow(10.0, cur / 40.0), w0 = 2.0 * kPi * f0 / fs;
+    const double cw = std::cos(w0);
+    if (kind == EqKind::Peak) {
+        // RBJ cookbook peaking EQ: alpha = sin(w0) / (2 Q).
+        const double al = std::sin(w0) / (2.0 * q);
+        const double a0 = 1.0 + al / A;
+        b[0] = static_cast<T>((1.0 + al * A) / a0);
+        b[1] = static_cast<T>(-2.0 * cw / a0);
+        b[2] = static_cast<T>((1.0 - al * A) / a0);
+        a[0] = static_cast<T>(-2.0 * cw / a0);
+        a[1] = static_cast<T>((1.0 - al / A) / a0);
+        return;
+    }
+    // RBJ cookbook shelves, S = 1: alpha = sin(w0)/2 * sqrt(2); sa = 2 sqrt(A) alpha.
+    const double sa = 2.0 * std::sqrt(A) * std::sin(w0) / 2.0 * std::sqrt(2.0);
+    if (kind == EqKind::HighShelf) {
+        const double a0 = (A + 1) - (A - 1) * cw + sa;
+        b[0] = static_cast<T>(A * ((A + 1) + (A - 1) * cw + sa) / a0);
+        b[1] = static_cast<T>(-2.0 * A * ((A - 1) + (A + 1) * cw) / a0);
+        b[2] = static_cast<T>(A * ((A + 1) + (A - 1) * cw - sa) / a0);
+        a[0] = static_cast<T>(2.0 * ((A - 1) - (A + 1) * cw) / a0);
+        a[1] = static_cast<T>(((A + 1) - (A - 1) * cw - sa) / a0);
+    } else {
+        const double a0 = (A + 1) + (A - 1) * cw + sa;
+        b[0] = static_cast<T>(A * ((A + 1) - (A - 1) * cw + sa) / a0);
+        b[1] = static_cast<T>(2.0 * A * ((A - 1) - (A + 1) * cw) / a0);
+        b[2] = static_cast<T>(A * ((A + 1) - (A - 1) * cw - sa) / a0);
+        a[0] = static_cast<T>(-2.0 * ((A - 1) + (A + 1) * cw) / a0);
+        a[1] = static_cast<T>(((A + 1) + (A - 1) * cw - sa) / a0);
+    }
 }
 
-// Treble shelf on the dry pair. At 0 dB with a zero state it is skipped (the
+void Engine::latchEq(bool snap) noexcept {
+    bass_.latch(bassDb_.load(std::memory_order_relaxed), snap, EqKind::LowShelf, kBassHz, 0.0, fs_);
+    mid_.latch(midDb_.load(std::memory_order_relaxed), snap, EqKind::Peak, kMidHz, kMidQ, fs_);
+    treble_.latch(trebleDb_.load(std::memory_order_relaxed), snap, EqKind::HighShelf, kTrebleHz, 0.0, fs_);
+}
+
+// One EQ band on the dry pair. At 0 dB with a zero state it is skipped (the
 // output is then bit-identical to the engine without it). State clean-up is
 // decided only at a final sub-block end (a point fixed to the music): at 0 dB
 // the unity filter's leftover transient is dropped once below 1e-12, and a
 // state decaying on silence is cleared below 1e-20 so idle output is exact zero.
-void Engine::processTreble(float* mL, float* mR, int n, bool final) noexcept {
+template <typename T>
+void Engine::EqBand<T>::process(float* mL, float* mR, int n, bool final) noexcept {
     bool st = false;
-    for (int c = 0; c < 2; ++c)
-        st = st || shX_[c][0] != 0.0f || shX_[c][1] != 0.0f || shY_[c][0] != 0.0f || shY_[c][1] != 0.0f;
-    if (trebleCur_ == 0.0f && !st) return;
+    for (int c = 0; c < 2; ++c) st = st || x[c][0] != T(0) || x[c][1] != T(0) || y[c][0] != T(0) || y[c][1] != T(0);
+    if (cur == 0.0f && !st) return;
     float* bus[2] = {mL, mR};
     for (int c = 0; c < 2; ++c) {
-        float x1 = shX_[c][0], x2 = shX_[c][1], y1 = shY_[c][0], y2 = shY_[c][1];
-        float* b = bus[c];
+        T x1 = x[c][0], x2 = x[c][1], y1 = y[c][0], y2 = y[c][1];
+        float* s = bus[c];
         for (int i = 0; i < n; ++i) {
-            const float x = b[i];
-            const float y = shB_[0] * x + shB_[1] * x1 + shB_[2] * x2 - shA_[0] * y1 - shA_[1] * y2;
+            const T in = s[i];
+            const T out = b[0] * in + b[1] * x1 + b[2] * x2 - a[0] * y1 - a[1] * y2;
             x2 = x1;
-            x1 = x;
+            x1 = in;
             y2 = y1;
-            y1 = y;
-            b[i] = y;
+            y1 = out;
+            s[i] = static_cast<float>(out);
         }
-        shX_[c][0] = x1;
-        shX_[c][1] = x2;
-        shY_[c][0] = y1;
-        shY_[c][1] = y2;
+        x[c][0] = x1;
+        x[c][1] = x2;
+        y[c][0] = y1;
+        y[c][1] = y2;
     }
     if (!final) return;
-    bool tiny = true, unityDone = trebleCur_ == 0.0f && trebleTarget_ == 0.0f;
+    bool tiny = true, unityDone = cur == 0.0f && target == 0.0f;
     for (int c = 0; c < 2; ++c)
         for (int j = 0; j < 2; ++j) {
-            tiny = tiny && std::fabs(shX_[c][j]) < 1e-20f && std::fabs(shY_[c][j]) < 1e-20f;
-            unityDone = unityDone && std::fabs(shX_[c][j] - shY_[c][j]) < 1e-12f;
+            tiny = tiny && std::fabs(x[c][j]) < T(1e-20f) && std::fabs(y[c][j]) < T(1e-20f);
+            unityDone = unityDone && std::fabs(x[c][j] - y[c][j]) < T(1e-12f);
         }
-    if (tiny || unityDone)
-        for (int c = 0; c < 2; ++c) shX_[c][0] = shX_[c][1] = shY_[c][0] = shY_[c][1] = 0.0f;
+    if (tiny || unityDone) clearState();
+}
+
+template struct Engine::EqBand<float>;
+template struct Engine::EqBand<double>;
+
+void Engine::processEq(float* mL, float* mR, int n, bool final) noexcept {
+    bass_.process(mL, mR, n, final);
+    mid_.process(mL, mR, n, final);
+    treble_.process(mL, mR, n, final);
 }
 
 void Engine::readParams() noexcept {
@@ -1076,7 +1132,8 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
                 hpY_[c][0] = y;
                 mix[c][i] += g * y;
             }
-        // Stereo width scales the side signal (1 at the default 0.35).
+        // Stereo width scales the side signal (1 at 0.35, the earlier default;
+        // the A/B-chosen default 0.7 was heard with this mapping, side x2).
         const float side = appliedWidth_ / 0.35f;
         for (int i = 0; i < n; ++i) {
             const float mid = 0.5f * (mL[i] + mR[i]), sd = 0.5f * (mL[i] - mR[i]) * side;
@@ -1113,9 +1170,9 @@ void Engine::processSubBlock(float* left, float* right, int n, std::int64_t now,
         }
     }
 
-    processTreble(mL, mR, n, final);
+    processEq(mL, mR, n, final);
 
-    // Room: fed the dry pair (after width and treble, before master gain and the DC
+    // Room: fed the dry pair (after width and the EQ, before master gain and the DC
     // blocker) once per sub-block; it is split-invariant, so the engine's
     // buffer-size invariance holds. Skipped while off and silent (the dry
     // output is then exactly the room-less one); otherwise it runs on every
@@ -1244,7 +1301,7 @@ void Engine::render(float* left, float* right, int nFrames, const ClockMapping* 
             // the host buffer or the sub-block.
             bank_.beginResponseTick(exactRespApplied_ ? -1 : kResponseBudget);
             if (!tickIsNoOp()) controlTick(now);
-            latchTreble(false);
+            latchEq(false);
         }
         // Sub-block end: the next point of the absolute grid, event or
         // hammer grid (fixed relative to the music), or the end of the
@@ -1337,6 +1394,8 @@ int Engine::describe(char* buf, int size) const noexcept {
     put("half_pedal %.3f %.3f %.3f\n", static_cast<double>(hpP0T_.load(std::memory_order_relaxed)),
         static_cast<double>(hpP0B_.load(std::memory_order_relaxed)), static_cast<double>(hpW_.load(std::memory_order_relaxed)));
     put("stereo_width %.3f\n", static_cast<double>(width_.load(std::memory_order_relaxed)));
+    put("bass_db %.2f\n", static_cast<double>(bassDb_.load(std::memory_order_relaxed)));
+    put("mid_db %.2f\n", static_cast<double>(midDb_.load(std::memory_order_relaxed)));
     put("treble_db %.2f\n", static_cast<double>(trebleDb_.load(std::memory_order_relaxed)));
     put("room_enabled %d\n", roomOn_.load(std::memory_order_relaxed) ? 1 : 0);
     put("room_level_db %.2f\n", static_cast<double>(roomLevelDb_.load(std::memory_order_relaxed)));
