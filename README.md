@@ -363,6 +363,25 @@ s after the strike, and the remaining energy is compared per Bark band.
 The model has no room or noise floor yet, so its pedal-up residual is
 80-130 dB below the tone and the ratio is far above the published 5-30 dB.
 
+Comparison with reference recordings (plan M6; the recordings themselves are
+private and never committed):
+
+```sh
+python3 tools/analysis/transcribe.py rec.wav --out rec.score.txt --render-cli build/tools/render_cli/render_cli
+python3 tools/analysis/compare_spectra.py rec.wav rec.score.txt --render-cli build/tools/render_cli/render_cli --room on
+python3 tools/analysis/transcribe.py --selftest --render-cli build/tools/render_cli/render_cli
+```
+
+`transcribe.py` turns a music recording into a render_cli score: note
+templates rendered from the model itself (cached), semi-supervised NMF on a
+log-frequency spectrogram, onsets at spectral-flux peaks, velocities from a
+calibration render, the level anchored by a median velocity of 64 (or the
+recording's absolute level with `--absolute-level`). No pedal detection.
+`compare_spectra.py` renders the score and prints octave-band long-term
+spectra of both, overall and per register, with the model-minus-recording
+difference. Self-test on model renders: onset F1 0.75, median velocity error
+12.5.
+
 ## Offline FDTD reference
 
 ```sh
